@@ -508,6 +508,10 @@ public final class HttpApi implements AutoCloseable {
       throw new BadRequest(400, "bad Content-Length");
     }
     if (n > max) {
+      // Refused from the declared length, without buffering it. The body is read and thrown away
+      // (up to a limit) only so that closing the connection does not reset it before the client
+      // has read the 413.
+      discard(ex, Math.min(n, 4L * max));
       throw new BadRequest(413, "value larger than " + max + " bytes");
     }
     try (InputStream in = ex.getRequestBody()) {
@@ -518,6 +522,19 @@ public final class HttpApi implements AutoCloseable {
       return body;
     } catch (IOException e) {
       throw new BadRequest(400, "could not read the body");
+    }
+  }
+
+  private static void discard(HttpExchange ex, long n) {
+    try (InputStream in = ex.getRequestBody()) {
+      byte[] buf = new byte[8192];
+      long left = n;
+      int r;
+      while (left > 0 && (r = in.read(buf, 0, (int) Math.min(buf.length, left))) > 0) {
+        left -= r;
+      }
+    } catch (IOException e) {
+      // The client gave up; the 413 is moot.
     }
   }
 
