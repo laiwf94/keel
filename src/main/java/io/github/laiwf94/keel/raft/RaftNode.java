@@ -8,7 +8,9 @@ import io.github.laiwf94.keel.raft.Message.VoteRequest;
 import io.github.laiwf94.keel.raft.Message.VoteResponse;
 import java.util.ArrayList;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.Random;
 import java.util.Set;
@@ -31,6 +33,26 @@ public final class RaftNode {
   }
 
   private static final String NONE = "";
+
+  /** What the leader knows about one follower's log (section 5.3). */
+  static final class Progress {
+    enum State {
+      /** Send one batch at a time until the follower's match point is found. */
+      PROBE,
+      /** The follower is in step: stream batches without waiting for each reply. */
+      REPLICATE
+    }
+
+    long match;
+    long next;
+    State state = State.PROBE;
+    boolean paused;
+    long ackedSeq;
+
+    Progress(long next) {
+      this.next = next;
+    }
+  }
 
   private final String id;
   private final RaftOptions opts;
@@ -56,6 +78,10 @@ public final class RaftNode {
   private final Set<String> votesGranted = new HashSet<>();
   private final Set<String> votesRejected = new HashSet<>();
   private final Set<String> recentlyActive = new HashSet<>();
+
+  private final Map<String, Progress> progress = new LinkedHashMap<>();
+  private long seq;
+  private boolean broadcastPending;
 
   private final List<Message> outbox = new ArrayList<>();
 
@@ -155,6 +181,21 @@ public final class RaftNode {
     return (!leaderId.isEmpty() || bootGuard) && electionElapsed < opts.electionTicks();
   }
 
+  /**
+   * Appends a command to the leader's log and returns its index. The command is committed once a
+   * majority stores it; the driver learns that from {@link Ready#committed()}.
+   *
+   * @throws NotLeaderException if this node is not the leader
+   */
+  public long propose(byte[] command) {
+    if (role != Role.LEADER) {
+      throw new NotLeaderException(leaderId);
+    }
+    Entry e = new Entry(log.lastIndex() + 1, term, EntryType.COMMAND, command);
+    appendLocal(e);
+    return e.index();
+  }
+
   /** Handles one message from another node. Messages addressed elsewhere are ignored. */
   public void step(Message m) {
     if (!m.to().equals(id) || m.from().equals(id)) {
@@ -196,6 +237,12 @@ public final class RaftNode {
 
   /** Collects what this node produced since the last call. */
   public Ready ready() {
+    if (broadcastPending && role == Role.LEADER) {
+      for (String peer : progress.keySet()) {
+        sendAppend(peer, false);
+      }
+    }
+    broadcastPending = false;
     List<Entry> committed = new ArrayList<>();
     for (long i = handedOut + 1; i <= commitIndex; i++) {
       committed.add(log.entry(i));
@@ -284,17 +331,130 @@ public final class RaftNode {
     }
     leaderId = ar.from();
     electionElapsed = 0;
-    boolean ok = log.matches(ar.prevLogIndex(), ar.prevLogTerm());
+    long prev = ar.prevLogIndex();
+    if (prev < log.snapshot().index()) {
+      // Everything up to our commit index is committed and therefore matches the leader.
+      send(new AppendResponse(id, ar.from(), term, true, commitIndex, 0, 0, 0, ar.seq()));
+      return;
+    }
+    if (log.matches(prev, ar.prevLogTerm())) {
+      List<Entry> written = log.appendFromLeader(ar.entries(), commitIndex);
+      if (!written.isEmpty()) {
+        storage.append(written);
+      }
+      long lastNew = prev + ar.entries().size();
+      commitIndex = Math.max(commitIndex, Math.min(ar.leaderCommit(), lastNew));
+      send(new AppendResponse(id, ar.from(), term, true, lastNew, 0, 0, 0, ar.seq()));
+      return;
+    }
+    // Tell the leader where to retry: past our end, or the start of the conflicting term.
+    long conflictIndex;
+    long conflictTerm;
+    if (prev > log.lastIndex()) {
+      conflictIndex = log.lastIndex() + 1;
+      conflictTerm = 0;
+    } else {
+      conflictTerm = log.termAt(prev);
+      conflictIndex = log.firstIndexOfTermAt(prev);
+    }
     send(
         new AppendResponse(
-            id, ar.from(), term, ok, ok ? ar.prevLogIndex() : 0, ar.prevLogIndex(), 0, 0, 0));
+            id, ar.from(), term, false, 0, prev, conflictIndex, conflictTerm, ar.seq()));
   }
 
   private void handleAppendResponse(AppendResponse ar) {
-    if (role != Role.LEADER) {
+    Progress pr = progress.get(ar.from());
+    if (role != Role.LEADER || pr == null) {
       return;
     }
     recentlyActive.add(ar.from());
+    pr.ackedSeq = Math.max(pr.ackedSeq, ar.seq());
+    if (ar.success()) {
+      pr.match = Math.max(pr.match, ar.matchIndex());
+      pr.paused = false;
+      if (pr.state == Progress.State.PROBE) {
+        pr.state = Progress.State.REPLICATE;
+        pr.next = pr.match + 1;
+      }
+      pr.next = Math.max(pr.next, pr.match + 1);
+      maybeCommit();
+      sendAppend(ar.from(), false);
+      return;
+    }
+    if (ar.rejectedIndex() <= pr.match) {
+      return; // a reply to a message older than what the follower has since acknowledged
+    }
+    long next = ar.conflictIndex();
+    if (ar.conflictTerm() > 0) {
+      long last = log.lastIndexOfTerm(ar.conflictTerm());
+      if (last != RaftLog.UNKNOWN) {
+        next = last + 1;
+      }
+    }
+    pr.next = Math.max(Math.min(next, ar.rejectedIndex()), pr.match + 1);
+    pr.state = Progress.State.PROBE;
+    pr.paused = false;
+    sendAppend(ar.from(), false);
+  }
+
+  /**
+   * Advances the commit index to the highest index stored on a majority, but only if that entry is
+   * from the current term. Counting replicas of an older-term entry is unsafe (section 5.4.2,
+   * Figure 8); such entries commit indirectly once a current-term entry after them does.
+   */
+  private void maybeCommit() {
+    List<Long> matches = new ArrayList<>();
+    for (String v : config().voterIds()) {
+      if (v.equals(id)) {
+        matches.add(log.lastIndex());
+      } else {
+        Progress pr = progress.get(v);
+        matches.add(pr == null ? 0 : pr.match);
+      }
+    }
+    if (matches.isEmpty()) {
+      return;
+    }
+    matches.sort((a, b) -> Long.compare(b, a));
+    long candidate = matches.get(config().quorum() - 1);
+    if (candidate > commitIndex && log.termAt(candidate) == term) {
+      commitIndex = candidate;
+    }
+  }
+
+  private void appendLocal(Entry e) {
+    log.append(e);
+    storage.append(List.of(e));
+    broadcastPending = true;
+    maybeCommit();
+  }
+
+  /**
+   * Sends the next batch to one follower. Heartbeats go out even with nothing to send, and double
+   * as probes when the follower's position is unknown.
+   */
+  private void sendAppend(String peer, boolean heartbeat) {
+    Progress pr = progress.get(peer);
+    long prev = pr.next - 1;
+    long prevTerm = log.termAt(prev);
+    List<Entry> entries = List.of();
+    boolean windowFull =
+        pr.state == Progress.State.REPLICATE && pr.next - pr.match - 1 >= opts.maxInflightEntries();
+    boolean probing = pr.state == Progress.State.PROBE && pr.paused;
+    if (pr.next <= log.lastIndex() && !windowFull && !probing) {
+      entries = log.slice(pr.next, opts.maxAppendEntries(), opts.maxAppendBytes());
+    }
+    if (entries.isEmpty() && !heartbeat) {
+      return;
+    }
+    if (!entries.isEmpty()) {
+      if (pr.state == Progress.State.REPLICATE) {
+        pr.next = entries.get(entries.size() - 1).index() + 1;
+      } else {
+        pr.paused = true;
+      }
+    }
+    send(new AppendRequest(id, peer, term, prev, prevTerm, entries, commitIndex, seq));
   }
 
   private void becomeFollower(long newTerm, String leader) {
@@ -305,6 +465,8 @@ public final class RaftNode {
     }
     role = Role.FOLLOWER;
     leaderId = leader;
+    progress.clear();
+    broadcastPending = false;
     resetElectionTimer();
   }
 
@@ -314,16 +476,21 @@ public final class RaftNode {
     heartbeatElapsed = 0;
     checkQuorumElapsed = 0;
     recentlyActive.clear();
+    progress.clear();
+    for (String peer : config().ids()) {
+      if (!peer.equals(id)) {
+        progress.put(peer, new Progress(log.lastIndex() + 1));
+      }
+    }
+    // A no-op in the new term lets entries from earlier terms commit (section 5.4.2) and tells
+    // the leader which of its entries are committed.
+    appendLocal(new Entry(log.lastIndex() + 1, term, EntryType.NOOP, new byte[0]));
     broadcastHeartbeat();
   }
 
   private void broadcastHeartbeat() {
-    for (String peer : config().ids()) {
-      if (!peer.equals(id)) {
-        send(
-            new AppendRequest(
-                id, peer, term, log.lastIndex(), log.lastTerm(), List.of(), commitIndex, 0));
-      }
+    for (String peer : progress.keySet()) {
+      sendAppend(peer, true);
     }
   }
 
