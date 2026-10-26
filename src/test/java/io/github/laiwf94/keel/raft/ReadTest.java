@@ -64,6 +64,7 @@ class ReadTest {
     n.step(new Message.VoteResponse("n2", "n1", 1, true, false));
     assertEquals(RaftNode.Role.LEADER, n.role());
     n.ready();
+    n.markDurable();
     n.read(9, ReadMode.LINEARIZABLE);
     n.read(10, ReadMode.LEASE);
     assertTrue(n.ready().reads().isEmpty());

@@ -97,12 +97,15 @@ final class TestCluster {
         }
         Ready r = e.getValue().ready();
         storages.get(e.getKey()).sync();
+        e.getValue().markDurable();
         wire.addAll(r.messages());
         applied.get(e.getKey()).addAll(r.committed());
         r.snapshot().ifPresent(restored.get(e.getKey())::add);
         reads.get(e.getKey()).addAll(r.reads());
       }
-      if (wire.isEmpty()) {
+      if (wire.isEmpty()
+          && nodes.entrySet().stream()
+              .noneMatch(e -> !down.contains(e.getKey()) && e.getValue().hasReady())) {
         return;
       }
       while (!wire.isEmpty()) {

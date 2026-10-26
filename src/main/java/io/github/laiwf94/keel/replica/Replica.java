@@ -132,13 +132,37 @@ public final class Replica {
     reads.put(context, callback);
   }
 
-  /** Runs one round: persist, send, apply, answer. Call after every batch of ticks and steps. */
+  /**
+   * Runs one round: persist, send, apply, answer. Call after every batch of ticks and steps.
+   *
+   * <p>A leader's AppendEntries and InstallSnapshot messages go out before the fsync: they promise
+   * nothing about the leader's own disk, so the leader writes in parallel with its followers
+   * (thesis section 10.2.1) and counts itself toward a commit only once its fsync returns. Every
+   * other message (votes, acknowledgements) waits for the fsync, because it is a promise about
+   * durable state.
+   */
   public void process() {
-    Ready r = node.ready();
-    storage.sync();
-    for (Message m : r.messages()) {
-      transport.accept(m);
+    for (int round = 0; round < 4; round++) {
+      Ready r = node.ready();
+      List<Message> afterSync = new ArrayList<>();
+      for (Message m : r.messages()) {
+        if (m instanceof Message.AppendRequest || m instanceof Message.SnapshotRequest) {
+          transport.accept(m);
+        } else {
+          afterSync.add(m);
+        }
+      }
+      storage.sync();
+      node.markDurable();
+      afterSync.forEach(transport);
+      apply(r);
+      if (!node.hasReady()) {
+        return;
+      }
     }
+  }
+
+  private void apply(Ready r) {
     r.snapshot().ifPresent(this::restore);
     for (Entry e : r.committed()) {
       apply(e);

@@ -125,7 +125,7 @@ class SnapshotTest {
     TestCluster c = new TestCluster(1, 36);
     RaftNode n = c.awaitLeader();
     n.propose(ReplicationTest.cmd("x"));
-    assertThrows(IllegalArgumentException.class, () -> n.compact(n.commitIndex(), new byte[0]));
+    assertThrows(IllegalArgumentException.class, () -> n.compact(n.log().lastIndex(), new byte[0]));
     c.flush();
     n.compact(n.commitIndex(), new byte[0]);
     long first = n.log().firstIndex();

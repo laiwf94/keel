@@ -71,6 +71,9 @@ public final class RaftNode {
   private String leaderId = NONE;
   private long commitIndex;
   private long handedOut;
+  // The last index known to be on this node's disk. A leader counts itself toward a commit only
+  // up to here, which lets it send entries to followers before its own fsync finishes.
+  private long durableIndex;
 
   private int electionElapsed;
   private int randomizedElectionTicks;
@@ -118,6 +121,7 @@ public final class RaftNode {
     this.votedFor = st.hardState().votedFor();
     this.commitIndex = meta.index();
     this.handedOut = meta.index();
+    this.durableIndex = log.lastIndex();
     this.latestSnapshot = st.snapshot().orElse(null);
     this.toRestore = latestSnapshot;
     resetElectionTimer();
@@ -361,6 +365,27 @@ public final class RaftNode {
     return r;
   }
 
+  /**
+   * Tells the node that everything it has written to storage so far is durable. The driver calls
+   * this right after {@link Storage#sync()}. A leader may then count its own log toward commits.
+   */
+  public void markDurable() {
+    durableIndex = log.lastIndex();
+    if (role == Role.LEADER) {
+      maybeCommit();
+    }
+  }
+
+  /** Whether {@link #ready()} would return anything. */
+  public boolean hasReady() {
+    boolean leaderWork = role == Role.LEADER && (broadcastPending || readRoundPending);
+    return !outbox.isEmpty()
+        || commitIndex > handedOut
+        || !readsReady.isEmpty()
+        || toRestore != null
+        || leaderWork;
+  }
+
   public Ready.Status status() {
     return new Ready.Status(
         id, role, term, leaderId, commitIndex, log.lastIndex(), log.snapshot().index());
@@ -520,7 +545,7 @@ public final class RaftNode {
     List<Long> matches = new ArrayList<>();
     for (String v : config().voterIds()) {
       if (v.equals(id)) {
-        matches.add(log.lastIndex());
+        matches.add(Math.min(durableIndex, log.lastIndex()));
       } else {
         Progress pr = progress.get(v);
         matches.add(pr == null ? 0 : pr.match);

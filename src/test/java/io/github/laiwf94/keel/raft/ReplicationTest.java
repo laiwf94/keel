@@ -49,10 +49,12 @@ class ReplicationTest {
   }
 
   @Test
-  void singleNodeCommitsImmediately() {
+  void leaderCountsItselfOnlyOnceItsWriteIsDurable() {
     TestCluster c = new TestCluster(1, 22);
     RaftNode n = c.awaitLeader();
     long idx = n.propose(cmd("x"));
+    assertTrue(n.commitIndex() < idx, "committed before the leader's own fsync");
+    n.markDurable();
     assertEquals(idx, n.commitIndex());
     assertEquals(List.of("x"), commands(n.ready().committed()));
   }

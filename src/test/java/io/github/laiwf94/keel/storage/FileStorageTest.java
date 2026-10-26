@@ -339,6 +339,8 @@ class FileStorageTest {
       }
       node.ready();
       s.sync();
+      node.markDurable();
+      node.ready();
       node.compact(3, new byte[] {42});
       term = node.term();
       last = node.log().lastIndex();
