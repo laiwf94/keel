@@ -289,6 +289,15 @@ public final class HttpApi implements AutoCloseable {
     return Response.error(404, "no such endpoint");
   }
 
+  /** A JSON object whose fields keep the order given, so responses read the same every time. */
+  private static Map<String, Object> fields(Object... kv) {
+    Map<String, Object> m = new LinkedHashMap<>();
+    for (int i = 0; i < kv.length; i += 2) {
+      m.put((String) kv[i], kv[i + 1]);
+    }
+    return m;
+  }
+
   private static void requireMethod(String method, String allowed) throws BadRequest {
     if (!method.equals(allowed)) {
       throw new BadRequest(405, "method not allowed; use " + allowed);
@@ -559,10 +568,10 @@ public final class HttpApi implements AutoCloseable {
     Result r = Result.decode(a.result());
     return switch (r.status()) {
       case OK ->
-          Response.json(200, Map.of(versionField, r.version(), "index", a.index()))
+          Response.json(200, Map.of(versionField, r.version()))
               .with("ETag", "\"" + r.version() + "\"");
       case CONFLICT ->
-          Response.json(412, Map.of("error", "version conflict", "current_version", r.version()));
+          Response.json(412, fields("error", "version conflict", "current_version", r.version()));
       case SESSION_EXPIRED -> Response.error(410, "session expired; register a new one");
       case STALE -> Response.error(409, "request is older than one this session already completed");
       case INVALID -> Response.error(400, "invalid command");
@@ -575,7 +584,7 @@ public final class HttpApi implements AutoCloseable {
       case Outcome.Unknown u ->
           Response.json(
                   503,
-                  Map.of(
+                  fields(
                       "error",
                       u.reason() + "; retry with the same Keel-Seq to be safe",
                       "outcome",
@@ -589,7 +598,7 @@ public final class HttpApi implements AutoCloseable {
   private Response membershipOutcome(HttpExchange ex, Outcome o) {
     return switch (o) {
       case Outcome.Applied a ->
-          Response.json(200, Map.of("index", a.index(), "members", membersJson()));
+          Response.json(200, fields("index", a.index(), "members", membersJson()));
       case Outcome.Rejected r -> Response.error(409, r.reason());
       default -> failedWrite(ex, o);
     };
@@ -605,7 +614,7 @@ public final class HttpApi implements AutoCloseable {
     if (ex.getRequestURI().getRawQuery() != null) {
       target += "?" + ex.getRequestURI().getRawQuery();
     }
-    return Response.json(307, Map.of("error", "not the leader", "leader", m.get().id()))
+    return Response.json(307, fields("error", "not the leader", "leader", m.get().id()))
         .with("Location", target)
         .with("Keel-Leader", m.get().id());
   }
