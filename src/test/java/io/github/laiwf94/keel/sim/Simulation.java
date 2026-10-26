@@ -120,6 +120,7 @@ final class Simulation {
   static final class SimNode {
     final String id;
     final MemStorage storage = new MemStorage();
+    Configuration initial;
     final double drift;
     Replica replica;
     StateMachine machine;
@@ -151,20 +152,31 @@ final class Simulation {
   final List<String> faultLog = new ArrayList<>();
 
   Simulation(long seed, Options opts, Supplier<StateMachine> machines) {
+    this(seed, opts, machines, opts.nodes());
+  }
+
+  /** The first {@code voters} nodes form the cluster; the rest start empty, waiting to join. */
+  Simulation(long seed, Options opts, Supplier<StateMachine> machines, int voters) {
     this.seed = seed;
     this.rnd = new Random(seed);
     this.opts = opts;
     this.machines = machines;
     List<Member> ms = new ArrayList<>();
     for (int i = 1; i <= opts.nodes(); i++) {
-      ms.add(new Member("n" + i, "n" + i + ":7000", "n" + i + ":8080", true));
+      ms.add(member("n" + i));
     }
-    this.config = new Configuration(ms);
+    this.config = new Configuration(ms.subList(0, voters));
     for (Member m : ms) {
       // By default clock rates differ by up to 3%, well inside what lease reads allow for.
       double drift = 1 - opts.maxDrift() + rnd.nextDouble() * 2 * opts.maxDrift();
-      nodes.put(m.id(), new SimNode(m.id(), drift));
+      SimNode n = new SimNode(m.id(), drift);
+      n.initial = config.contains(m.id()) ? config : Configuration.EMPTY;
+      nodes.put(m.id(), n);
     }
+  }
+
+  static Member member(String id) {
+    return new Member(id, id + ":7000", id + ":8080", true);
   }
 
   long now() {
@@ -189,7 +201,7 @@ final class Simulation {
     n.replica =
         new Replica(
             id,
-            config,
+            n.initial,
             opts.raft(),
             n.storage,
             n.machine,
@@ -351,7 +363,9 @@ final class Simulation {
       case 0 -> crash(ids.get(rnd.nextInt(ids.size())));
       case 1 -> {
         for (String id : ids) {
-          restart(id);
+          if (!retired.contains(id)) {
+            restart(id);
+          }
         }
       }
       case 2 -> {
@@ -375,6 +389,66 @@ final class Simulation {
       default -> heal();
     }
     schedule(nextFaultGap(), this::fault);
+  }
+
+  /**
+   * Adds and removes servers at random through the leader, one change at a time. A new server
+   * always gets a new id and an empty disk. A removed server is stopped shortly after its removal
+   * commits; it comes back with its old disk when the run settles, which checks that a server that
+   * missed its own removal cannot disrupt the cluster.
+   *
+   * <p>Reusing an id with a wiped disk is not allowed: the server would forget votes it cast and
+   * could vote twice in one term. The simulator found exactly that when it reused ids.
+   */
+  void enableMembershipChanges(int minVoters) {
+    schedule(300 + rnd.nextInt(300), () -> membershipChange(minVoters));
+  }
+
+  final List<String> membershipLog = new ArrayList<>();
+  final Set<String> retired = new HashSet<>();
+
+  private void membershipChange(int minVoters) {
+    if (now >= opts.durationMs()) {
+      return;
+    }
+    schedule(300 + rnd.nextInt(400), () -> membershipChange(minVoters));
+    Optional<SimNode> leader = leader();
+    if (leader.isEmpty()) {
+      return;
+    }
+    Replica r = leader.get().replica;
+    Configuration current = r.node().config();
+    boolean add = current.voterIds().size() <= minVoters || rnd.nextBoolean();
+    if (add && current.members().size() < 7) {
+      String id = "n" + (nodes.size() + 1);
+      SimNode fresh = new SimNode(id, 1 - opts.maxDrift() + rnd.nextDouble() * 2 * opts.maxDrift());
+      fresh.initial = Configuration.EMPTY;
+      nodes.put(id, fresh);
+      start(id);
+      membershipLog.add(now + " add " + id);
+      r.addServer(member(id), o -> membershipLog.add(now + " add " + id + " -> " + o));
+    } else if (current.voterIds().size() > minVoters) {
+      List<String> ids = current.ids();
+      String id = ids.get(rnd.nextInt(ids.size()));
+      membershipLog.add(now + " remove " + id);
+      r.removeServer(
+          id,
+          o -> {
+            membershipLog.add(now + " remove " + id + " -> " + o);
+            if (o instanceof Outcome.Applied) {
+              schedule(200, () -> retireIfRemoved(id));
+            }
+          });
+    }
+    afterStep(leader.get());
+  }
+
+  private void retireIfRemoved(String id) {
+    boolean member = leader().map(l -> l.replica.node().config().contains(id)).orElse(true);
+    if (!member) {
+      crash(id);
+      retired.add(id);
+    }
   }
 
   /** Heals the network, restarts every node and runs until things settle. */

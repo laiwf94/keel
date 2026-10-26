@@ -29,6 +29,9 @@ public sealed interface Outcome {
     }
   }
 
+  /** The request was refused before anything was proposed; {@code reason} says why. */
+  record Rejected(String reason) implements Outcome {}
+
   /** This node is not the leader. Nothing was proposed, so retrying elsewhere is safe. */
   record NotLeader(Optional<String> leaderHint) implements Outcome {}
 

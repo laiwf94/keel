@@ -20,7 +20,10 @@ class KvSimulationTest {
   record Run(Simulation sim, History history, int retries) {}
 
   static Run run(long seed, Simulation.Options opts, Supplier<StateMachine> machines) {
-    Simulation sim = new Simulation(seed, opts, machines);
+    return run(new Simulation(seed, opts, machines), opts);
+  }
+
+  static Run run(Simulation sim, Simulation.Options opts) {
     History history = new History();
     List<String> keys = List.of("a", "b", "c");
     List<SimKvClient> clients =
@@ -78,6 +81,44 @@ class KvSimulationTest {
         "KvSimulationTest",
         200,
         seed -> checkSeed(seed, Simulation.Options.defaults().withDrift(0.1)));
+  }
+
+  @Test
+  void historiesAreLinearizableWhileServersJoinAndLeave() {
+    Seeds.run(
+        "KvSimulationTest",
+        300,
+        seed -> {
+          Simulation.Options opts = Simulation.Options.defaults();
+          Simulation sim =
+              new Simulation(seed, opts.withNodes(3), () -> new KvMachine(60_000, 1_000));
+          sim.enableMembershipChanges(2);
+          Run r = run(sim, opts);
+          Optional<String> violation = Linearizability.check(r.history().ops);
+          assertTrue(violation.isEmpty(), () -> violation.get() + "\n" + sim.membershipLog);
+          sim.checkLogMatching();
+          // Every current member converges on the same state.
+          var leader = sim.leader().orElseThrow(() -> new AssertionError("no leader"));
+          var members = leader.replica.node().config();
+          sim.runUntil(sim.now() + 1_000);
+          for (String id : members.ids()) {
+            var n = sim.nodes.get(id);
+            assertEquals(leader.replica.appliedIndex(), n.replica.appliedIndex(), id);
+            assertArrayEquals(leader.machine.snapshot(), n.machine.snapshot(), id);
+          }
+        });
+  }
+
+  @Test
+  void membershipChangesHappen() {
+    Simulation.Options opts = Simulation.Options.defaults().withFaults(false);
+    Simulation sim = new Simulation(5, opts.withNodes(3), () -> new KvMachine(60_000, 1_000));
+    sim.enableMembershipChanges(2);
+    run(sim, opts);
+    long applied = sim.membershipLog.stream().filter(l -> l.contains("Applied")).count();
+    assertTrue(applied >= 5, "only " + applied + " changes applied: " + sim.membershipLog);
+    assertTrue(
+        sim.membershipLog.stream().anyMatch(l -> l.contains("remove") && l.contains("Applied")));
   }
 
   /** A replica that ignores sessions, so a retried write can apply twice. */

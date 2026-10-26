@@ -28,7 +28,7 @@ final class SimKvClient {
   private final List<String> keys;
   private final long stopAt;
   private final Map<String, Long> lastSeen = new HashMap<>();
-  private final List<String> nodeIds;
+  private List<String> nodeIds;
   private final ReadMode readMode;
   private String target;
   private long clientId;
@@ -94,6 +94,7 @@ final class SimKvClient {
     if (o instanceof Outcome.NotLeader nl && nl.leaderHint().isPresent()) {
       target = nl.leaderHint().get();
     } else {
+      nodeIds = new ArrayList<>(sim.nodes.keySet());
       target = nodeIds.get(sim.rnd.nextInt(nodeIds.size()));
     }
   }

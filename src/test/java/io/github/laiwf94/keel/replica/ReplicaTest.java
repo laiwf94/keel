@@ -165,4 +165,19 @@ class ReplicaTest {
     assertEquals(2, out.size());
     out.forEach(o -> assertInstanceOf(Outcome.Unknown.class, o));
   }
+
+  @Test
+  void membershipChangesReportTheirOutcome() {
+    Replica r = single(new Echo(), new ArrayList<>());
+    List<Outcome> out = new ArrayList<>();
+    r.addServer(new Member("n2", "h:1", "h:2", true), out::add);
+    r.process();
+    assertInstanceOf(Outcome.Applied.class, out.get(0));
+    assertTrue(r.node().config().contains("n2"));
+    r.removeServer("n2", out::add);
+    r.process();
+    assertInstanceOf(Outcome.Applied.class, out.get(1));
+    r.removeServer("n9", out::add);
+    assertInstanceOf(Outcome.Rejected.class, out.get(2));
+  }
 }

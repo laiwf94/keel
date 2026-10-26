@@ -1,8 +1,10 @@
 package io.github.laiwf94.keel.replica;
 
+import io.github.laiwf94.keel.raft.ConfigChangeException;
 import io.github.laiwf94.keel.raft.Configuration;
 import io.github.laiwf94.keel.raft.Entry;
 import io.github.laiwf94.keel.raft.EntryType;
+import io.github.laiwf94.keel.raft.Member;
 import io.github.laiwf94.keel.raft.Message;
 import io.github.laiwf94.keel.raft.NotLeaderException;
 import io.github.laiwf94.keel.raft.RaftNode;
@@ -18,6 +20,7 @@ import java.util.Map;
 import java.util.Random;
 import java.util.TreeMap;
 import java.util.function.Consumer;
+import java.util.function.LongSupplier;
 
 /**
  * Drives one {@link RaftNode}: it persists, sends and applies what the node produces, and matches
@@ -88,11 +91,27 @@ public final class Replica {
    * inside {@link #process()} or immediately if this node is not the leader.
    */
   public void propose(byte[] command, Consumer<Outcome> callback) {
+    submit(() -> node.propose(command), callback);
+  }
+
+  /** Adds a server as a learner; the leader promotes it to voter once it has caught up. */
+  public void addServer(Member member, Consumer<Outcome> callback) {
+    submit(() -> node.addServer(member), callback);
+  }
+
+  public void removeServer(String id, Consumer<Outcome> callback) {
+    submit(() -> node.removeServer(id), callback);
+  }
+
+  private void submit(LongSupplier append, Consumer<Outcome> callback) {
     long index;
     try {
-      index = node.propose(command);
+      index = append.getAsLong();
     } catch (NotLeaderException e) {
       callback.accept(new Outcome.NotLeader(e.leaderHint()));
+      return;
+    } catch (ConfigChangeException e) {
+      callback.accept(new Outcome.Rejected(e.getMessage()));
       return;
     }
     pending.put(index, new Pending(node.term(), callback));
@@ -169,7 +188,8 @@ public final class Replica {
   }
 
   private void apply(Entry e) {
-    byte[] result = e.type() == EntryType.COMMAND ? machine.apply(e.index(), e.data()) : null;
+    byte[] result =
+        e.type() == EntryType.COMMAND ? machine.apply(e.index(), e.data()) : new byte[0];
     appliedIndex = e.index();
     // Anything proposed at a lower index that is still pending was overwritten by another leader.
     while (!pending.isEmpty() && pending.firstKey() < e.index()) {
@@ -179,7 +199,7 @@ public final class Replica {
     if (p == null) {
       return;
     }
-    if (p.term() == e.term() && result != null) {
+    if (p.term() == e.term()) {
       p.callback().accept(new Outcome.Applied(e.index(), result));
     } else {
       p.callback().accept(new Outcome.Unknown("overwritten by another leader"));

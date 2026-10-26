@@ -489,7 +489,10 @@ public final class RaftNode {
       }
       pr.next = Math.max(pr.next, pr.match + 1);
       maybeCommit();
-      sendAppend(ar.from(), false);
+      maybePromote();
+      if (role == Role.LEADER) {
+        sendAppend(ar.from(), false);
+      }
       return;
     }
     if (ar.rejectedIndex() <= pr.match || pr.state == Progress.State.SNAPSHOT) {
@@ -530,19 +533,116 @@ public final class RaftNode {
     long candidate = matches.get(config().quorum() - 1);
     if (candidate > commitIndex && log.termAt(candidate) == term) {
       commitIndex = candidate;
-      if (commitIndex >= termStartIndex && !readsAwaitingTermCommit.isEmpty()) {
-        List<PendingRead> waiting = List.copyOf(readsAwaitingTermCommit);
-        readsAwaitingTermCommit.clear();
-        waiting.forEach(this::startRead);
+      onCommitAdvanced();
+    }
+  }
+
+  private void onCommitAdvanced() {
+    if (commitIndex >= termStartIndex && !readsAwaitingTermCommit.isEmpty()) {
+      List<PendingRead> waiting = List.copyOf(readsAwaitingTermCommit);
+      readsAwaitingTermCommit.clear();
+      waiting.forEach(this::startRead);
+    }
+    if (log.latestConfigIndex() <= commitIndex) {
+      // The latest configuration is committed: stop replicating to servers it removed, and if
+      // it removed this leader, step down (thesis section 4.2.2).
+      progress.keySet().removeIf(peer -> !config().contains(peer));
+      if (!config().contains(id)) {
+        becomeFollower(term, NONE);
+        return;
       }
     }
+    maybePromote();
   }
 
   private void appendLocal(Entry e) {
     log.append(e);
     storage.append(List.of(e));
     broadcastPending = true;
+    if (e.type() == EntryType.CONFIG) {
+      for (String peer : config().ids()) {
+        if (!peer.equals(id)) {
+          progress.putIfAbsent(peer, new Progress(log.lastIndex() + 1));
+        }
+      }
+    }
     maybeCommit();
+  }
+
+  /**
+   * Adds a server as a learner. It receives the log but does not vote; once it has caught up to the
+   * commit index, the leader promotes it to a voter in a second, separate change.
+   *
+   * @return the index of the configuration entry
+   * @throws NotLeaderException if this node is not the leader
+   * @throws ConfigChangeException if a change is already in progress or the server is a member
+   */
+  public long addServer(Member m) {
+    checkCanChangeConfig();
+    if (config().contains(m.id())) {
+      throw new ConfigChangeException(m.id() + " is already a member");
+    }
+    return appendConfig(config().withLearner(m));
+  }
+
+  /**
+   * Removes a voter or learner.
+   *
+   * @return the index of the configuration entry
+   * @throws NotLeaderException if this node is not the leader
+   * @throws ConfigChangeException if a change is in progress, the server is not a member, or it is
+   *     the last voter
+   */
+  public long removeServer(String serverId) {
+    checkCanChangeConfig();
+    if (!config().contains(serverId)) {
+      throw new ConfigChangeException(serverId + " is not a member");
+    }
+    if (config().voterIds().equals(List.of(serverId))) {
+      throw new ConfigChangeException("cannot remove the last voter");
+    }
+    return appendConfig(config().without(serverId));
+  }
+
+  /**
+   * Single-server changes are safe one at a time (thesis section 4.1), and only after the leader
+   * has committed an entry of its own term. Without that second rule a change from a previous
+   * leader that never committed can combine with this one into two disjoint majorities (the bug
+   * Ongaro described on raft-dev in 2015).
+   */
+  private boolean canChangeConfig() {
+    return role == Role.LEADER
+        && commitIndex >= termStartIndex
+        && log.latestConfigIndex() <= commitIndex;
+  }
+
+  private void checkCanChangeConfig() {
+    if (role != Role.LEADER) {
+      throw new NotLeaderException(leaderId);
+    }
+    if (!canChangeConfig()) {
+      throw new ConfigChangeException("another membership change is still in progress");
+    }
+  }
+
+  private long appendConfig(Configuration next) {
+    Entry e = new Entry(log.lastIndex() + 1, term, EntryType.CONFIG, next.encode());
+    appendLocal(e);
+    return e.index();
+  }
+
+  /** Promotes the first learner that has caught up, if a change may start now. */
+  private void maybePromote() {
+    if (!canChangeConfig()) {
+      return;
+    }
+    for (Member m : config().members()) {
+      Progress pr = progress.get(m.id());
+      if (!m.voter() && pr != null && pr.match >= commitIndex) {
+        appendConfig(config().withPromoted(m.id()));
+        return;
+      }
+    }
   }
 
   /**
@@ -551,6 +651,9 @@ public final class RaftNode {
    */
   private void sendAppend(String peer, boolean heartbeat) {
     Progress pr = progress.get(peer);
+    if (pr == null) {
+      return; // removed from the configuration
+    }
     if (pr.state == Progress.State.SNAPSHOT) {
       if (heartbeat) {
         long at = log.snapshot().index();
@@ -627,7 +730,10 @@ public final class RaftNode {
     pr.state = Progress.State.PROBE;
     pr.paused = false;
     maybeCommit();
-    sendAppend(sr.from(), false);
+    maybePromote();
+    if (role == Role.LEADER) {
+      sendAppend(sr.from(), false);
+    }
   }
 
   private void becomeFollower(long newTerm, String leader) {
