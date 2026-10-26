@@ -1,6 +1,6 @@
-# keel design
+# How keel works
 
-## Goals
+## What keel promises
 
 keel is a replicated key-value store that stays correct when machines crash, disks tear writes, and networks drop, delay, duplicate and partition traffic. Correct here means three things. Raft's safety properties hold: at most one leader per term, committed entries never change, and every replica applies the same commands in the same order. Clients see a linearizable store: every operation appears to take effect at one instant between its call and its return. And a write a client retries after a timeout takes effect at most once.
 
@@ -8,7 +8,7 @@ Throughput matters less than those three properties, but the design avoids the o
 
 It is deliberately small. There are no runtime dependencies beyond the JDK, and the build adds only formatting, static analysis, test and coverage tools.
 
-## Layers
+## Where the algorithm lives
 
 The code is split so that the hard part, the Raft algorithm, can be tested without threads, sockets or clocks.
 
@@ -20,7 +20,7 @@ The simulator calls `Replica` directly from one thread with a virtual clock. The
 
 Around the loop sit `FileStorage` (the disk format), `PeerTransport` (authenticated TCP between nodes), `HttpApi` (the client API on the JDK HTTP server and virtual threads), and `KvMachine` (the key-value state machine with client sessions).
 
-## Election
+## Choosing a leader
 
 Election follows section 5.2 of the Raft paper with three additions from Ongaro's thesis.
 
@@ -44,7 +44,7 @@ The commit rule is the part that is easy to get wrong. A leader advances its com
 
 A leader writes its own new entries to disk in parallel with its followers (thesis section 10.2.1). AppendEntries and InstallSnapshot leave before the leader's fsync, because they promise nothing about the leader's disk. The node keeps the last index known to be durable and counts itself toward a commit only up to there. Every other message, a vote or an acknowledgement, is a promise about durable state and waits for the fsync. Without this the leader's fsync and the follower's ran one after the other; now they overlap.
 
-## Storage
+## On disk
 
 Each node has a directory with three files and a lock file.
 
@@ -64,7 +64,7 @@ Any storage error stops the node. A node that cannot persist cannot keep the pro
 
 The replica snapshots the state machine every 10,000 applied entries by default and compacts the log to that point. A follower that needs compacted entries gets the whole snapshot in one message, keeps any suffix of its log that matches, and restores its state machine from it. A lost snapshot is resent after an election timeout. Snapshots are sent whole and held in memory, which caps them at 256 MiB; chunked transfer would remove that limit and is listed below.
 
-## Reads
+## Reading without the log
 
 Reads do not go through the log. A linearizable read uses ReadIndex (thesis section 6.4). The leader records its commit index, then confirms it is still leader by collecting acknowledgements of a heartbeat round sent after the read arrived. Once a majority has acknowledged that round and the state machine has applied up to the recorded index, the read is served. Reads that arrive together share one round. A new leader does not know the latest commit index until it commits an entry of its own term, so reads wait for its no-op to commit.
 
@@ -106,7 +106,7 @@ The HTTP API runs on the JDK's built-in server with a virtual thread per request
 
 Every input is checked before anything is proposed. Keys are strictly percent-decoded, must be valid UTF-8 without control characters, and are limited to 1 KiB. Values are limited to 1 MiB, and that is checked against `Content-Length` before the body is read. Bearer tokens are compared as SHA-256 hashes with a constant-time comparison. Membership changes need a separate admin token and are disabled when none is configured.
 
-## Testing
+## How it is checked
 
 The simulator is the main test. It runs the real `RaftNode` and `Replica` on one thread with a virtual clock and one seeded random source. The network drops, delays, reorders and duplicates messages and applies random partitions, including isolating the leader. Nodes crash, losing whatever they had not synced, and restart. Occasionally a sync fails as if power were lost in the middle of an fsync, after a leader has already sent that batch to its followers. Clock rates differ between nodes. After every step the checker verifies election safety, state machine safety and leader completeness. Log matching is checked across all live nodes at the end of the fault period and again after the cluster settles, and by then every acknowledged write must be present on every replica. A seed replays the identical run, and a failure prints the command that replays it. `./gradlew check` runs 1,000 seeds of each simulation test, and CI runs 10,000.
 
@@ -116,7 +116,7 @@ Real-process tests cover what the simulator cannot. Three servers in one JVM los
 
 Java has no race detector. The single-owner event loop removes most of the need for one, and the remaining concurrency (transport queues, HTTP futures) is covered by the real-server tests.
 
-## Failure modes
+## What each failure costs
 
 A leader crash costs one election timeout, 250 to 500 ms by default, before a new leader is elected. Writes in flight get an unknown outcome and are safe to retry under the same session. No acknowledged write is lost, because a write is acknowledged only after a majority has it on disk.
 
@@ -132,7 +132,7 @@ A slow or unreachable peer fills its send queue and its messages are dropped unt
 
 A full session table evicts the least recently used session, and that client gets "session expired" on its next write.
 
-## Trade-offs and limits
+## What was traded away
 
 The whole key space and the session table live in memory, and snapshots are serialized in memory. That keeps the state machine simple and fast but bounds the data set by heap size.
 
@@ -150,7 +150,7 @@ Every founding node must be started with the same initial membership. A server t
 
 Benchmarks on macOS measure the JDK's `force`, which on that platform asks the drive to flush its cache. That makes each fsync a few milliseconds and bounds write latency.
 
-## Dependencies
+## What it is built with
 
 There are no runtime dependencies. The build uses Gradle with the wrapper, Spotless with google-java-format, Error Prone, JUnit 5 and JaCoCo, each pinned to an exact version, and every resolved version is recorded in `gradle.lockfile`. CI scans that lockfile with osv-scanner. No dependency had to be moved to a newer release for a security fix.
 

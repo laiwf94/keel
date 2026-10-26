@@ -2,7 +2,7 @@
 
 keel is a replicated key-value store built on the Raft consensus algorithm, written in Java 21 with no runtime dependencies. A cluster of three or five nodes keeps serving linearizable reads and writes while a minority of them crash or are cut off, and a client that retries a write after a timeout gets it applied exactly once. It comes with a deterministic simulator that runs thousands of seeded fault schedules and checks every client history for linearizability.
 
-## Quick start
+## Starting a three-node cluster
 
 You need Docker and a JDK 21.
 
@@ -28,7 +28,7 @@ java -jar build/libs/keel-0.1.0.jar server --id n1 \
 
 Every flag can also be set as an environment variable, for example `KEEL_ID` for `--id`. Each member is `id@peer-address@client-address`; the client address is what followers put in their redirects, so it must be reachable by clients.
 
-## Example
+## Talking to it over HTTP
 
 The API is plain HTTP. A key's version is the log index of its last write and doubles as its ETag. These are real responses from a fresh compose cluster whose leader was n1.
 
@@ -64,7 +64,7 @@ The Java client in `io.github.laiwf94.keel.client.KeelClient` does all of this f
 
 Other endpoints are `DELETE /v1/kv/{key}`, `GET /v1/status`, `GET /v1/members`, `POST /v1/members?id=&peer=&client=` and `DELETE /v1/members/{id}` (both need the admin token), `GET /metrics` in the Prometheus text format, and `GET /healthz`. Set `KEEL_CLIENT_TOKEN` to require a bearer token on the client API and `KEEL_ADMIN_TOKEN` to enable membership changes.
 
-## Behaviour under failure
+## What happens when things break
 
 A write is acknowledged only after a majority of nodes has it on disk, so losing any minority of nodes loses no acknowledged write. When the leader dies, the others elect a new one within one election timeout (250 to 500 ms by default) and the client retries there. A leader cut off from the majority stops accepting writes within an election timeout and never serves a linearizable read; its uncommitted writes are discarded when the partition heals. A write whose fate is unknown, because the leader changed or the request timed out, is reported as such (503 or 504), never as a success or a failure, and retrying it under the same session is safe. A torn final write to the log is cut off on restart; corruption anywhere else stops the node rather than silently dropping data.
 
@@ -119,7 +119,7 @@ on n1: the majority write is present ("kept")
 == PASS: no acknowledged write lost across a leader kill; an isolated leader could not commit
 ```
 
-## Benchmarks
+## How fast it is, and why
 
 `bench/run.sh local` starts three nodes as separate JVMs on one machine, a 16-core arm64 Mac, with the benchmark clients on the same machine. Values are 100 bytes, each run warms up for 3 s and measures for 15 s, and every client sends its next request as soon as the last one is answered. Nothing failed in any run.
 
@@ -135,13 +135,13 @@ on n1: the majority write is present ("kept")
 
 A write is acknowledged only after it is on disk on the leader and on at least one follower. On macOS the JDK's `FileChannel.force` asks the drive to flush its cache, which takes about 5 ms here. The leader's and the follower's fsyncs overlap, but under load a write also waits for the round already in progress, so latency is a few fsyncs. Throughput grows with the number of clients because each event-loop round syncs every write that arrived in it with one fsync. Reads skip the log and the disk; a lease read also skips the heartbeat round. With 256 clients the machine itself is saturated by the client processes, and reads fall to about 12,000 per second. Through Docker Desktop on macOS every request also pays for port forwarding, which dominates the numbers, so the table uses local processes.
 
-## Limits
+## What it does not do
 
 All data lives in memory and is snapshotted to disk, so the data set is bounded by the heap. Snapshots are sent in one message of at most 256 MiB. Only the leader serves linearizable and lease reads. Each session allows one outstanding request. Peer traffic is authenticated with HMAC-SHA256 but not encrypted, so run it on a private network. Lease reads assume clock rates differ by less than 25% between nodes; ReadIndex, the default, assumes nothing about clocks. There is no leadership transfer. Every founding node must start with the same member list, and a node that loses its disk must rejoin under a new id.
 
 docs/DESIGN.md explains the design, the reasons behind it, the failure modes and the trade-offs in detail.
 
-## Development
+## Working on keel
 
 ```sh
 ./gradlew check                                     # format, Error Prone, tests, 90% line coverage
