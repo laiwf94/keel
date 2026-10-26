@@ -17,6 +17,7 @@ final class TestCluster {
   final Map<String, MemStorage> storages = new LinkedHashMap<>();
   final Map<String, List<Entry>> applied = new LinkedHashMap<>();
   final Map<String, List<Snapshot>> restored = new LinkedHashMap<>();
+  final Map<String, List<Ready.ReadState>> reads = new LinkedHashMap<>();
   final Set<String> down = new HashSet<>();
   final Set<String> isolated = new HashSet<>();
   final Deque<Message> wire = new ArrayDeque<>();
@@ -41,6 +42,7 @@ final class TestCluster {
       storages.put(m.id(), new MemStorage());
       applied.put(m.id(), new ArrayList<>());
       restored.put(m.id(), new ArrayList<>());
+      reads.put(m.id(), new ArrayList<>());
       start(m.id());
     }
   }
@@ -70,6 +72,16 @@ final class TestCluster {
     flush();
   }
 
+  /** Ticks only the given nodes, as if their clocks ran faster than everyone else's. */
+  void tickOnly(java.util.Collection<String> ids) {
+    for (String id : ids) {
+      if (!down.contains(id)) {
+        nodes.get(id).tick();
+      }
+    }
+    flush();
+  }
+
   void ticks(int n) {
     for (int i = 0; i < n; i++) {
       tick();
@@ -88,6 +100,7 @@ final class TestCluster {
         wire.addAll(r.messages());
         applied.get(e.getKey()).addAll(r.committed());
         r.snapshot().ifPresent(restored.get(e.getKey())::add);
+        reads.get(e.getKey()).addAll(r.reads());
       }
       if (wire.isEmpty()) {
         return;

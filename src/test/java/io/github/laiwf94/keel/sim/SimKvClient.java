@@ -1,8 +1,13 @@
 package io.github.laiwf94.keel.sim;
 
 import io.github.laiwf94.keel.kv.Command;
+import io.github.laiwf94.keel.kv.KvMachine;
 import io.github.laiwf94.keel.kv.Result;
+import io.github.laiwf94.keel.raft.ReadMode;
 import io.github.laiwf94.keel.replica.Outcome;
+import io.github.laiwf94.keel.replica.ReadOutcome;
+import io.github.laiwf94.keel.replica.StateMachine;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
@@ -24,20 +29,27 @@ final class SimKvClient {
   private final long stopAt;
   private final Map<String, Long> lastSeen = new HashMap<>();
   private final List<String> nodeIds;
+  private final ReadMode readMode;
   private String target;
   private long clientId;
   private long seq;
   private long attempt;
   int retries;
 
-  SimKvClient(int id, Simulation sim, History history, List<String> keys, long stopAt) {
+  SimKvClient(
+      int id, Simulation sim, History history, List<String> keys, long stopAt, ReadMode readMode) {
     this.id = id;
+    this.readMode = readMode;
     this.sim = sim;
     this.history = history;
     this.keys = keys;
     this.stopAt = stopAt;
     this.nodeIds = new ArrayList<>(sim.nodes.keySet());
     this.target = nodeIds.get(sim.rnd.nextInt(nodeIds.size()));
+  }
+
+  static KvMachine kv(StateMachine m) {
+    return m instanceof KvSimulationTest.ForgetfulSessions f ? f.inner : (KvMachine) m;
   }
 
   void start() {
@@ -91,7 +103,11 @@ final class SimKvClient {
       return;
     }
     String key = keys.get(sim.rnd.nextInt(keys.size()));
-    int pick = sim.rnd.nextInt(10);
+    int pick = sim.rnd.nextInt(13);
+    if (pick >= 10) {
+      read(history.call(id, History.Kind.GET, key, null, -1), sim.now() + OP_TIMEOUT_MS);
+      return;
+    }
     History.Op op;
     Command cmd;
     seq++;
@@ -126,6 +142,48 @@ final class SimKvClient {
             retries++;
             redirect(null);
             send(op, cmd, deadline);
+          }
+        });
+  }
+
+  private void read(History.Op op, long deadline) {
+    if (sim.now() >= deadline) {
+      next();
+      return;
+    }
+    long gen = ++attempt;
+    sim.read(
+        target,
+        readMode,
+        (node, o) -> {
+          if (gen != attempt) {
+            return;
+          }
+          attempt++;
+          if (o instanceof ReadOutcome.Served) {
+            // Read the state machine now, on the replica's turn, as the server does.
+            var v = kv(node.machine).get(op.key);
+            history.read(
+                op,
+                v.map(x -> new String(x.bytes(), StandardCharsets.UTF_8)).orElse(null),
+                v.map(KvMachine.Value::version).orElse(0L));
+            sim.schedule(sim.rnd.nextInt(10), this::next);
+            return;
+          }
+          retries++;
+          redirect(
+              o instanceof ReadOutcome.NotLeader nl
+                  ? new Outcome.NotLeader(nl.leaderHint())
+                  : null);
+          sim.schedule(5 + sim.rnd.nextInt(10), () -> read(op, deadline));
+        });
+    sim.schedule(
+        ATTEMPT_TIMEOUT_MS,
+        () -> {
+          if (gen == attempt) {
+            retries++;
+            redirect(null);
+            read(op, deadline);
           }
         });
   }

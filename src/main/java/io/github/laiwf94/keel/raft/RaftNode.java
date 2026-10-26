@@ -6,6 +6,7 @@ import io.github.laiwf94.keel.raft.Message.SnapshotRequest;
 import io.github.laiwf94.keel.raft.Message.SnapshotResponse;
 import io.github.laiwf94.keel.raft.Message.VoteRequest;
 import io.github.laiwf94.keel.raft.Message.VoteResponse;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
@@ -14,6 +15,7 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Random;
 import java.util.Set;
+import java.util.TreeMap;
 
 /**
  * One Raft participant as a deterministic state machine. It never touches a clock, a socket or a
@@ -85,6 +87,18 @@ public final class RaftNode {
   private final Map<String, Progress> progress = new LinkedHashMap<>();
   private long seq;
   private boolean broadcastPending;
+  private long termStartIndex;
+
+  // Reads (thesis section 6.4). Time is counted in ticks for the lease.
+  private record PendingRead(long context, ReadMode mode, long index, long seq) {}
+
+  private long now;
+  private long leaseExpiry;
+  private final TreeMap<Long, Long> seqSentAt = new TreeMap<>();
+  private final List<PendingRead> readsAwaitingTermCommit = new ArrayList<>();
+  private final ArrayDeque<PendingRead> readsAwaitingQuorum = new ArrayDeque<>();
+  private final List<Ready.ReadState> readsReady = new ArrayList<>();
+  private boolean readRoundPending;
 
   private final List<Message> outbox = new ArrayList<>();
   private Snapshot latestSnapshot;
@@ -140,6 +154,7 @@ public final class RaftNode {
 
   /** Advances logical time by one tick. */
   public void tick() {
+    now++;
     if (role == Role.LEADER) {
       tickLeader();
       return;
@@ -265,6 +280,62 @@ public final class RaftNode {
     }
   }
 
+  /**
+   * Asks to serve a read. Once it is safe, {@link Ready#reads()} carries the context with the index
+   * the state machine must have applied before answering.
+   *
+   * @throws NotLeaderException if this node is not the leader
+   */
+  public void read(long context, ReadMode mode) {
+    if (role != Role.LEADER) {
+      throw new NotLeaderException(leaderId);
+    }
+    PendingRead r = new PendingRead(context, mode, 0, 0);
+    // Until an entry of this term commits, the leader does not know the latest commit index.
+    if (commitIndex < termStartIndex) {
+      readsAwaitingTermCommit.add(r);
+    } else {
+      startRead(r);
+    }
+  }
+
+  private void startRead(PendingRead r) {
+    if (r.mode() == ReadMode.LEASE && now < leaseExpiry) {
+      readsReady.add(new Ready.ReadState(r.context(), commitIndex));
+      return;
+    }
+    // Every read that arrives before the next heartbeat round shares it.
+    readsAwaitingQuorum.add(new PendingRead(r.context(), r.mode(), commitIndex, seq + 1));
+    readRoundPending = true;
+  }
+
+  /** Releases reads and extends the lease once a majority has acknowledged a heartbeat round. */
+  private void advanceReads() {
+    List<Long> acked = new ArrayList<>();
+    for (String v : config().voterIds()) {
+      if (v.equals(id)) {
+        acked.add(seq);
+      } else {
+        Progress pr = progress.get(v);
+        acked.add(pr == null ? 0 : pr.ackedSeq);
+      }
+    }
+    if (acked.isEmpty()) {
+      return;
+    }
+    acked.sort((a, b) -> Long.compare(b, a));
+    long quorumSeq = acked.get(config().quorum() - 1);
+    while (!readsAwaitingQuorum.isEmpty() && readsAwaitingQuorum.peek().seq() <= quorumSeq) {
+      PendingRead r = readsAwaitingQuorum.poll();
+      readsReady.add(new Ready.ReadState(r.context(), r.index()));
+    }
+    Long sentAt = seqSentAt.get(quorumSeq);
+    if (sentAt != null) {
+      leaseExpiry = Math.max(leaseExpiry, sentAt + opts.leaseTicks());
+    }
+    seqSentAt.headMap(quorumSeq).clear();
+  }
+
   /** Collects what this node produced since the last call. */
   public Ready ready() {
     if (broadcastPending && role == Role.LEADER) {
@@ -273,13 +344,19 @@ public final class RaftNode {
       }
     }
     broadcastPending = false;
+    if (readRoundPending && role == Role.LEADER) {
+      broadcastHeartbeat();
+      advanceReads();
+    }
+    readRoundPending = false;
     List<Entry> committed = new ArrayList<>();
     for (long i = handedOut + 1; i <= commitIndex; i++) {
       committed.add(log.entry(i));
     }
     handedOut = commitIndex;
-    Ready r = new Ready(outbox, Optional.ofNullable(toRestore), committed, List.of(), status());
+    Ready r = new Ready(outbox, Optional.ofNullable(toRestore), committed, readsReady, status());
     outbox.clear();
+    readsReady.clear();
     toRestore = null;
     return r;
   }
@@ -399,7 +476,10 @@ public final class RaftNode {
       return;
     }
     recentlyActive.add(ar.from());
-    pr.ackedSeq = Math.max(pr.ackedSeq, ar.seq());
+    if (ar.seq() > pr.ackedSeq) {
+      pr.ackedSeq = ar.seq();
+      advanceReads();
+    }
     if (ar.success()) {
       pr.match = Math.max(pr.match, ar.matchIndex());
       pr.paused = false;
@@ -450,6 +530,11 @@ public final class RaftNode {
     long candidate = matches.get(config().quorum() - 1);
     if (candidate > commitIndex && log.termAt(candidate) == term) {
       commitIndex = candidate;
+      if (commitIndex >= termStartIndex && !readsAwaitingTermCommit.isEmpty()) {
+        List<PendingRead> waiting = List.copyOf(readsAwaitingTermCommit);
+        readsAwaitingTermCommit.clear();
+        waiting.forEach(this::startRead);
+      }
     }
   }
 
@@ -533,7 +618,10 @@ public final class RaftNode {
       return;
     }
     recentlyActive.add(sr.from());
-    pr.ackedSeq = Math.max(pr.ackedSeq, sr.seq());
+    if (sr.seq() > pr.ackedSeq) {
+      pr.ackedSeq = sr.seq();
+      advanceReads();
+    }
     pr.match = Math.max(pr.match, sr.matchIndex());
     pr.next = pr.match + 1;
     pr.state = Progress.State.PROBE;
@@ -552,6 +640,7 @@ public final class RaftNode {
     leaderId = leader;
     progress.clear();
     broadcastPending = false;
+    clearReads();
     resetElectionTimer();
   }
 
@@ -567,13 +656,26 @@ public final class RaftNode {
         progress.put(peer, new Progress(log.lastIndex() + 1));
       }
     }
+    clearReads();
     // A no-op in the new term lets entries from earlier terms commit (section 5.4.2) and tells
     // the leader which of its entries are committed.
-    appendLocal(new Entry(log.lastIndex() + 1, term, EntryType.NOOP, new byte[0]));
+    termStartIndex = log.lastIndex() + 1;
+    appendLocal(new Entry(termStartIndex, term, EntryType.NOOP, new byte[0]));
     broadcastHeartbeat();
   }
 
+  /** Drops reads that were not served. The driver fails them when it sees the role change. */
+  private void clearReads() {
+    readsAwaitingTermCommit.clear();
+    readsAwaitingQuorum.clear();
+    readRoundPending = false;
+    leaseExpiry = 0;
+    seqSentAt.clear();
+  }
+
   private void broadcastHeartbeat() {
+    seq++;
+    seqSentAt.put(seq, now);
     for (String peer : progress.keySet()) {
       sendAppend(peer, true);
     }

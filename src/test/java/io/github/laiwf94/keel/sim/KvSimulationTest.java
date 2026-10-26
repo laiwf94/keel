@@ -6,6 +6,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import io.github.laiwf94.keel.kv.Command;
 import io.github.laiwf94.keel.kv.KvMachine;
+import io.github.laiwf94.keel.raft.ReadMode;
 import io.github.laiwf94.keel.replica.StateMachine;
 import java.util.List;
 import java.util.Optional;
@@ -24,7 +25,15 @@ class KvSimulationTest {
     List<String> keys = List.of("a", "b", "c");
     List<SimKvClient> clients =
         java.util.stream.IntStream.range(0, 4)
-            .mapToObj(i -> new SimKvClient(i, sim, history, keys, opts.durationMs()))
+            .mapToObj(
+                i ->
+                    new SimKvClient(
+                        i,
+                        sim,
+                        history,
+                        keys,
+                        opts.durationMs(),
+                        i % 2 == 0 ? ReadMode.LINEARIZABLE : ReadMode.LEASE))
             .toList();
     sim.startAll();
     clients.forEach(SimKvClient::start);
@@ -60,6 +69,15 @@ class KvSimulationTest {
         "KvSimulationTest",
         100,
         seed -> checkSeed(seed, Simulation.Options.defaults().withNodes(3)));
+  }
+
+  @Test
+  void leaseReadsStayLinearizableAtTheEdgeOfTheDriftBound() {
+    // Rates within 10% either way: at worst 1.1 / 0.9 = 1.22, under electionTicks / leaseTicks.
+    Seeds.run(
+        "KvSimulationTest",
+        200,
+        seed -> checkSeed(seed, Simulation.Options.defaults().withDrift(0.1)));
   }
 
   /** A replica that ignores sessions, so a retried write can apply twice. */

@@ -7,11 +7,14 @@ import io.github.laiwf94.keel.raft.Message;
 import io.github.laiwf94.keel.raft.NotLeaderException;
 import io.github.laiwf94.keel.raft.RaftNode;
 import io.github.laiwf94.keel.raft.RaftOptions;
+import io.github.laiwf94.keel.raft.ReadMode;
 import io.github.laiwf94.keel.raft.Ready;
 import io.github.laiwf94.keel.raft.Snapshot;
 import io.github.laiwf94.keel.raft.Storage;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Random;
 import java.util.TreeMap;
 import java.util.function.Consumer;
@@ -33,6 +36,9 @@ public final class Replica {
   private final Consumer<Message> transport;
   private final long snapshotEvery;
   private final TreeMap<Long, Pending> pending = new TreeMap<>();
+  private final Map<Long, Consumer<ReadOutcome>> reads = new HashMap<>();
+  private final TreeMap<Long, List<Consumer<ReadOutcome>>> readsAwaitingApply = new TreeMap<>();
+  private long nextReadContext;
   private long appliedIndex;
   private Ready.Status status;
 
@@ -92,6 +98,21 @@ public final class Replica {
     pending.put(index, new Pending(node.term(), callback));
   }
 
+  /**
+   * Asks to serve a read. The callback runs on this replica's thread once the read is safe (or has
+   * failed), so it can read the state machine directly.
+   */
+  public void read(ReadMode mode, Consumer<ReadOutcome> callback) {
+    long context = ++nextReadContext;
+    try {
+      node.read(context, mode);
+    } catch (NotLeaderException e) {
+      callback.accept(new ReadOutcome.NotLeader(e.leaderHint()));
+      return;
+    }
+    reads.put(context, callback);
+  }
+
   /** Runs one round: persist, send, apply, answer. Call after every batch of ticks and steps. */
   public void process() {
     Ready r = node.ready();
@@ -103,6 +124,17 @@ public final class Replica {
     for (Entry e : r.committed()) {
       apply(e);
     }
+    for (Ready.ReadState rs : r.reads()) {
+      Consumer<ReadOutcome> cb = reads.remove(rs.context());
+      if (cb != null) {
+        readsAwaitingApply.computeIfAbsent(rs.index(), k -> new ArrayList<>()).add(cb);
+      }
+    }
+    while (!readsAwaitingApply.isEmpty() && readsAwaitingApply.firstKey() <= appliedIndex) {
+      for (Consumer<ReadOutcome> cb : readsAwaitingApply.pollFirstEntry().getValue()) {
+        cb.accept(new ReadOutcome.Served(appliedIndex));
+      }
+    }
     if (appliedIndex - node.log().snapshot().index() >= snapshotEvery) {
       node.compact(appliedIndex, machine.snapshot());
     }
@@ -110,6 +142,15 @@ public final class Replica {
     status = r.status();
     if (status.role() != RaftNode.Role.LEADER || status.term() != before.term()) {
       failPending("leadership changed before the entry was applied");
+      failReads();
+    }
+  }
+
+  private void failReads() {
+    List<Consumer<ReadOutcome>> all = new ArrayList<>(reads.values());
+    reads.clear();
+    for (Consumer<ReadOutcome> cb : all) {
+      cb.accept(new ReadOutcome.Failed("leadership changed before the read was confirmed"));
     }
   }
 

@@ -6,7 +6,9 @@ import io.github.laiwf94.keel.raft.Member;
 import io.github.laiwf94.keel.raft.Message;
 import io.github.laiwf94.keel.raft.RaftNode;
 import io.github.laiwf94.keel.raft.RaftOptions;
+import io.github.laiwf94.keel.raft.ReadMode;
 import io.github.laiwf94.keel.replica.Outcome;
+import io.github.laiwf94.keel.replica.ReadOutcome;
 import io.github.laiwf94.keel.replica.Replica;
 import io.github.laiwf94.keel.replica.StateMachine;
 import java.nio.charset.StandardCharsets;
@@ -19,6 +21,7 @@ import java.util.PriorityQueue;
 import java.util.Random;
 import java.util.Set;
 import java.util.TreeMap;
+import java.util.function.BiConsumer;
 import java.util.function.Consumer;
 import java.util.function.Supplier;
 
@@ -39,9 +42,11 @@ final class Simulation {
       boolean faults,
       int meanFaultGapMs,
       long snapshotEvery,
+      double maxDrift,
       RaftOptions raft) {
     static Options defaults() {
-      return new Options(5, 6_000, 10, 1, 15, 0.02, 0.02, true, 400, 40, RaftOptions.DEFAULTS);
+      return new Options(
+          5, 6_000, 10, 1, 15, 0.02, 0.02, true, 400, 40, 0.03, RaftOptions.DEFAULTS);
     }
 
     Options withNodes(int n) {
@@ -56,6 +61,7 @@ final class Simulation {
           faults,
           meanFaultGapMs,
           snapshotEvery,
+          maxDrift,
           raft);
     }
 
@@ -71,6 +77,24 @@ final class Simulation {
           f,
           meanFaultGapMs,
           snapshotEvery,
+          maxDrift,
+          raft);
+    }
+
+    /** Clock rates differ by up to {@code drift} either way. */
+    Options withDrift(double drift) {
+      return new Options(
+          nodes,
+          durationMs,
+          tickMs,
+          minDelayMs,
+          maxDelayMs,
+          dropRate,
+          duplicateRate,
+          faults,
+          meanFaultGapMs,
+          snapshotEvery,
+          drift,
           raft);
     }
 
@@ -86,6 +110,7 @@ final class Simulation {
           faults,
           meanFaultGapMs,
           every,
+          maxDrift,
           raft);
     }
   }
@@ -136,8 +161,9 @@ final class Simulation {
     }
     this.config = new Configuration(ms);
     for (Member m : ms) {
-      // Clock rates differ by up to 3%, inside the drift the lease reads allow for.
-      nodes.put(m.id(), new SimNode(m.id(), 0.97 + rnd.nextDouble() * 0.06));
+      // By default clock rates differ by up to 3%, well inside what lease reads allow for.
+      double drift = 1 - opts.maxDrift() + rnd.nextDouble() * 2 * opts.maxDrift();
+      nodes.put(m.id(), new SimNode(m.id(), drift));
     }
   }
 
@@ -265,6 +291,17 @@ final class Simulation {
       return;
     }
     n.replica.propose(command, done);
+    afterStep(n);
+  }
+
+  /** Asks {@code target} to serve a read; the callback gets the node so it can read its state. */
+  void read(String target, ReadMode mode, BiConsumer<SimNode, ReadOutcome> done) {
+    SimNode n = nodes.get(target);
+    if (!n.up) {
+      done.accept(n, new ReadOutcome.NotLeader(Optional.empty()));
+      return;
+    }
+    n.replica.read(mode, o -> done.accept(n, o));
     afterStep(n);
   }
 
