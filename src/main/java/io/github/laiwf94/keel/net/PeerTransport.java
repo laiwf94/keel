@@ -83,6 +83,8 @@ public final class PeerTransport implements AutoCloseable {
   final AtomicLong rejected = new AtomicLong();
 
   /**
+   * Binds the peer port. Call {@link #start()} to begin accepting connections.
+   *
    * @param resolver maps a peer id to its address, from the current configuration
    * @param inbound receives every authenticated message addressed to this node; it is called from
    *     transport threads and must be thread-safe

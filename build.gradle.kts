@@ -32,6 +32,12 @@ dependencies {
     testRuntimeOnly("org.junit.platform:junit-platform-launcher")
 }
 
+tasks.jar {
+    manifest {
+        attributes("Main-Class" to "io.github.laiwf94.keel.Main")
+    }
+}
+
 tasks.withType<JavaCompile>().configureEach {
     options.encoding = "UTF-8"
     options.compilerArgs.addAll(listOf("-parameters", "-Xlint:all,-processing", "-Werror"))
