@@ -77,6 +77,7 @@ public final class KeelClient implements AutoCloseable {
     this.http =
         HttpClient.newBuilder()
             .connectTimeout(opts.requestTimeout())
+            .version(HttpClient.Version.HTTP_1_1)
             .followRedirects(HttpClient.Redirect.NEVER)
             .build();
     this.current = opts.endpoints().get(0);
