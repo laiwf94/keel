@@ -1,12 +1,16 @@
 package io.github.laiwf94.keel.sim;
 
 import io.github.laiwf94.keel.raft.Configuration;
+import io.github.laiwf94.keel.raft.Entry;
+import io.github.laiwf94.keel.raft.HardState;
 import io.github.laiwf94.keel.raft.MemStorage;
 import io.github.laiwf94.keel.raft.Member;
 import io.github.laiwf94.keel.raft.Message;
 import io.github.laiwf94.keel.raft.RaftNode;
 import io.github.laiwf94.keel.raft.RaftOptions;
 import io.github.laiwf94.keel.raft.ReadMode;
+import io.github.laiwf94.keel.raft.Snapshot;
+import io.github.laiwf94.keel.raft.Storage;
 import io.github.laiwf94.keel.replica.Outcome;
 import io.github.laiwf94.keel.replica.ReadOutcome;
 import io.github.laiwf94.keel.replica.Replica;
@@ -203,7 +207,7 @@ final class Simulation {
             id,
             n.initial,
             opts.raft(),
-            n.storage,
+            disk(n),
             n.machine,
             new Random(rnd.nextLong()),
             this::send,
@@ -290,8 +294,64 @@ final class Simulation {
     afterStep(n);
   }
 
+  /** Thrown from a sync to model losing power in the middle of an fsync. */
+  private static final class PowerLoss extends RuntimeException {
+    private static final long serialVersionUID = 1L;
+
+    PowerLoss() {
+      super(null, null, false, false);
+    }
+  }
+
+  long powerLosses;
+
+  /**
+   * The node's disk. While faults are on, a sync occasionally fails as if power were lost during
+   * the fsync: the node dies with that batch unwritten, after a leader has already sent the batch's
+   * entries to its followers.
+   */
+  private Storage disk(SimNode n) {
+    MemStorage m = n.storage;
+    return new Storage() {
+      @Override
+      public State load() {
+        return m.load();
+      }
+
+      @Override
+      public void saveHardState(HardState state) {
+        m.saveHardState(state);
+      }
+
+      @Override
+      public void append(List<Entry> entries) {
+        m.append(entries);
+      }
+
+      @Override
+      public void saveSnapshot(Snapshot snapshot, List<Entry> remaining) {
+        m.saveSnapshot(snapshot, remaining);
+      }
+
+      @Override
+      public void sync() {
+        if (opts.faults() && now < opts.durationMs() && rnd.nextInt(2000) == 0) {
+          throw new PowerLoss();
+        }
+        m.sync();
+      }
+    };
+  }
+
   void afterStep(SimNode n) {
-    n.replica.process();
+    try {
+      n.replica.process();
+    } catch (PowerLoss e) {
+      powerLosses++;
+      faultLog.add(now + " power loss during fsync on " + n.id);
+      crash(n.id);
+      return;
+    }
     invariants.observe(n.replica.node());
   }
 

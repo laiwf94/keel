@@ -163,8 +163,9 @@ class KvSimulationTest {
   }
 
   @Test
-  void snapshotsAreInstalledInMostSeeds() {
+  void snapshotsAndPowerLossesHappenInMostSeeds() {
     AtomicInteger withInstall = new AtomicInteger();
+    AtomicInteger withPowerLoss = new AtomicInteger();
     LongStream.range(0, 40)
         .parallel()
         .forEach(
@@ -173,8 +174,12 @@ class KvSimulationTest {
               if (r.sim().snapshotsDelivered > 0) {
                 withInstall.incrementAndGet();
               }
+              if (r.sim().powerLosses > 0) {
+                withPowerLoss.incrementAndGet();
+              }
             });
     assertTrue(withInstall.get() >= 20, "InstallSnapshot ran in only " + withInstall + " of 40");
+    assertTrue(withPowerLoss.get() >= 20, "power loss hit only " + withPowerLoss + " of 40");
   }
 
   @Test
