@@ -1,5 +1,6 @@
 package io.github.laiwf94.keel;
 
+import io.github.laiwf94.keel.bench.Bench;
 import io.github.laiwf94.keel.client.KeelClient;
 import io.github.laiwf94.keel.client.KeelException;
 import java.io.BufferedWriter;
@@ -11,6 +12,7 @@ import java.nio.file.Path;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Locale;
 import java.util.Optional;
 import java.util.concurrent.atomic.AtomicLong;
 
@@ -141,5 +143,33 @@ final class Workloads {
     problems.stream().limit(20).forEach(out::println);
     out.printf("verify: checked=%d present=%d lost=%d%n", writes.size(), present.get(), lost.get());
     return lost.get() == 0 ? 0 : 1;
+  }
+
+  /** Runs the benchmark workloads one after another and prints a table. */
+  static int bench(Main.Args a, PrintStream out) throws Main.UsageException, InterruptedException {
+    List<Bench.Workload> workloads = new ArrayList<>();
+    for (String w : a.get("workloads", "write,read-linearizable,read-lease").split(",", -1)) {
+      try {
+        workloads.add(Bench.Workload.valueOf(w.trim().toUpperCase(Locale.ROOT).replace('-', '_')));
+      } catch (IllegalArgumentException e) {
+        throw new Main.UsageException("unknown workload " + w);
+      }
+    }
+    int clients = a.integer("clients", 16);
+    int keys = a.integer("keys", 1000);
+    int valueSize = a.integer("value-size", 100);
+    if (clients < 1 || keys < 1 || valueSize < 0) {
+      throw new Main.UsageException("--clients and --keys must be positive");
+    }
+    Duration warmup = a.duration("warmup", "2s");
+    Duration measure = a.duration("duration", "10s");
+    KeelClient.Options opts = Main.clientOptions(a, a.get("token"));
+    out.println(Bench.header());
+    for (Bench.Workload w : workloads) {
+      Bench.Result r =
+          Bench.run(() -> new KeelClient(opts), w, clients, keys, valueSize, warmup, measure);
+      out.println(Bench.row(r));
+    }
+    return 0;
   }
 }

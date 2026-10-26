@@ -43,6 +43,7 @@ public final class Main {
         members add <id> <peer> <client> | members remove <id>
         load                       write unique keys and record every acknowledged write
         verify                     read back every write recorded by load
+        bench                      measure throughput and latency (--workloads write,read-linearizable,read-lease)
 
       client options: --endpoints http://h:p,...  --token T  (or KEEL_ENDPOINTS, KEEL_TOKEN)
       """;
@@ -133,6 +134,7 @@ public final class Main {
         case "put", "get", "delete", "status", "members" -> client(argv[0], a, out, err);
         case "load" -> Workloads.load(a, out);
         case "verify" -> Workloads.verify(a, out);
+        case "bench" -> Workloads.bench(a, out);
         default -> throw new UsageException("unknown command " + argv[0]);
       };
     } catch (UsageException e) {

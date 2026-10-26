@@ -76,6 +76,24 @@ class MainTest {
       Files.writeString(log, "never-written\t1\tx\n", java.nio.file.StandardOpenOption.APPEND);
       assertEquals(1, run(env, "verify", "--in", log.toString()));
       assertTrue(out().contains("LOST never-written"), out());
+      assertEquals(
+          0,
+          run(
+              env,
+              "bench",
+              "--clients",
+              "2",
+              "--keys",
+              "10",
+              "--warmup",
+              "100ms",
+              "--duration",
+              "300ms",
+              "--workloads",
+              "write,read-lease"));
+      assertTrue(out().contains("read-lease"), out());
+      assertEquals(2, run(env, "bench", "--workloads", "everything"));
+      assertEquals(2, run(env, "bench", "--clients", "0"));
       Files.writeString(log, "malformed\n", java.nio.file.StandardOpenOption.APPEND);
       assertEquals(2, run(env, "verify", "--in", log.toString()));
     }
