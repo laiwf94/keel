@@ -26,7 +26,8 @@ final class LocalCluster implements AutoCloseable {
   static final InetAddress LOOPBACK = InetAddress.getLoopbackAddress();
 
   final Path root;
-  final Configuration config;
+  Configuration config;
+  private final boolean proxied;
   final Map<String, KeelServer> servers = new LinkedHashMap<>();
   // Per node: peer port, HTTP port, and the proxy port peers dial when proxies are on.
   final Map<String, int[]> ports = new LinkedHashMap<>();
@@ -44,6 +45,18 @@ final class LocalCluster implements AutoCloseable {
   /** With {@code proxied}, peers reach each node through a {@link PartitionProxy}. */
   LocalCluster(Path root, int n, boolean proxied) throws IOException {
     this.root = root;
+    this.proxied = proxied;
+    assignPorts(n);
+  }
+
+  /**
+   * Picks free ports for every node. A port found free can be taken by another process before a
+   * server binds it, so {@link #startAll()} picks again and retries when a bind fails.
+   */
+  private void assignPorts(int n) throws IOException {
+    proxies.values().forEach(PartitionProxy::close);
+    proxies.clear();
+    ports.clear();
     List<Member> ms = new ArrayList<>();
     for (int i = 1; i <= n; i++) {
       String id = "n" + i;
@@ -104,10 +117,22 @@ final class LocalCluster implements AutoCloseable {
   }
 
   LocalCluster startAll() throws IOException {
-    for (String id : ports.keySet()) {
-      start(id);
+    for (int attempt = 1; ; attempt++) {
+      try {
+        for (String id : ports.keySet()) {
+          start(id);
+        }
+        return this;
+      } catch (java.net.BindException e) {
+        if (attempt == 3) {
+          throw e;
+        }
+        for (String id : new ArrayList<>(servers.keySet())) {
+          stop(id);
+        }
+        assignPorts(ports.size());
+      }
     }
-    return this;
   }
 
   void stop(String id) {
