@@ -19,11 +19,13 @@ import java.util.Set;
  * #step}, and collects the results from {@link #ready()}. That is what lets the simulator and the
  * server run exactly the same code.
  *
- * <p>Section numbers in comments refer to the extended Raft paper (Ongaro and Ousterhout, 2014).
+ * <p>Section numbers in comments refer to the extended Raft paper (Ongaro and Ousterhout) unless
+ * they say "thesis", which means Ongaro's PhD thesis, "Consensus: Bridging Theory and Practice".
  */
 public final class RaftNode {
   public enum Role {
     FOLLOWER,
+    PRE_CANDIDATE,
     CANDIDATE,
     LEADER
   }
@@ -46,9 +48,14 @@ public final class RaftNode {
   private int electionElapsed;
   private int randomizedElectionTicks;
   private int heartbeatElapsed;
+  private int checkQuorumElapsed;
+  // A freshly started node behaves as if it had just heard from a leader until one election
+  // timeout passes, so a restart cannot cut short another leader's lease (see inLease()).
+  private boolean bootGuard = true;
 
   private final Set<String> votesGranted = new HashSet<>();
   private final Set<String> votesRejected = new HashSet<>();
+  private final Set<String> recentlyActive = new HashSet<>();
 
   private final List<Message> outbox = new ArrayList<>();
 
@@ -101,20 +108,51 @@ public final class RaftNode {
   /** Advances logical time by one tick. */
   public void tick() {
     if (role == Role.LEADER) {
-      if (++heartbeatElapsed >= opts.heartbeatTicks()) {
-        heartbeatElapsed = 0;
-        broadcastHeartbeat();
-      }
+      tickLeader();
       return;
     }
-    if (++electionElapsed >= randomizedElectionTicks) {
-      electionElapsed = 0;
+    electionElapsed++;
+    if (electionElapsed >= opts.electionTicks()) {
+      bootGuard = false;
+    }
+    if (electionElapsed >= randomizedElectionTicks) {
       if (config().isVoter(id)) {
-        campaign();
+        campaign(true);
       } else {
         resetElectionTimer();
       }
     }
+  }
+
+  private void tickLeader() {
+    // Check quorum (thesis section 6.2): a leader that has not heard from a majority within an
+    // election timeout steps down, so a leader stranded in a minority stops accepting work.
+    if (++checkQuorumElapsed >= opts.electionTicks()) {
+      checkQuorumElapsed = 0;
+      recentlyActive.add(id);
+      boolean ok = config().hasQuorum(recentlyActive);
+      recentlyActive.clear();
+      if (!ok) {
+        becomeFollower(term, NONE);
+        return;
+      }
+    }
+    if (++heartbeatElapsed >= opts.heartbeatTicks()) {
+      heartbeatElapsed = 0;
+      broadcastHeartbeat();
+    }
+  }
+
+  /**
+   * Whether this node believes a leader is alive. While it does, it ignores votes for a higher term
+   * (thesis section 4.2.3). That keeps removed or partitioned nodes from deposing a healthy leader,
+   * and it is what makes lease reads safe.
+   */
+  private boolean inLease() {
+    if (role == Role.LEADER) {
+      return true;
+    }
+    return (!leaderId.isEmpty() || bootGuard) && electionElapsed < opts.electionTicks();
   }
 
   /** Handles one message from another node. Messages addressed elsewhere are ignored. */
@@ -123,12 +161,26 @@ public final class RaftNode {
       return;
     }
     if (m.term() > term) {
-      String leader = m instanceof AppendRequest || m instanceof SnapshotRequest ? m.from() : NONE;
-      becomeFollower(m.term(), leader);
+      if (m instanceof VoteRequest vr) {
+        if (inLease()) {
+          return;
+        }
+        if (!vr.preVote()) {
+          becomeFollower(m.term(), NONE);
+        }
+      } else if (!(m instanceof VoteResponse vr && vr.preVote() && vr.granted())) {
+        // A granted pre-vote carries the term the pre-candidate would campaign in, so it is the
+        // one higher-term message that does not move this node to that term.
+        String leader =
+            m instanceof AppendRequest || m instanceof SnapshotRequest ? m.from() : NONE;
+        becomeFollower(m.term(), leader);
+      }
     } else if (m.term() < term) {
-      // A stale leader learns the new term from our reply and steps down.
+      // A stale leader or pre-candidate learns the newer term from the reply.
       if (m instanceof AppendRequest || m instanceof SnapshotRequest) {
         send(new AppendResponse(id, m.from(), term, false, 0, 0, 0, 0, 0));
+      } else if (m instanceof VoteRequest vr && vr.preVote()) {
+        send(new VoteResponse(id, m.from(), term, false, true));
       }
       return;
     }
@@ -136,7 +188,7 @@ public final class RaftNode {
       case VoteRequest vr -> handleVoteRequest(vr);
       case VoteResponse vr -> handleVoteResponse(vr);
       case AppendRequest ar -> handleAppend(ar);
-      case AppendResponse ar -> {}
+      case AppendResponse ar -> handleAppendResponse(ar);
       case SnapshotRequest sr -> {}
       case SnapshotResponse sr -> {}
     }
@@ -159,45 +211,68 @@ public final class RaftNode {
         id, role, term, leaderId, commitIndex, log.lastIndex(), log.snapshot().index());
   }
 
-  private void campaign() {
-    term++;
-    votedFor = id;
-    persistHardState();
-    role = Role.CANDIDATE;
+  /**
+   * Starts an election. With {@code preVote} the node first asks whether it could win in term+1
+   * without changing anyone's term (thesis section 9.6), so a node returning from a partition
+   * cannot force the cluster into a new term.
+   */
+  private void campaign(boolean preVote) {
+    if (preVote) {
+      role = Role.PRE_CANDIDATE;
+    } else {
+      term++;
+      votedFor = id;
+      persistHardState();
+      role = Role.CANDIDATE;
+    }
     leaderId = NONE;
     votesGranted.clear();
     votesRejected.clear();
     votesGranted.add(id);
     resetElectionTimer();
     if (config().hasQuorum(votesGranted)) {
-      becomeLeader();
+      if (preVote) {
+        campaign(false);
+      } else {
+        becomeLeader();
+      }
       return;
     }
+    long voteTerm = preVote ? term + 1 : term;
     for (String peer : config().voterIds()) {
       if (!peer.equals(id)) {
-        send(new VoteRequest(id, peer, term, log.lastIndex(), log.lastTerm(), false));
+        send(new VoteRequest(id, peer, voteTerm, log.lastIndex(), log.lastTerm(), preVote));
       }
     }
   }
 
   private void handleVoteRequest(VoteRequest vr) {
-    boolean canVote = votedFor.equals(vr.from()) || (votedFor.isEmpty() && leaderId.isEmpty());
+    boolean canVote =
+        votedFor.equals(vr.from())
+            || (votedFor.isEmpty() && leaderId.isEmpty())
+            || (vr.preVote() && vr.term() > term);
     boolean grant = canVote && log.isUpToDate(vr.lastLogIndex(), vr.lastLogTerm());
-    if (grant) {
+    if (grant && !vr.preVote()) {
       votedFor = vr.from();
       persistHardState();
       electionElapsed = 0;
     }
-    send(new VoteResponse(id, vr.from(), term, grant, false));
+    long replyTerm = grant && vr.preVote() ? vr.term() : term;
+    send(new VoteResponse(id, vr.from(), replyTerm, grant, vr.preVote()));
   }
 
   private void handleVoteResponse(VoteResponse vr) {
-    if (role != Role.CANDIDATE) {
+    Role expected = vr.preVote() ? Role.PRE_CANDIDATE : Role.CANDIDATE;
+    if (role != expected) {
       return;
     }
     (vr.granted() ? votesGranted : votesRejected).add(vr.from());
     if (config().hasQuorum(votesGranted)) {
-      becomeLeader();
+      if (vr.preVote()) {
+        campaign(false);
+      } else {
+        becomeLeader();
+      }
     } else if (config().hasQuorum(votesRejected)) {
       becomeFollower(term, NONE);
     }
@@ -215,6 +290,13 @@ public final class RaftNode {
             id, ar.from(), term, ok, ok ? ar.prevLogIndex() : 0, ar.prevLogIndex(), 0, 0, 0));
   }
 
+  private void handleAppendResponse(AppendResponse ar) {
+    if (role != Role.LEADER) {
+      return;
+    }
+    recentlyActive.add(ar.from());
+  }
+
   private void becomeFollower(long newTerm, String leader) {
     if (newTerm > term) {
       term = newTerm;
@@ -230,6 +312,8 @@ public final class RaftNode {
     role = Role.LEADER;
     leaderId = id;
     heartbeatElapsed = 0;
+    checkQuorumElapsed = 0;
+    recentlyActive.clear();
     broadcastHeartbeat();
   }
 

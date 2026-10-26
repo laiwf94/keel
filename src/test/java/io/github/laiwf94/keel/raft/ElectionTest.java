@@ -19,6 +19,18 @@ class ElectionTest {
     return new TestCluster(3, 0).config;
   }
 
+  /** A follower that has waited out its boot guard but not yet campaigned. */
+  static RaftNode fresh(String id, MemStorage s) {
+    RaftOptions o = new RaftOptions(10, 2, 256, 1 << 20, 4096, 2);
+    RaftNode n = new RaftNode(id, three(), o, s, new Random(5));
+    for (int i = 0; i < o.electionTicks(); i++) {
+      n.tick();
+    }
+    n.ready();
+    s.sync();
+    return n;
+  }
+
   @Test
   void threeNodesElectExactlyOneLeader() {
     TestCluster c = new TestCluster(3, 1);
@@ -60,13 +72,13 @@ class ElectionTest {
   @Test
   void voteSurvivesRestartAndIsNotGivenTwice() {
     MemStorage s = new MemStorage();
-    RaftNode n = new RaftNode("n1", three(), RaftOptions.DEFAULTS, s, new Random(1));
+    RaftNode n = fresh("n1", s);
     n.step(new VoteRequest("n2", "n1", 5, 0, 0, false));
     Ready r = n.ready();
     s.sync();
     assertEquals(List.of(new VoteResponse("n1", "n2", 5, true, false)), r.messages());
 
-    RaftNode restarted = new RaftNode("n1", three(), RaftOptions.DEFAULTS, s, new Random(2));
+    RaftNode restarted = fresh("n1", s);
     assertEquals(5, restarted.term());
     restarted.step(new VoteRequest("n3", "n1", 5, 0, 0, false));
     assertEquals(
@@ -79,7 +91,7 @@ class ElectionTest {
   @Test
   void unsyncedVoteIsLostOnCrash() {
     MemStorage s = new MemStorage();
-    RaftNode n = new RaftNode("n1", three(), RaftOptions.DEFAULTS, s, new Random(1));
+    RaftNode n = fresh("n1", s);
     n.step(new VoteRequest("n2", "n1", 5, 0, 0, false));
     n.ready();
     s.crash();
@@ -95,7 +107,7 @@ class ElectionTest {
             new Entry(2, 2, EntryType.COMMAND, new byte[0])));
     s.saveHardState(new HardState(2, ""));
     s.sync();
-    RaftNode n = new RaftNode("n1", three(), RaftOptions.DEFAULTS, s, new Random(1));
+    RaftNode n = fresh("n1", s);
     n.step(new VoteRequest("n2", "n1", 3, 5, 1, false));
     assertFalse(((VoteResponse) n.ready().messages().get(0)).granted());
     n.step(new VoteRequest("n3", "n1", 3, 2, 2, false));
@@ -105,11 +117,15 @@ class ElectionTest {
   @Test
   void candidateStepsDownWhenAMajorityRejects() {
     RaftNode n = new RaftNode("n1", three(), RaftOptions.DEFAULTS, new MemStorage(), new Random(1));
-    for (int i = 0; i < 40 && n.role() != RaftNode.Role.CANDIDATE; i++) {
+    for (int i = 0; i < 40 && n.role() != RaftNode.Role.PRE_CANDIDATE; i++) {
       n.tick();
     }
+    assertEquals(RaftNode.Role.PRE_CANDIDATE, n.role());
+    assertEquals(0, n.term());
+    n.step(new VoteResponse("n2", "n1", 1, true, true));
     assertEquals(RaftNode.Role.CANDIDATE, n.role());
     long t = n.term();
+    assertEquals(1, t);
     n.step(new VoteResponse("n2", "n1", t, false, false));
     assertEquals(RaftNode.Role.CANDIDATE, n.role());
     n.step(new VoteResponse("n3", "n1", t, false, false));
@@ -141,7 +157,7 @@ class ElectionTest {
     assertTrue(leader.leader().isEmpty());
 
     RaftNode n = new RaftNode("n1", three(), RaftOptions.DEFAULTS, new MemStorage(), new Random(1));
-    for (int i = 0; i < 40 && n.role() != RaftNode.Role.CANDIDATE; i++) {
+    for (int i = 0; i < 40 && n.role() != RaftNode.Role.PRE_CANDIDATE; i++) {
       n.tick();
     }
     n.step(new AppendRequest("n2", "n1", n.term(), 0, 0, List.of(), 0, 0));
