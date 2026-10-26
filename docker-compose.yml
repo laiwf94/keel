@@ -1,0 +1,68 @@
+# Three keel nodes. Peers talk on the internal "peers" network through aliases that exist only
+# there, so disconnecting a container from "peers" partitions it while clients on the host can
+# still reach its HTTP port. Set KEEL_CLUSTER_SECRET (16+ characters) before starting.
+name: keel
+
+x-node: &node
+  build: .
+  image: keel:local
+  restart: "no"
+  healthcheck:
+    test: ["CMD", "java", "-XX:TieredStopAtLevel=1", "-jar", "/app/keel.jar", "status",
+           "--endpoints", "http://127.0.0.1:8080", "--timeout", "1s", "--retry-for", "1s"]
+    interval: 5s
+    timeout: 4s
+    retries: 6
+    start_period: 5s
+
+x-env: &env
+  KEEL_MEMBERS: n1@keel1-peer:7000@localhost:8081,n2@keel2-peer:7000@localhost:8082,n3@keel3-peer:7000@localhost:8083
+  KEEL_SECRET: ${KEEL_CLUSTER_SECRET:?set KEEL_CLUSTER_SECRET to 16 or more random characters}
+  KEEL_CLIENT_TOKEN: ${KEEL_CLIENT_TOKEN:-}
+  KEEL_TOKEN: ${KEEL_CLIENT_TOKEN:-}
+  KEEL_ADMIN_TOKEN: ${KEEL_ADMIN_TOKEN:-}
+  KEEL_DATA: /data
+  KEEL_PEER_BIND: 0.0.0.0:7000
+  KEEL_HTTP_BIND: 0.0.0.0:8080
+
+services:
+  keel1:
+    <<: *node
+    environment:
+      <<: *env
+      KEEL_ID: n1
+    ports: ["127.0.0.1:8081:8080"]
+    volumes: ["keel1:/data"]
+    networks:
+      peers: {aliases: [keel1-peer]}
+      clients: {}
+  keel2:
+    <<: *node
+    environment:
+      <<: *env
+      KEEL_ID: n2
+    ports: ["127.0.0.1:8082:8080"]
+    volumes: ["keel2:/data"]
+    networks:
+      peers: {aliases: [keel2-peer]}
+      clients: {}
+  keel3:
+    <<: *node
+    environment:
+      <<: *env
+      KEEL_ID: n3
+    ports: ["127.0.0.1:8083:8080"]
+    volumes: ["keel3:/data"]
+    networks:
+      peers: {aliases: [keel3-peer]}
+      clients: {}
+
+networks:
+  peers:
+    internal: true
+  clients: {}
+
+volumes:
+  keel1: {}
+  keel2: {}
+  keel3: {}

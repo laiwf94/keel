@@ -259,6 +259,9 @@ public final class Main {
 
   private static int server(Args a, PrintStream out) throws UsageException, IOException {
     KeelServer.Config c = serverConfig(a);
+    // Peer addresses are host names that can move (containers, rescheduled pods). The JVM caches
+    // successful lookups for 30 s by default; keep that short so a moved peer is found again.
+    java.security.Security.setProperty("networkaddress.cache.ttl", "5");
     CountDownLatch stopped = new CountDownLatch(1);
     // A node that cannot write to disk must stop at once rather than keep talking to peers.
     KeelServer s = KeelServer.start(c, out, () -> Runtime.getRuntime().halt(70));
