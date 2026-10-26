@@ -1,0 +1,47 @@
+
+== building the client and starting three nodes
+node role           term  leader  applied
+n1   follower       1     n3      1      
+n2   follower       1     n3      1      
+n3   leader         1     n3      1      
+
+== write load: 4 clients for 25 s, every acknowledged write recorded
+
+== killing the leader n3 (term 1) with SIGKILL, mid-load
+new leader: n1 in term 2 (was n3 in term 1)
+node role           term  leader  applied
+n1   leader         2     n1      478    
+n2   follower       2     n1      482    
+n3   (down)
+
+== restarting n3 from its own disk
+t=23s acked=1755 unknown=0 errors=0
+t=24s acked=1839 unknown=0 errors=0
+t=25s acked=1892 unknown=0 errors=0
+load done: acked=1892 unknown=0 errors=0
+
+== reading back all 1892 acknowledged writes with linearizable reads
+verify: checked=1892 present=1892 lost=0
+node role           term  leader  applied
+n1   leader         2     n1      1898   
+n2   follower       2     n1      1898   
+n3   follower       2     n1      1898   
+
+== partition: cutting the leader n1 off from its peers
+write sent to the isolated n1: HTTP 503 {"error":"leadership changed before the entry was applied; retry with the same Keel-Seq to be safe","outcome":"unknown"}
+majority leader: n2 in term 3
+write through the majority: acknowledged
+node role           term  leader  applied
+n1   pre_candidate  2     -       1898   
+n2   leader         3     n2      1900   
+n3   follower       3     n2      1900   
+
+== healing the partition
+node role           term  leader  applied
+n1   follower       3     n2      1900   
+n2   leader         3     n2      1900   
+n3   follower       3     n2      1900   
+on n1: the uncommitted minority write is gone (HTTP 404)
+on n1: the majority write is present ("kept")
+
+== PASS: no acknowledged write lost across a leader kill; an isolated leader could not commit
