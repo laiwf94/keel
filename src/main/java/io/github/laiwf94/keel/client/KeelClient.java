@@ -13,6 +13,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.ThreadLocalRandom;
+import java.util.concurrent.locks.ReentrantLock;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -67,6 +68,7 @@ public final class KeelClient implements AutoCloseable {
 
   private final Options opts;
   private final HttpClient http;
+  private final ReentrantLock lock = new ReentrantLock();
   private URI current;
   private int next;
   private long clientId;
@@ -84,40 +86,69 @@ public final class KeelClient implements AutoCloseable {
   }
 
   /** The node the client is talking to now; after a write this is usually the leader. */
-  public synchronized URI current() {
-    return current;
+  public URI current() {
+    lock.lock();
+    try {
+      return current;
+    } finally {
+      lock.unlock();
+    }
+  }
+
+  /** Runs one call while holding the lock, so calls on this client never overlap. */
+  private <T> T locked(Call<T> c) throws KeelException, InterruptedException {
+    lock.lockInterruptibly();
+    try {
+      return c.run();
+    } finally {
+      lock.unlock();
+    }
+  }
+
+  @FunctionalInterface
+  private interface Call<T> {
+    T run() throws KeelException, InterruptedException;
   }
 
   /** Registers a session; later writes from this client are applied at most once. */
-  public synchronized long openSession() throws KeelException, InterruptedException {
-    HttpResponse<byte[]> r = call("POST", "/v1/sessions", null, List.of(), false);
-    clientId = field(r, "client_id");
-    seq = 0;
-    return clientId;
+  public long openSession() throws KeelException, InterruptedException {
+    return locked(
+        () -> {
+          HttpResponse<byte[]> r = call("POST", "/v1/sessions", null, List.of(), false);
+          clientId = field(r, "client_id");
+          seq = 0;
+          return clientId;
+        });
   }
 
-  public synchronized long put(String key, byte[] value)
-      throws KeelException, InterruptedException {
-    return write("PUT", key, value, List.of(), "version");
+  public long put(String key, byte[] value) throws KeelException, InterruptedException {
+    return locked(() -> write("PUT", key, value, List.of(), "version"));
   }
 
   /** Writes only if the key's version is {@code expected} (0 means "only if absent"). */
-  public synchronized long putIf(String key, byte[] value, long expected)
+  public long putIf(String key, byte[] value, long expected)
       throws KeelException, InterruptedException {
     List<String> h =
         expected == 0 ? List.of("If-None-Match", "*") : List.of("If-Match", "\"" + expected + "\"");
-    return write("PUT", key, value, h, "version");
+    return locked(() -> write("PUT", key, value, h, "version"));
   }
 
   /** Deletes a key; returns the version removed, or 0 if it was absent. */
-  public synchronized long delete(String key) throws KeelException, InterruptedException {
-    return write("DELETE", key, null, List.of(), "deleted_version");
+  public long delete(String key) throws KeelException, InterruptedException {
+    return locked(() -> write("DELETE", key, null, List.of(), "deleted_version"));
   }
 
-  public synchronized Optional<Versioned> get(String key, String consistency)
+  public Optional<Versioned> get(String key, String consistency)
       throws KeelException, InterruptedException {
     HttpResponse<byte[]> r =
-        call("GET", "/v1/kv/" + encode(key) + "?consistency=" + consistency, null, List.of(), true);
+        locked(
+            () ->
+                call(
+                    "GET",
+                    "/v1/kv/" + encode(key) + "?consistency=" + consistency,
+                    null,
+                    List.of(),
+                    true));
     if (r.statusCode() == 404) {
       return Optional.empty();
     }
@@ -126,24 +157,24 @@ public final class KeelClient implements AutoCloseable {
   }
 
   /** The raw JSON of {@code GET /v1/status} from the current node. */
-  public synchronized String status() throws KeelException, InterruptedException {
-    return new String(
-        call("GET", "/v1/status", null, List.of(), false).body(), StandardCharsets.UTF_8);
+  public String status() throws KeelException, InterruptedException {
+    return text(locked(() -> call("GET", "/v1/status", null, List.of(), false)));
+  }
+
+  private static String text(HttpResponse<byte[]> r) {
+    return new String(r.body(), StandardCharsets.UTF_8);
   }
 
   /** Adds a server as a learner; needs the admin token. Returns the new member list as JSON. */
-  public synchronized String addMember(String id, String peer, String client)
+  public String addMember(String id, String peer, String client)
       throws KeelException, InterruptedException {
     String q = "?id=" + encode(id) + "&peer=" + encode(peer) + "&client=" + encode(client);
-    return new String(
-        call("POST", "/v1/members" + q, null, List.of(), false).body(), StandardCharsets.UTF_8);
+    return text(locked(() -> call("POST", "/v1/members" + q, null, List.of(), false)));
   }
 
   /** Removes a server; needs the admin token. Returns the new member list as JSON. */
-  public synchronized String removeMember(String id) throws KeelException, InterruptedException {
-    return new String(
-        call("DELETE", "/v1/members/" + encode(id), null, List.of(), false).body(),
-        StandardCharsets.UTF_8);
+  public String removeMember(String id) throws KeelException, InterruptedException {
+    return text(locked(() -> call("DELETE", "/v1/members/" + encode(id), null, List.of(), false)));
   }
 
   private long write(String method, String key, byte[] body, List<String> headers, String field)

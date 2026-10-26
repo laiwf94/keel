@@ -27,6 +27,7 @@ import java.util.Optional;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.locks.ReentrantLock;
 
 /** The {@code keel} command line: run a node, or talk to a cluster. */
 public final class Main {
@@ -281,6 +282,10 @@ public final class Main {
   }
 
   static KeelClient client(Args a, Optional<String> token) throws UsageException {
+    return new KeelClient(clientOptions(a, token));
+  }
+
+  static KeelClient.Options clientOptions(Args a, Optional<String> token) throws UsageException {
     List<URI> endpoints = new ArrayList<>();
     for (String e : a.get("endpoints", "http://127.0.0.1:8080").split(",", -1)) {
       try {
@@ -293,9 +298,8 @@ public final class Main {
         throw new UsageException("bad endpoint " + e);
       }
     }
-    return new KeelClient(
-        new KeelClient.Options(
-            endpoints, token, a.duration("timeout", "2s"), a.duration("retry-for", "10s")));
+    return new KeelClient.Options(
+        endpoints, token, a.duration("timeout", "2s"), a.duration("retry-for", "10s"));
   }
 
   private static int client(String cmd, Args a, PrintStream out, PrintStream err)
@@ -354,11 +358,17 @@ public final class Main {
     return HexFormat.of().formatHex(b);
   }
 
+  private static final ReentrantLock APPEND = new ReentrantLock();
+
+  /** Appends one line for a load worker; a lock, not synchronized, so virtual threads unmount. */
   static void appendLine(BufferedWriter w, String line, AtomicLong count) throws IOException {
-    synchronized (w) {
+    APPEND.lock();
+    try {
       w.write(line);
       w.newLine();
       w.flush();
+    } finally {
+      APPEND.unlock();
     }
     count.incrementAndGet();
   }
