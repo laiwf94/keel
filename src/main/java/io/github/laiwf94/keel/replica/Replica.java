@@ -8,6 +8,7 @@ import io.github.laiwf94.keel.raft.NotLeaderException;
 import io.github.laiwf94.keel.raft.RaftNode;
 import io.github.laiwf94.keel.raft.RaftOptions;
 import io.github.laiwf94.keel.raft.Ready;
+import io.github.laiwf94.keel.raft.Snapshot;
 import io.github.laiwf94.keel.raft.Storage;
 import java.util.ArrayList;
 import java.util.List;
@@ -30,6 +31,7 @@ public final class Replica {
   private final Storage storage;
   private final StateMachine machine;
   private final Consumer<Message> transport;
+  private final long snapshotEvery;
   private final TreeMap<Long, Pending> pending = new TreeMap<>();
   private long appliedIndex;
   private Ready.Status status;
@@ -41,7 +43,12 @@ public final class Replica {
       Storage storage,
       StateMachine machine,
       Random random,
-      Consumer<Message> transport) {
+      Consumer<Message> transport,
+      long snapshotEvery) {
+    if (snapshotEvery < 1) {
+      throw new IllegalArgumentException("snapshotEvery must be positive");
+    }
+    this.snapshotEvery = snapshotEvery;
     this.storage = storage;
     this.machine = machine;
     this.transport = transport;
@@ -92,13 +99,31 @@ public final class Replica {
     for (Message m : r.messages()) {
       transport.accept(m);
     }
+    r.snapshot().ifPresent(this::restore);
     for (Entry e : r.committed()) {
       apply(e);
+    }
+    if (appliedIndex - node.log().snapshot().index() >= snapshotEvery) {
+      node.compact(appliedIndex, machine.snapshot());
     }
     Ready.Status before = status;
     status = r.status();
     if (status.role() != RaftNode.Role.LEADER || status.term() != before.term()) {
       failPending("leadership changed before the entry was applied");
+    }
+  }
+
+  private void restore(Snapshot s) {
+    machine.restore(s.data());
+    appliedIndex = s.meta().index();
+    // Proposals the snapshot covers were either applied by others or overwritten; we cannot
+    // tell which from here.
+    while (!pending.isEmpty() && pending.firstKey() <= appliedIndex) {
+      pending
+          .pollFirstEntry()
+          .getValue()
+          .callback()
+          .accept(new Outcome.Unknown("covered by a snapshot"));
     }
   }
 

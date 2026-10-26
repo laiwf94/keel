@@ -104,6 +104,21 @@ class KvSimulationTest {
   }
 
   @Test
+  void snapshotsAreInstalledInMostSeeds() {
+    AtomicInteger withInstall = new AtomicInteger();
+    LongStream.range(0, 40)
+        .parallel()
+        .forEach(
+            seed -> {
+              Run r = run(seed, Simulation.Options.defaults(), () -> new KvMachine(60_000, 100));
+              if (r.sim().snapshotsDelivered > 0) {
+                withInstall.incrementAndGet();
+              }
+            });
+    assertTrue(withInstall.get() >= 20, "InstallSnapshot ran in only " + withInstall + " of 40");
+  }
+
+  @Test
   void clientsMakeProgress() {
     Run r =
         run(3, Simulation.Options.defaults().withFaults(false), () -> new KvMachine(60_000, 10));

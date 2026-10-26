@@ -16,6 +16,7 @@ final class TestCluster {
   final Map<String, RaftNode> nodes = new LinkedHashMap<>();
   final Map<String, MemStorage> storages = new LinkedHashMap<>();
   final Map<String, List<Entry>> applied = new LinkedHashMap<>();
+  final Map<String, List<Snapshot>> restored = new LinkedHashMap<>();
   final Set<String> down = new HashSet<>();
   final Set<String> isolated = new HashSet<>();
   final Deque<Message> wire = new ArrayDeque<>();
@@ -39,6 +40,7 @@ final class TestCluster {
     for (Member m : ms) {
       storages.put(m.id(), new MemStorage());
       applied.put(m.id(), new ArrayList<>());
+      restored.put(m.id(), new ArrayList<>());
       start(m.id());
     }
   }
@@ -85,6 +87,7 @@ final class TestCluster {
         storages.get(e.getKey()).sync();
         wire.addAll(r.messages());
         applied.get(e.getKey()).addAll(r.committed());
+        r.snapshot().ifPresent(restored.get(e.getKey())::add);
       }
       if (wire.isEmpty()) {
         return;

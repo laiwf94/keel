@@ -48,7 +48,14 @@ class ReplicaTest {
   static Replica single(Echo sm, List<Message> sent) {
     Replica r =
         new Replica(
-            "n1", config(1), RaftOptions.DEFAULTS, new MemStorage(), sm, new Random(1), sent::add);
+            "n1",
+            config(1),
+            RaftOptions.DEFAULTS,
+            new MemStorage(),
+            sm,
+            new Random(1),
+            sent::add,
+            1_000);
     while (r.node().role() != RaftNode.Role.LEADER) {
       r.tick();
       r.process();
@@ -82,7 +89,8 @@ class ReplicaTest {
             new MemStorage(),
             new Echo(),
             new Random(1),
-            m -> {});
+            m -> {},
+            1_000);
     r.propose(new byte[] {1}, out::add);
     assertEquals(new Outcome.NotLeader(java.util.Optional.empty()), out.get(0));
   }
@@ -98,7 +106,8 @@ class ReplicaTest {
             new MemStorage(),
             new Echo(),
             new Random(1),
-            sent::add);
+            sent::add,
+            1_000);
     while (r.node().role() != RaftNode.Role.PRE_CANDIDATE) {
       r.tick();
       r.process();
@@ -128,7 +137,8 @@ class ReplicaTest {
             new MemStorage(),
             new Echo(),
             new Random(1),
-            sent::add);
+            sent::add,
+            1_000);
     while (r.node().role() != RaftNode.Role.PRE_CANDIDATE) {
       r.tick();
       r.process();

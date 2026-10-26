@@ -40,7 +40,9 @@ public final class RaftNode {
       /** Send one batch at a time until the follower's match point is found. */
       PROBE,
       /** The follower is in step: stream batches without waiting for each reply. */
-      REPLICATE
+      REPLICATE,
+      /** The follower needs entries we compacted; a snapshot is on its way. */
+      SNAPSHOT
     }
 
     long match;
@@ -48,6 +50,7 @@ public final class RaftNode {
     State state = State.PROBE;
     boolean paused;
     long ackedSeq;
+    int snapshotElapsed;
 
     Progress(long next) {
       this.next = next;
@@ -84,6 +87,8 @@ public final class RaftNode {
   private boolean broadcastPending;
 
   private final List<Message> outbox = new ArrayList<>();
+  private Snapshot latestSnapshot;
+  private Snapshot toRestore;
 
   public RaftNode(
       String id, Configuration initial, RaftOptions opts, Storage storage, Random random) {
@@ -99,6 +104,8 @@ public final class RaftNode {
     this.votedFor = st.hardState().votedFor();
     this.commitIndex = meta.index();
     this.handedOut = meta.index();
+    this.latestSnapshot = st.snapshot().orElse(null);
+    this.toRestore = latestSnapshot;
     resetElectionTimer();
   }
 
@@ -167,6 +174,12 @@ public final class RaftNode {
       heartbeatElapsed = 0;
       broadcastHeartbeat();
     }
+    for (Map.Entry<String, Progress> e : progress.entrySet()) {
+      Progress pr = e.getValue();
+      if (pr.state == Progress.State.SNAPSHOT && ++pr.snapshotElapsed >= opts.electionTicks()) {
+        sendSnapshot(e.getKey()); // the last one was probably lost
+      }
+    }
   }
 
   /**
@@ -194,6 +207,23 @@ public final class RaftNode {
     Entry e = new Entry(log.lastIndex() + 1, term, EntryType.COMMAND, command);
     appendLocal(e);
     return e.index();
+  }
+
+  /**
+   * Replaces the log up to {@code index} with a snapshot of the state machine at that index. The
+   * driver calls this after applying {@code index}; {@code data} is the state machine's snapshot.
+   */
+  public void compact(long index, byte[] data) {
+    if (index > handedOut) {
+      throw new IllegalArgumentException(
+          "cannot snapshot at " + index + " before applying it (applied " + handedOut + ")");
+    }
+    if (index <= log.snapshot().index()) {
+      return;
+    }
+    SnapshotMeta meta = log.compactTo(index);
+    latestSnapshot = new Snapshot(meta, data);
+    storage.saveSnapshot(latestSnapshot, log.entries());
   }
 
   /** Handles one message from another node. Messages addressed elsewhere are ignored. */
@@ -230,8 +260,8 @@ public final class RaftNode {
       case VoteResponse vr -> handleVoteResponse(vr);
       case AppendRequest ar -> handleAppend(ar);
       case AppendResponse ar -> handleAppendResponse(ar);
-      case SnapshotRequest sr -> {}
-      case SnapshotResponse sr -> {}
+      case SnapshotRequest sr -> handleSnapshot(sr);
+      case SnapshotResponse sr -> handleSnapshotResponse(sr);
     }
   }
 
@@ -248,8 +278,9 @@ public final class RaftNode {
       committed.add(log.entry(i));
     }
     handedOut = commitIndex;
-    Ready r = new Ready(outbox, Optional.empty(), committed, List.of(), status());
+    Ready r = new Ready(outbox, Optional.ofNullable(toRestore), committed, List.of(), status());
     outbox.clear();
+    toRestore = null;
     return r;
   }
 
@@ -381,8 +412,8 @@ public final class RaftNode {
       sendAppend(ar.from(), false);
       return;
     }
-    if (ar.rejectedIndex() <= pr.match) {
-      return; // a reply to a message older than what the follower has since acknowledged
+    if (ar.rejectedIndex() <= pr.match || pr.state == Progress.State.SNAPSHOT) {
+      return; // a reply to an older message, or a heartbeat while a snapshot is in flight
     }
     long next = ar.conflictIndex();
     if (ar.conflictTerm() > 0) {
@@ -435,8 +466,19 @@ public final class RaftNode {
    */
   private void sendAppend(String peer, boolean heartbeat) {
     Progress pr = progress.get(peer);
+    if (pr.state == Progress.State.SNAPSHOT) {
+      if (heartbeat) {
+        long at = log.snapshot().index();
+        send(new AppendRequest(id, peer, term, at, log.termAt(at), List.of(), commitIndex, seq));
+      }
+      return;
+    }
     long prev = pr.next - 1;
     long prevTerm = log.termAt(prev);
+    if (prevTerm == RaftLog.UNKNOWN) {
+      sendSnapshot(peer);
+      return;
+    }
     List<Entry> entries = List.of();
     boolean windowFull =
         pr.state == Progress.State.REPLICATE && pr.next - pr.match - 1 >= opts.maxInflightEntries();
@@ -455,6 +497,49 @@ public final class RaftNode {
       }
     }
     send(new AppendRequest(id, peer, term, prev, prevTerm, entries, commitIndex, seq));
+  }
+
+  private void sendSnapshot(String peer) {
+    Progress pr = progress.get(peer);
+    pr.state = Progress.State.SNAPSHOT;
+    pr.snapshotElapsed = 0;
+    send(new SnapshotRequest(id, peer, term, latestSnapshot, seq));
+  }
+
+  /** InstallSnapshot (section 7), received whole. */
+  private void handleSnapshot(SnapshotRequest sr) {
+    if (role != Role.FOLLOWER) {
+      becomeFollower(term, sr.from());
+    }
+    leaderId = sr.from();
+    electionElapsed = 0;
+    SnapshotMeta meta = sr.snapshot().meta();
+    if (meta.index() <= commitIndex) {
+      send(new SnapshotResponse(id, sr.from(), term, commitIndex, sr.seq()));
+      return;
+    }
+    log.installSnapshot(meta);
+    storage.saveSnapshot(sr.snapshot(), log.entries());
+    latestSnapshot = sr.snapshot();
+    toRestore = sr.snapshot();
+    commitIndex = meta.index();
+    handedOut = meta.index();
+    send(new SnapshotResponse(id, sr.from(), term, meta.index(), sr.seq()));
+  }
+
+  private void handleSnapshotResponse(SnapshotResponse sr) {
+    Progress pr = progress.get(sr.from());
+    if (role != Role.LEADER || pr == null) {
+      return;
+    }
+    recentlyActive.add(sr.from());
+    pr.ackedSeq = Math.max(pr.ackedSeq, sr.seq());
+    pr.match = Math.max(pr.match, sr.matchIndex());
+    pr.next = pr.match + 1;
+    pr.state = Progress.State.PROBE;
+    pr.paused = false;
+    maybeCommit();
+    sendAppend(sr.from(), false);
   }
 
   private void becomeFollower(long newTerm, String leader) {

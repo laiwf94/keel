@@ -38,9 +38,10 @@ final class Simulation {
       double duplicateRate,
       boolean faults,
       int meanFaultGapMs,
+      long snapshotEvery,
       RaftOptions raft) {
     static Options defaults() {
-      return new Options(5, 6_000, 10, 1, 15, 0.02, 0.02, true, 400, RaftOptions.DEFAULTS);
+      return new Options(5, 6_000, 10, 1, 15, 0.02, 0.02, true, 400, 40, RaftOptions.DEFAULTS);
     }
 
     Options withNodes(int n) {
@@ -54,6 +55,7 @@ final class Simulation {
           duplicateRate,
           faults,
           meanFaultGapMs,
+          snapshotEvery,
           raft);
     }
 
@@ -68,6 +70,22 @@ final class Simulation {
           duplicateRate,
           f,
           meanFaultGapMs,
+          snapshotEvery,
+          raft);
+    }
+
+    Options withSnapshotEvery(long every) {
+      return new Options(
+          nodes,
+          durationMs,
+          tickMs,
+          minDelayMs,
+          maxDelayMs,
+          dropRate,
+          duplicateRate,
+          faults,
+          meanFaultGapMs,
+          every,
           raft);
     }
   }
@@ -104,6 +122,7 @@ final class Simulation {
   private long eventSeq;
   private long trace = 0xcbf29ce484222325L;
   long delivered;
+  long snapshotsDelivered;
   final List<String> faultLog = new ArrayList<>();
 
   Simulation(long seed, Options opts, Supplier<StateMachine> machines) {
@@ -143,7 +162,14 @@ final class Simulation {
     n.machine = machines.get();
     n.replica =
         new Replica(
-            id, config, opts.raft(), n.storage, n.machine, new Random(rnd.nextLong()), this::send);
+            id,
+            config,
+            opts.raft(),
+            n.storage,
+            n.machine,
+            new Random(rnd.nextLong()),
+            this::send,
+            opts.snapshotEvery());
     n.up = true;
     int inc = ++n.incarnation;
     mix(id.hashCode() * 31L + inc);
@@ -217,6 +243,9 @@ final class Simulation {
       return;
     }
     delivered++;
+    if (m instanceof Message.SnapshotRequest) {
+      snapshotsDelivered++;
+    }
     mix(now);
     mix(m.hashCode());
     n.replica.receive(m);
