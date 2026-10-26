@@ -17,7 +17,14 @@ import org.junit.jupiter.api.Test;
 
 /** Simulated clients against a faulty cluster, with every history checked for linearizability. */
 class KvSimulationTest {
-  record Run(Simulation sim, History history, int retries) {}
+  /**
+   * One run. {@code completedAfterFaults} counts operations that finished after the fault period,
+   * when the network is healed and every node is back: a cluster that recovers must serve them.
+   */
+  record Run(Simulation sim, History history, int retries, int completedAfterFaults) {}
+
+  /** How long clients keep working after faults stop, inside the settle period. */
+  static final long CLIENTS_AFTER_FAULTS_MS = 2_000;
 
   static Run run(long seed, Simulation.Options opts, Supplier<StateMachine> machines) {
     return run(new Simulation(seed, opts, machines), opts);
@@ -35,21 +42,26 @@ class KvSimulationTest {
                         sim,
                         history,
                         keys,
-                        opts.durationMs(),
+                        opts.durationMs() + CLIENTS_AFTER_FAULTS_MS,
                         i % 2 == 0 ? ReadMode.LINEARIZABLE : ReadMode.LEASE))
             .toList();
     sim.startAll();
     clients.forEach(SimKvClient::start);
     sim.runUntil(opts.durationMs());
+    int completedDuringFaults = history.completed();
     sim.settle(3_000);
-    return new Run(sim, history, clients.stream().mapToInt(c -> c.retries).sum());
+    return new Run(
+        sim,
+        history,
+        clients.stream().mapToInt(c -> c.retries).sum(),
+        history.completed() - completedDuringFaults);
   }
 
   static void checkSeed(long seed, Simulation.Options opts) {
     Run r = run(seed, opts, () -> new KvMachine(60_000, 1_000));
     Optional<String> violation = Linearizability.check(r.history().ops);
     assertTrue(violation.isEmpty(), () -> violation.get());
-    assertTrue(r.history().completed() > 0, "no operation completed");
+    assertTrue(r.completedAfterFaults() > 0, "no operation completed after the faults stopped");
     r.sim().checkLogMatching();
     // Once settled, replicas at the same applied index hold identical state.
     var nodes = r.sim().nodes.values().stream().toList();
@@ -119,6 +131,27 @@ class KvSimulationTest {
     assertTrue(applied >= 5, "only " + applied + " changes applied: " + sim.membershipLog);
     assertTrue(
         sim.membershipLog.stream().anyMatch(l -> l.contains("remove") && l.contains("Applied")));
+  }
+
+  /**
+   * Seeds whose fault schedule keeps a majority down for the whole fault period, so no client
+   * finishes anything until the cluster recovers (issue #23). The cluster must then serve clients.
+   */
+  @Test
+  void clientsAreServedOnceAClusterThatWasDownThroughoutRecovers() {
+    Run threeNodes =
+        run(1709, Simulation.Options.defaults().withNodes(3), () -> new KvMachine(60_000, 1_000));
+    assertEquals(
+        threeNodes.history().completed(),
+        threeNodes.completedAfterFaults(),
+        "seed 1709 keeps a majority down for the whole fault period");
+    assertTrue(threeNodes.completedAfterFaults() > 0, "nothing completed after recovery");
+    assertTrue(Linearizability.check(threeNodes.history().ops).isEmpty());
+
+    Run drift =
+        run(5669, Simulation.Options.defaults().withDrift(0.1), () -> new KvMachine(60_000, 1_000));
+    assertTrue(drift.completedAfterFaults() > 0, "nothing completed after recovery");
+    assertTrue(Linearizability.check(drift.history().ops).isEmpty());
   }
 
   /** A replica that ignores sessions, so a retried write can apply twice. */
