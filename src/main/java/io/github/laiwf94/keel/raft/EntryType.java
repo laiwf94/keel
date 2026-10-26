@@ -7,17 +7,29 @@ public enum EntryType {
   /**
    * Appended by a new leader so entries from earlier terms can commit (Raft paper, section 5.4.2).
    */
-  NOOP,
+  NOOP(0),
   /** An opaque command for the state machine. */
-  COMMAND,
+  COMMAND(1),
   /** A new cluster configuration, effective as soon as it is appended. */
-  CONFIG;
+  CONFIG(2);
+
+  private final int code;
+
+  EntryType(int code) {
+    this.code = code;
+  }
+
+  /** The stable number written to disk and the wire. */
+  public int code() {
+    return code;
+  }
 
   public static EntryType fromCode(int code) {
-    EntryType[] all = values();
-    if (code < 0 || code >= all.length) {
-      throw new CodecException("unknown entry type " + code);
+    for (EntryType t : values()) {
+      if (t.code == code) {
+        return t;
+      }
     }
-    return all[code];
+    throw new CodecException("unknown entry type " + code);
   }
 }
