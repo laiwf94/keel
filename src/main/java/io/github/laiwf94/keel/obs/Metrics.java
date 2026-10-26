@@ -7,11 +7,12 @@ import java.util.concurrent.atomic.AtomicLongArray;
 import java.util.concurrent.atomic.DoubleAdder;
 import java.util.concurrent.atomic.LongAdder;
 import java.util.function.DoubleSupplier;
+import java.util.function.LongSupplier;
 
 /** Counters, gauges and histograms rendered in the Prometheus text exposition format. */
 public final class Metrics {
   /** Anything that can render itself in the exposition format. */
-  public sealed interface Metric permits Counter, Histogram, Gauge {
+  public sealed interface Metric permits Counter, Histogram, Gauge, CounterFunction {
     void render(StringBuilder sb, String name);
 
     String help();
@@ -129,7 +130,24 @@ public final class Metrics {
     }
   }
 
+  record CounterFunction(String help, LongSupplier value) implements Metric {
+    @Override
+    public void render(StringBuilder sb, String name) {
+      sb.append(name).append(' ').append(value.getAsLong()).append('\n');
+    }
+
+    @Override
+    public String type() {
+      return "counter";
+    }
+  }
+
   private final Map<String, Metric> metrics = new ConcurrentSkipListMap<>();
+
+  /** A counter whose value is read from elsewhere, such as the transport's own counters. */
+  public void counter(String name, String help, LongSupplier value) {
+    metrics.put(name, new CounterFunction(help, value));
+  }
 
   public Counter counter(String name, String help) {
     return (Counter) metrics.computeIfAbsent(name, n -> new Counter(help));
