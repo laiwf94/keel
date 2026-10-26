@@ -28,22 +28,44 @@ final class LocalCluster implements AutoCloseable {
   final Path root;
   final Configuration config;
   final Map<String, KeelServer> servers = new LinkedHashMap<>();
+  // Per node: peer port, HTTP port, and the proxy port peers dial when proxies are on.
   final Map<String, int[]> ports = new LinkedHashMap<>();
+  final Map<String, PartitionProxy> proxies = new LinkedHashMap<>();
+  final java.util.Set<String> isolated = java.util.concurrent.ConcurrentHashMap.newKeySet();
   final ByteArrayOutputStream logs = new ByteArrayOutputStream();
   Optional<String> clientToken = Optional.empty();
   Optional<String> adminToken = Optional.empty();
   Duration requestTimeout = Duration.ofSeconds(3);
 
   LocalCluster(Path root, int n) throws IOException {
+    this(root, n, false);
+  }
+
+  /** With {@code proxied}, peers reach each node through a {@link PartitionProxy}. */
+  LocalCluster(Path root, int n, boolean proxied) throws IOException {
     this.root = root;
     List<Member> ms = new ArrayList<>();
     for (int i = 1; i <= n; i++) {
       String id = "n" + i;
-      int[] p = {freePort(), freePort()};
+      int[] p = {freePort(), freePort(), freePort()};
       ports.put(id, p);
-      ms.add(new Member(id, "127.0.0.1:" + p[0], "127.0.0.1:" + p[1], true));
+      int advertised = proxied ? p[2] : p[0];
+      if (proxied) {
+        proxies.put(id, new PartitionProxy(id, p[2], p[0], isolated));
+      }
+      ms.add(new Member(id, "127.0.0.1:" + advertised, "127.0.0.1:" + p[1], true));
     }
     this.config = new Configuration(ms);
+  }
+
+  /** Cuts every peer connection to and from {@code id}. */
+  void isolate(String id) {
+    isolated.add(id);
+    proxies.values().forEach(PartitionProxy::enforce);
+  }
+
+  void heal() {
+    isolated.clear();
   }
 
   static int freePort() throws IOException {
@@ -121,5 +143,6 @@ final class LocalCluster implements AutoCloseable {
     for (String id : new ArrayList<>(servers.keySet())) {
       stop(id);
     }
+    proxies.values().forEach(PartitionProxy::close);
   }
 }
