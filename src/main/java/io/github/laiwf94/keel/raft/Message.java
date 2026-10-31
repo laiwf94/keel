@@ -31,13 +31,32 @@ public sealed interface Message {
     }
   }
 
-  /** RequestVote, or a pre-vote probe when {@code preVote} is set (thesis section 9.6). */
+  /**
+   * RequestVote, or a pre-vote probe when {@code preVote} is set (thesis section 9.6). A {@code
+   * transfer} vote comes from a candidate the leader told to start an election with {@link
+   * TimeoutNow}, so voters grant it even while they still hear from that leader (thesis section
+   * 3.10).
+   */
   record VoteRequest(
-      String from, String to, long term, long lastLogIndex, long lastLogTerm, boolean preVote)
+      String from,
+      String to,
+      long term,
+      long lastLogIndex,
+      long lastLogTerm,
+      boolean preVote,
+      boolean transfer)
       implements Message {
     public VoteRequest {
       check(from, to, term);
       nonNegative(lastLogIndex, lastLogTerm);
+      if (preVote && transfer) {
+        throw new IllegalArgumentException("a transfer election skips the pre-vote");
+      }
+    }
+
+    public VoteRequest(
+        String from, String to, long term, long lastLogIndex, long lastLogTerm, boolean preVote) {
+      this(from, to, term, lastLogIndex, lastLogTerm, preVote, false);
     }
   }
 
@@ -109,6 +128,16 @@ public sealed interface Message {
     public SnapshotResponse {
       check(from, to, term);
       nonNegative(matchIndex, seq);
+    }
+  }
+
+  /**
+   * Sent by a leader handing over leadership to a follower whose log matches its own: start an
+   * election now, without waiting for a timeout and without a pre-vote (thesis section 3.10).
+   */
+  record TimeoutNow(String from, String to, long term) implements Message {
+    public TimeoutNow {
+      check(from, to, term);
     }
   }
 }

@@ -10,6 +10,7 @@ import io.github.laiwf94.keel.raft.Message.AppendRequest;
 import io.github.laiwf94.keel.raft.Message.AppendResponse;
 import io.github.laiwf94.keel.raft.Message.SnapshotRequest;
 import io.github.laiwf94.keel.raft.Message.SnapshotResponse;
+import io.github.laiwf94.keel.raft.Message.TimeoutNow;
 import io.github.laiwf94.keel.raft.Message.VoteRequest;
 import io.github.laiwf94.keel.raft.Message.VoteResponse;
 import java.util.ArrayList;
@@ -27,6 +28,7 @@ public final class MessageCodec {
   private static final int APPEND_RESPONSE = 4;
   private static final int SNAPSHOT_REQUEST = 5;
   private static final int SNAPSHOT_RESPONSE = 6;
+  private static final int TIMEOUT_NOW = 7;
 
   /** Most entries accepted in one AppendEntries message. */
   public static final int MAX_ENTRIES = 100_000;
@@ -39,6 +41,7 @@ public final class MessageCodec {
       case VoteRequest v -> {
         header(w, VOTE_REQUEST, m);
         w.writeLong(v.lastLogIndex()).writeLong(v.lastLogTerm()).writeBoolean(v.preVote());
+        w.writeBoolean(v.transfer());
       }
       case VoteResponse v -> {
         header(w, VOTE_RESPONSE, m);
@@ -67,6 +70,7 @@ public final class MessageCodec {
         header(w, SNAPSHOT_RESPONSE, m);
         w.writeLong(s.matchIndex()).writeLong(s.seq());
       }
+      case TimeoutNow t -> header(w, TIMEOUT_NOW, t);
     }
     return w.toByteArray();
   }
@@ -86,7 +90,8 @@ public final class MessageCodec {
       m =
           switch (type) {
             case VOTE_REQUEST ->
-                new VoteRequest(from, to, term, r.readLong(), r.readLong(), r.readBoolean());
+                new VoteRequest(
+                    from, to, term, r.readLong(), r.readLong(), r.readBoolean(), r.readBoolean());
             case VOTE_RESPONSE ->
                 new VoteResponse(from, to, term, r.readBoolean(), r.readBoolean());
             case APPEND_REQUEST -> {
@@ -118,6 +123,7 @@ public final class MessageCodec {
             }
             case SNAPSHOT_RESPONSE ->
                 new SnapshotResponse(from, to, term, r.readLong(), r.readLong());
+            case TIMEOUT_NOW -> new TimeoutNow(from, to, term);
             default -> throw new CodecException("unknown message type " + type);
           };
     } catch (IllegalArgumentException e) {

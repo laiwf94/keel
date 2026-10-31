@@ -41,7 +41,9 @@ class MessageCodecTest {
         new Message.AppendResponse("b", "a", 3, false, 0, 4, 2, 1, 9),
         new Message.SnapshotRequest(
             "a", "b", 3, new Snapshot(new SnapshotMeta(7, 2, CONFIG), new byte[] {5, 6, 7}), 4),
-        new Message.SnapshotResponse("b", "a", 3, 7, 4));
+        new Message.SnapshotResponse("b", "a", 3, 7, 4),
+        new Message.VoteRequest("a", "b", 4, 10, 3, false, true),
+        new Message.TimeoutNow("a", "b", 3));
   }
 
   @Test
@@ -71,7 +73,7 @@ class MessageCodecTest {
       byte[] b = new byte[r.nextInt(200)];
       r.nextBytes(b);
       if (b.length > 0) {
-        b[0] = (byte) (1 + r.nextInt(6));
+        b[0] = (byte) (1 + r.nextInt(7));
       }
       try {
         MessageCodec.decode(b);

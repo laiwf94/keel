@@ -4,6 +4,7 @@ import io.github.laiwf94.keel.raft.Message.AppendRequest;
 import io.github.laiwf94.keel.raft.Message.AppendResponse;
 import io.github.laiwf94.keel.raft.Message.SnapshotRequest;
 import io.github.laiwf94.keel.raft.Message.SnapshotResponse;
+import io.github.laiwf94.keel.raft.Message.TimeoutNow;
 import io.github.laiwf94.keel.raft.Message.VoteRequest;
 import io.github.laiwf94.keel.raft.Message.VoteResponse;
 import java.util.ArrayDeque;
@@ -90,6 +91,14 @@ public final class RaftNode {
   private final Map<String, Progress> progress = new LinkedHashMap<>();
   private long seq;
   private boolean broadcastPending;
+  // Leadership transfer (thesis section 3.10): the voter this leader is handing over to, and how
+  // many ticks ago it started. While set, the leader accepts no new proposals.
+  private String transferee = NONE;
+  private int transferElapsed;
+  // Set once this leader has sent TimeoutNow in its term. Voters grant a transfer election even
+  // while they still count this leader's lease, so from then on the lease is void and lease reads
+  // fall back to a ReadIndex round.
+  private boolean leaseRevoked;
   private long termStartIndex;
 
   // Reads (thesis section 6.4). Time is counted in ticks for the lease.
@@ -151,6 +160,11 @@ public final class RaftNode {
     return commitIndex;
   }
 
+  /** The voter this leader is handing leadership to, while a transfer is in progress. */
+  public Optional<String> transferee() {
+    return transferee.isEmpty() ? Optional.empty() : Optional.of(transferee);
+  }
+
   /** Read-only view of the log, for tests and status. */
   public RaftLog log() {
     return log;
@@ -177,6 +191,11 @@ public final class RaftNode {
   }
 
   private void tickLeader() {
+    // A transfer that has not finished within an election timeout has failed (the target is
+    // down, partitioned or too slow): give up and take proposals again.
+    if (!transferee.isEmpty() && ++transferElapsed >= opts.electionTicks()) {
+      abortTransfer();
+    }
     // Check quorum (thesis section 6.2): a leader that has not heard from a majority within an
     // election timeout steps down, so a leader stranded in a minority stops accepting work.
     if (++checkQuorumElapsed >= opts.electionTicks()) {
@@ -223,9 +242,51 @@ public final class RaftNode {
     if (role != Role.LEADER) {
       throw new NotLeaderException(leaderId);
     }
+    if (!transferee.isEmpty()) {
+      // New entries would only make the target fall behind again; point the client at it.
+      throw new NotLeaderException(transferee);
+    }
     Entry e = new Entry(log.lastIndex() + 1, term, EntryType.COMMAND, command);
     appendLocal(e);
     return e.index();
+  }
+
+  /**
+   * Hands leadership to {@code target}, a voter (thesis section 3.10). The leader stops taking
+   * proposals, brings the target's log up to its own, then sends it {@link TimeoutNow} so it starts
+   * an election at once; with an up-to-date log it wins in about one round trip. If the target has
+   * not taken over within an election timeout the transfer is abandoned and this node goes on
+   * leading. Asking for a new target replaces a transfer in progress; asking for the same one again
+   * changes nothing.
+   *
+   * @throws NotLeaderException if this node is not the leader
+   * @throws IllegalArgumentException if {@code target} is this node or not a voter
+   */
+  public void transferLeadership(String target) {
+    if (role != Role.LEADER) {
+      throw new NotLeaderException(leaderId);
+    }
+    if (target.equals(id)) {
+      throw new IllegalArgumentException(id + " already leads");
+    }
+    if (!config().isVoter(target) || !progress.containsKey(target)) {
+      throw new IllegalArgumentException(target + " is not a voter");
+    }
+    if (target.equals(transferee)) {
+      return;
+    }
+    transferee = target;
+    transferElapsed = 0;
+    if (progress.get(target).match == log.lastIndex()) {
+      sendTimeoutNow(target);
+    } else {
+      sendAppend(target, false);
+    }
+  }
+
+  private void abortTransfer() {
+    transferee = NONE;
+    transferElapsed = 0;
   }
 
   /**
@@ -252,7 +313,9 @@ public final class RaftNode {
     }
     if (m.term() > term) {
       if (m instanceof VoteRequest vr) {
-        if (inLease()) {
+        // A transfer election was started by the leader itself, so its lease is no reason to
+        // refuse it.
+        if (inLease() && !vr.transfer()) {
           return;
         }
         if (!vr.preVote()) {
@@ -262,7 +325,9 @@ public final class RaftNode {
         // A granted pre-vote carries the term the pre-candidate would campaign in, so it is the
         // one higher-term message that does not move this node to that term.
         String leader =
-            m instanceof AppendRequest || m instanceof SnapshotRequest ? m.from() : NONE;
+            m instanceof AppendRequest || m instanceof SnapshotRequest || m instanceof TimeoutNow
+                ? m.from()
+                : NONE;
         becomeFollower(m.term(), leader);
       }
     } else if (m.term() < term) {
@@ -281,6 +346,7 @@ public final class RaftNode {
       case AppendResponse ar -> handleAppendResponse(ar);
       case SnapshotRequest sr -> handleSnapshot(sr);
       case SnapshotResponse sr -> handleSnapshotResponse(sr);
+      case TimeoutNow tn -> handleTimeoutNow(tn);
     }
   }
 
@@ -334,7 +400,7 @@ public final class RaftNode {
       readsReady.add(new Ready.ReadState(r.context(), r.index()));
     }
     Long sentAt = seqSentAt.get(quorumSeq);
-    if (sentAt != null) {
+    if (sentAt != null && !leaseRevoked) {
       leaseExpiry = Math.max(leaseExpiry, sentAt + opts.leaseTicks());
     }
     seqSentAt.headMap(quorumSeq).clear();
@@ -397,6 +463,10 @@ public final class RaftNode {
    * cannot force the cluster into a new term.
    */
   private void campaign(boolean preVote) {
+    campaign(preVote, false);
+  }
+
+  private void campaign(boolean preVote, boolean transfer) {
     if (preVote) {
       role = Role.PRE_CANDIDATE;
     } else {
@@ -421,7 +491,9 @@ public final class RaftNode {
     long voteTerm = preVote ? term + 1 : term;
     for (String peer : config().voterIds()) {
       if (!peer.equals(id)) {
-        send(new VoteRequest(id, peer, voteTerm, log.lastIndex(), log.lastTerm(), preVote));
+        send(
+            new VoteRequest(
+                id, peer, voteTerm, log.lastIndex(), log.lastTerm(), preVote, transfer));
       }
     }
   }
@@ -439,6 +511,17 @@ public final class RaftNode {
     }
     long replyTerm = grant && vr.preVote() ? vr.term() : term;
     send(new VoteResponse(id, vr.from(), replyTerm, grant, vr.preVote()));
+  }
+
+  /**
+   * The leader asked this node to take over. Only a voter that still follows that leader acts on
+   * it; anything else is a stale or misdirected message.
+   */
+  private void handleTimeoutNow(TimeoutNow tn) {
+    if (role != Role.FOLLOWER || !tn.from().equals(leaderId) || !config().isVoter(id)) {
+      return;
+    }
+    campaign(false, true);
   }
 
   private void handleVoteResponse(VoteResponse vr) {
@@ -517,6 +600,7 @@ public final class RaftNode {
       maybePromote();
       if (role == Role.LEADER) {
         sendAppend(ar.from(), false);
+        maybeSendTimeoutNow(ar.from());
       }
       return;
     }
@@ -572,6 +656,9 @@ public final class RaftNode {
       // The latest configuration is committed: stop replicating to servers it removed, and if
       // it removed this leader, step down (thesis section 4.2.2).
       progress.keySet().removeIf(peer -> !config().contains(peer));
+      if (!transferee.isEmpty() && !config().isVoter(transferee)) {
+        abortTransfer();
+      }
       if (!config().contains(id)) {
         becomeFollower(term, NONE);
         return;
@@ -637,6 +724,7 @@ public final class RaftNode {
    */
   private boolean canChangeConfig() {
     return role == Role.LEADER
+        && transferee.isEmpty()
         && commitIndex >= termStartIndex
         && log.latestConfigIndex() <= commitIndex;
   }
@@ -644,6 +732,9 @@ public final class RaftNode {
   private void checkCanChangeConfig() {
     if (role != Role.LEADER) {
       throw new NotLeaderException(leaderId);
+    }
+    if (!transferee.isEmpty()) {
+      throw new ConfigChangeException("a leadership transfer is in progress");
     }
     if (!canChangeConfig()) {
       throw new ConfigChangeException("another membership change is still in progress");
@@ -758,7 +849,22 @@ public final class RaftNode {
     maybePromote();
     if (role == Role.LEADER) {
       sendAppend(sr.from(), false);
+      maybeSendTimeoutNow(sr.from());
     }
+  }
+
+  /** Sends TimeoutNow once the transfer target's log has caught up with this leader's. */
+  private void maybeSendTimeoutNow(String peer) {
+    Progress pr = progress.get(peer);
+    if (peer.equals(transferee) && pr != null && pr.match == log.lastIndex()) {
+      sendTimeoutNow(peer);
+    }
+  }
+
+  private void sendTimeoutNow(String peer) {
+    leaseRevoked = true;
+    leaseExpiry = 0;
+    send(new TimeoutNow(id, peer, term));
   }
 
   private void becomeFollower(long newTerm, String leader) {
@@ -771,6 +877,7 @@ public final class RaftNode {
     leaderId = leader;
     progress.clear();
     broadcastPending = false;
+    abortTransfer();
     clearReads();
     resetElectionTimer();
   }
@@ -782,6 +889,8 @@ public final class RaftNode {
     checkQuorumElapsed = 0;
     recentlyActive.clear();
     progress.clear();
+    abortTransfer();
+    leaseRevoked = false;
     for (String peer : config().ids()) {
       if (!peer.equals(id)) {
         progress.put(peer, new Progress(log.lastIndex() + 1));
