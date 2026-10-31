@@ -26,6 +26,12 @@ dependencyLocking {
 
 dependencies {
     errorprone("com.google.errorprone:error_prone_core:2.50.0")
+    constraints {
+        // Error Prone pulls in Guava 33.5.0-jre, which has GHSA-xxph-c9ww-hj94 (#76).
+        errorprone("com.google.guava:guava:33.7.2-jre") {
+            because("GHSA-xxph-c9ww-hj94 is fixed in 33.7.2")
+        }
+    }
 
     testImplementation(platform("org.junit:junit-bom:5.14.4"))
     testImplementation("org.junit.jupiter:junit-jupiter")

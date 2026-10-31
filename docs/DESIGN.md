@@ -154,7 +154,7 @@ Benchmarks on macOS measure the JDK's `force`, which on that platform asks the d
 
 ## What it is built with
 
-There are no runtime dependencies. The build uses Gradle with the wrapper, Spotless with google-java-format, Error Prone, JUnit 5 and JaCoCo, each pinned to an exact version, and every resolved version is recorded in `gradle.lockfile`. CI scans that lockfile with osv-scanner. No dependency had to be moved to a newer release for a security fix.
+There are no runtime dependencies. The build uses Gradle with the wrapper, Spotless with google-java-format, Error Prone, JUnit 5 and JaCoCo, each pinned to an exact version, and every resolved version is recorded in `gradle.lockfile`. CI scans that lockfile with osv-scanner. One has been moved to a newer release for a security fix: Guava, which Error Prone brings into the annotation processor path, is held at 33.7.2-jre or later by a constraint in `build.gradle.kts` because of GHSA-xxph-c9ww-hj94. It never reaches the runtime classpath.
 
 ## References
 
