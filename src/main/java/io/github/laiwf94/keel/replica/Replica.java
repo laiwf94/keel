@@ -82,6 +82,11 @@ public final class Replica {
     node.tick();
   }
 
+  /** Ticks that passed while this replica's thread was paused; see {@link RaftNode#elapse}. */
+  public void elapse(long ticks) {
+    node.elapse(ticks);
+  }
+
   public void receive(Message m) {
     node.step(m);
   }

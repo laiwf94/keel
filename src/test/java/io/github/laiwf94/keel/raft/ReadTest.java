@@ -150,4 +150,34 @@ class ReadTest {
     c.flush();
     assertTrue(c.reads.get(old.id()).stream().noneMatch(r -> r.context() == 6));
   }
+
+  /**
+   * The same deposed leader as above, but with a clock that was paused rather than slow: once it is
+   * told how long the pause lasted, its lease has run out and the read needs a heartbeat round.
+   */
+  @Test
+  void aLeaderToldOfAPauseNoLongerTrustsItsLease() {
+    TestCluster c = new TestCluster(3, 48);
+    RaftNode old = c.awaitLeader();
+    c.ticks(c.opts.heartbeatTicks() * 2);
+    List<String> fs = followers(c, old);
+    c.isolated.add(old.id());
+    int paused = 0;
+    while (fs.stream().map(c::node).noneMatch(n -> n.role() == RaftNode.Role.LEADER)) {
+      c.tickOnly(fs);
+      paused++;
+      assertTrue(paused < 200, "followers did not elect a new leader");
+    }
+    old.elapse(paused);
+    old.read(5, ReadMode.LEASE);
+    assertTrue(old.ready().reads().isEmpty(), "served from a lease that ran out during the pause");
+    // A pause shorter than the lease leaves it in place.
+    TestCluster d = new TestCluster(3, 43);
+    RaftNode leader = d.awaitLeader();
+    d.ticks(d.opts.heartbeatTicks() * 2);
+    leader.elapse(0);
+    leader.read(1, ReadMode.LEASE);
+    assertEquals(1, leader.ready().reads().size());
+    assertThrows(IllegalArgumentException.class, () -> leader.elapse(-1));
+  }
 }

@@ -190,6 +190,20 @@ public final class RaftNode {
     }
   }
 
+  /**
+   * Tells the node that {@code ticks} ticks passed while it could not be ticked, because its thread
+   * was paused (a stalled fsync, a long garbage collection). Only the lease clock moves, so a
+   * leader whose lease ran out during the pause confirms its next lease read with a heartbeat round
+   * instead of answering from a stale state. Timers do not move: firing them in a burst after a
+   * pause would only start needless elections.
+   */
+  public void elapse(long ticks) {
+    if (ticks < 0) {
+      throw new IllegalArgumentException("ticks must not be negative: " + ticks);
+    }
+    now += ticks;
+  }
+
   private void tickLeader() {
     // A transfer that has not finished within an election timeout has failed (the target is
     // down, partitioned or too slow): give up and take proposals again.

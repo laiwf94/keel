@@ -210,6 +210,108 @@ class NodeLoopTest {
     n.receive(new Message.VoteRequest("n2", "n1", 1, 0, 0, false));
   }
 
+  /** Memory storage whose next sync with something to write can be made to hang. */
+  static final class StallingStorage implements Storage {
+    final MemStorage inner = new MemStorage();
+    volatile long stallMs;
+    final CountDownLatch stalled = new CountDownLatch(1);
+    private boolean dirty;
+
+    @Override
+    public State load() {
+      return inner.load();
+    }
+
+    @Override
+    public void saveHardState(HardState state) {
+      dirty = true;
+      inner.saveHardState(state);
+    }
+
+    @Override
+    public void append(List<Entry> entries) {
+      dirty |= !entries.isEmpty();
+      inner.append(entries);
+    }
+
+    @Override
+    public void saveSnapshot(Snapshot snapshot, List<Entry> remaining) {
+      dirty = true;
+      inner.saveSnapshot(snapshot, remaining);
+    }
+
+    @Override
+    public void sync() {
+      long ms = stallMs;
+      boolean writes = dirty;
+      dirty = false;
+      if (ms > 0 && writes) {
+        stallMs = 0;
+        stalled.countDown();
+        try {
+          Thread.sleep(ms);
+        } catch (InterruptedException e) {
+          Thread.currentThread().interrupt();
+        }
+      }
+      inner.sync();
+    }
+  }
+
+  /**
+   * A leader whose fsync hangs for a second is replaced, and a lease read that was queued during
+   * the hang must not be answered from the old leader's lease when the fsync returns: the loop has
+   * to count the time it spent blocked before it runs the read.
+   */
+  @Test
+  void aLeaderPausedInAnFsyncDoesNotServeAStaleLeaseRead() throws Exception {
+    Map<String, StallingStorage> disks = new java.util.HashMap<>();
+    for (int i = 1; i <= 3; i++) {
+      StallingStorage d = new StallingStorage();
+      disks.put("n" + i, d);
+      loop("n" + i, config(3), d, () -> {});
+    }
+    await(() -> leader() != null);
+    NodeLoop old = leader();
+    String oldId = old.status().id();
+    assertInstanceOf(Outcome.Applied.class, old.propose(put("k", "v1")).get(5, TimeUnit.SECONDS));
+    // Let the lease renew so that it is valid when the fsync hangs.
+    Thread.sleep(50);
+    disks.get(oldId).stallMs = 1_000;
+    var stuck = old.propose(put("k", "v-stuck"));
+    assertTrue(disks.get(oldId).stalled.await(5, TimeUnit.SECONDS));
+    cut.add(oldId);
+
+    await(() -> leader() != null);
+    NodeLoop next = leader();
+    assertInstanceOf(Outcome.Applied.class, next.propose(put("k", "v2")).get(5, TimeUnit.SECONDS));
+
+    KvMachine kv = (KvMachine) old.machine();
+    ReadResult<String> r =
+        old.read(
+                Consistency.LEASE,
+                () -> new String(kv.get("k").orElseThrow().bytes(), StandardCharsets.UTF_8))
+            .get(5, TimeUnit.SECONDS);
+    assertTrue(
+        !(r instanceof ReadResult.Value<String> v) || v.value().equals("v2"),
+        "the deposed leader answered a lease read with a stale value: " + r);
+    // Followers may have acknowledged the write before the cut, so it can commit; it cannot be lost
+    // silently.
+    Outcome o = stuck.get(5, TimeUnit.SECONDS);
+    assertTrue(o instanceof Outcome.Applied || o instanceof Outcome.Unknown, o.toString());
+  }
+
+  @Test
+  void ticksDueCountsEveryTickThatHasComeDue() {
+    assertEquals(0, NodeLoop.ticksDue(99, 100, 10));
+    assertEquals(1, NodeLoop.ticksDue(100, 100, 10));
+    assertEquals(1, NodeLoop.ticksDue(109, 100, 10));
+    assertEquals(2, NodeLoop.ticksDue(110, 100, 10));
+    assertEquals(101, NodeLoop.ticksDue(1_100, 100, 10));
+    // nanoTime may be negative and may wrap; only differences count.
+    assertEquals(2, NodeLoop.ticksDue(Long.MIN_VALUE + 5, Long.MAX_VALUE - 4, 10));
+  }
+
   @Test
   void consistencyNamesParse() {
     assertEquals(Consistency.LEASE, Consistency.parse("lease").orElseThrow());
