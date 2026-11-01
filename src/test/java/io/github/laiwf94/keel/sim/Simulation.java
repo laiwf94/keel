@@ -15,7 +15,6 @@ import io.github.laiwf94.keel.replica.Outcome;
 import io.github.laiwf94.keel.replica.ReadOutcome;
 import io.github.laiwf94.keel.replica.Replica;
 import io.github.laiwf94.keel.replica.StateMachine;
-import io.github.laiwf94.keel.server.NodeLoop;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.HashSet;
@@ -200,7 +199,7 @@ final class Simulation {
       double q = r.nextDouble();
       double stall = q < 0.4 ? 0 : q < 0.75 ? 0.003 : 0.01;
       double f = r.nextDouble();
-      double fail = f < 0.6 ? 0 : f < 0.85 ? 0.0005 : 0.002;
+      double fail = f < 0.5 ? 0 : f < 0.8 ? 0.001 : 0.004;
       return new DiskProfile(mean, stall, fail);
     }
 
@@ -230,8 +229,13 @@ final class Simulation {
      */
     long busyUntil;
 
-    /** When the next tick is due. */
-    long nextTickAt;
+    /** When this incarnation's first tick was due; later ones follow every tick period. */
+    long firstTickAt;
+
+    /** Ticks this incarnation has run, and the most tick periods it has been told have passed. */
+    long ticks;
+
+    long observed;
 
     /** If positive, the next sync with something to write takes this long. */
     long stallNext;
@@ -345,55 +349,49 @@ final class Simulation {
     int inc = ++n.incarnation;
     mix(id.hashCode() * 31L + inc);
     // The first tick lands at a random phase so nodes are not in lockstep.
-    scheduleTick(n, inc, rnd.nextInt(opts.tickMs()) + 1);
+    long first = rnd.nextInt(opts.tickMs()) + 1L;
+    n.firstTickAt = now + first;
+    n.ticks = 0;
+    n.observed = 0;
+    scheduleTick(n, inc, first);
   }
 
   private void scheduleTick(SimNode n, int inc, long delay) {
-    long at = now + delay;
-    n.nextTickAt = at;
-    schedule(delay, () -> tickLoop(n, inc, at));
+    schedule(delay, () -> tickLoop(n, inc));
   }
 
-  private void tickLoop(SimNode n, int inc, long at) {
-    if (!n.up || n.incarnation != inc || n.nextTickAt != at) {
-      return; // a stale incarnation, or a catch-up already ran this tick
-    }
-    if (n.busy(now)) {
-      schedule(n.busyUntil - now, () -> tickLoop(n, inc, at));
+  private void tickLoop(SimNode n, int inc) {
+    if (!n.up || n.incarnation != inc) {
       return;
     }
-    tickNow(n);
-    afterStep(n);
-  }
-
-  /**
-   * Runs the tick that was due at {@code nextTickAt}, and accounts for every later one that was
-   * missed while the node was blocked, as {@code NodeLoop} does: a short delay is ticked through, a
-   * long one is one tick plus {@link Replica#elapse}.
-   */
-  private void tickNow(SimNode n) {
-    long period = Math.round(opts.tickMs() * n.drift);
-    long due = (now - n.nextTickAt) / period + 1;
-    if (due > NodeLoop.MAX_TICK_BURST) {
-      n.replica.elapse(due - 1);
-      n.replica.tick();
-    } else {
-      for (long i = 0; i < due; i++) {
-        n.replica.tick();
-      }
+    if (n.busy(now)) {
+      // Like NodeLoop after a stall: one tick when the loop is free again, not a burst.
+      schedule(n.busyUntil - now, () -> tickLoop(n, inc));
+      return;
     }
-    lateTicks += due - 1;
-    scheduleTick(n, n.incarnation, period);
+    catchUp(n);
+    n.replica.tick();
+    n.ticks++;
+    afterStep(n);
+    scheduleTick(n, inc, period(n));
+  }
+
+  private long period(SimNode n) {
+    return Math.round(opts.tickMs() * n.drift);
   }
 
   /**
-   * Before a node that was blocked handles anything, it catches up on the ticks it missed, as
-   * {@code NodeLoop} does before every task. Without a block no tick is ever overdue here.
+   * Before a node handles anything it learns how many tick periods have passed since it started, as
+   * {@code NodeLoop} tells its replica before every task. Ticks fall behind that only while the
+   * node is blocked; otherwise this changes nothing.
    */
   private void catchUp(SimNode n) {
-    if (now > n.nextTickAt) {
-      tickNow(n);
+    long periods = now <= n.firstTickAt ? 0 : (now - n.firstTickAt - 1) / period(n) + 1;
+    if (periods > n.ticks) {
+      lateTicks += periods - Math.max(n.ticks, n.observed);
+      n.observed = Math.max(n.observed, periods);
     }
+    n.replica.observeClock(periods);
   }
 
   long lateTicks;

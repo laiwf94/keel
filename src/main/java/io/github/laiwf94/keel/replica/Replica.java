@@ -82,9 +82,9 @@ public final class Replica {
     node.tick();
   }
 
-  /** Ticks that passed while this replica's thread was paused; see {@link RaftNode#elapse}. */
-  public void elapse(long ticks) {
-    node.elapse(ticks);
+  /** Real tick periods since start; see {@link RaftNode#observeClock}. */
+  public void observeClock(long ticksSinceStart) {
+    node.observeClock(ticksSinceStart);
   }
 
   public void receive(Message m) {

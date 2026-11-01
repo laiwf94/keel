@@ -302,14 +302,13 @@ class NodeLoopTest {
   }
 
   @Test
-  void ticksDueCountsEveryTickThatHasComeDue() {
-    assertEquals(0, NodeLoop.ticksDue(99, 100, 10));
-    assertEquals(1, NodeLoop.ticksDue(100, 100, 10));
-    assertEquals(1, NodeLoop.ticksDue(109, 100, 10));
-    assertEquals(2, NodeLoop.ticksDue(110, 100, 10));
-    assertEquals(101, NodeLoop.ticksDue(1_100, 100, 10));
+  void ticksSinceCountsWholeTickPeriods() {
+    assertEquals(0, NodeLoop.ticksSince(100, 109, 10));
+    assertEquals(1, NodeLoop.ticksSince(100, 110, 10));
+    assertEquals(100, NodeLoop.ticksSince(100, 1_105, 10));
+    assertEquals(0, NodeLoop.ticksSince(100, 50, 10), "never negative");
     // nanoTime may be negative and may wrap; only differences count.
-    assertEquals(2, NodeLoop.ticksDue(Long.MIN_VALUE + 5, Long.MAX_VALUE - 4, 10));
+    assertEquals(1, NodeLoop.ticksSince(Long.MAX_VALUE - 4, Long.MIN_VALUE + 5, 10));
   }
 
   @Test

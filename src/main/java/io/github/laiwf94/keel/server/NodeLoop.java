@@ -29,9 +29,9 @@ import java.util.function.Supplier;
 /**
  * The single thread that owns a {@link Replica}. Everything that touches Raft state, from HTTP
  * handlers and from the transport, is a task in one bounded queue. Each round runs every queued
- * task (up to a batch limit), ticking whenever a tick has come due before a task runs, then calls
- * {@link Replica#process()} once, so a burst of proposals costs one fsync and one AppendEntries per
- * peer.
+ * task (up to a batch limit), ticks if a tick is due, then calls {@link Replica#process()} once, so
+ * a burst of proposals costs one fsync and one AppendEntries per peer. Before each task the replica
+ * learns how much real time has passed, which keeps lease reads safe across pauses.
  *
  * <p>If storage fails the loop stops and calls the fatal handler: a node that cannot persist must
  * not keep talking to its peers.
@@ -280,52 +280,42 @@ public final class NodeLoop implements AutoCloseable {
     return running && inbox.offer(task);
   }
 
-  /** Beyond this many overdue ticks the loop stops ticking them one by one. */
-  public static final long MAX_TICK_BURST = 10;
-
-  /** How many ticks are due at {@code now} when the next one was due at {@code nextTick}. */
-  static long ticksDue(long now, long nextTick, long tickNanos) {
-    return now - nextTick < 0 ? 0 : (now - nextTick) / tickNanos + 1;
-  }
-
-  /**
-   * Runs the ticks that are due and returns when the next one is. After a long pause (a stalled
-   * disk, a garbage collection) ticking every missed tick would fire timers in a burst, so the loop
-   * ticks once and tells the replica how much time passed: the lease clock must not fall behind
-   * real time, or a deposed leader would answer lease reads from a stale state.
-   */
-  private long catchUp(long nextTick, long tickNanos) {
-    long due = ticksDue(System.nanoTime(), nextTick, tickNanos);
-    if (due > MAX_TICK_BURST) {
-      replica.elapse(due - 1);
-      replica.tick();
-    } else {
-      for (long i = 0; i < due; i++) {
-        replica.tick();
-      }
-    }
-    return nextTick + due * tickNanos;
+  /** Whole tick periods from {@code origin} to {@code now}, both from {@link System#nanoTime}. */
+  static long ticksSince(long origin, long now, long tickNanos) {
+    return Math.max(0, now - origin) / tickNanos;
   }
 
   private void run() {
     long tickNanos = TimeUnit.MILLISECONDS.toNanos(settings.tickMs());
-    long nextTick = System.nanoTime() + tickNanos;
+    long origin = System.nanoTime();
+    long nextTick = origin + tickNanos;
     try {
       while (running) {
         long wait = nextTick - System.nanoTime();
         Runnable task = wait > 0 ? inbox.poll(wait, TimeUnit.NANOSECONDS) : inbox.poll();
         int ran = 0;
         while (task != null) {
-          // Catch up on time before every task, so that a read never meets a lease clock that
-          // stopped while the thread was paused in an fsync or a garbage collection.
-          nextTick = catchUp(nextTick, tickNanos);
+          // Before every task the lease clock catches up with real time, so a read never meets a
+          // lease that ran out while the thread was paused in an fsync or a garbage collection.
+          replica.observeClock(ticksSince(origin, System.nanoTime(), tickNanos));
           task.run();
           if (++ran >= settings.maxBatch()) {
             break;
           }
           task = inbox.poll();
         }
-        nextTick = catchUp(nextTick, tickNanos);
+        long now = System.nanoTime();
+        replica.observeClock(ticksSince(origin, now, tickNanos));
+        if (now >= nextTick) {
+          replica.tick();
+          nextTick += tickNanos;
+          if (now - nextTick > 10 * tickNanos) {
+            // We fell far behind (a long GC pause or a stalled disk). Ticking to catch up would
+            // fire timers in a burst, so skip ahead instead; the lease clock has already caught
+            // up through observeClock.
+            nextTick = now + tickNanos;
+          }
+        }
         replica.process();
         publishStatus();
         checkTransfers();

@@ -152,8 +152,9 @@ class ReadTest {
   }
 
   /**
-   * The same deposed leader as above, but with a clock that was paused rather than slow: once it is
-   * told how long the pause lasted, its lease has run out and the read needs a heartbeat round.
+   * The same deposed leader as above, but with a clock that was paused rather than slow: once the
+   * driver tells it how much real time has passed, its lease has run out and the read needs a
+   * heartbeat round.
    */
   @Test
   void aLeaderToldOfAPauseNoLongerTrustsItsLease() {
@@ -168,16 +169,16 @@ class ReadTest {
       paused++;
       assertTrue(paused < 200, "followers did not elect a new leader");
     }
-    old.elapse(paused);
+    // A clock reading behind the ticks the node has seen changes nothing.
+    old.observeClock(0);
+    old.read(4, ReadMode.LEASE);
+    assertEquals(1, old.ready().reads().size(), "the lease holds until real time moves on");
+    old.observeClock(1_000_000);
     old.read(5, ReadMode.LEASE);
     assertTrue(old.ready().reads().isEmpty(), "served from a lease that ran out during the pause");
-    // A pause shorter than the lease leaves it in place.
-    TestCluster d = new TestCluster(3, 43);
-    RaftNode leader = d.awaitLeader();
-    d.ticks(d.opts.heartbeatTicks() * 2);
-    leader.elapse(0);
-    leader.read(1, ReadMode.LEASE);
-    assertEquals(1, leader.ready().reads().size());
-    assertThrows(IllegalArgumentException.class, () -> leader.elapse(-1));
+    // The clock never runs backwards.
+    old.observeClock(0);
+    old.read(6, ReadMode.LEASE);
+    assertTrue(old.ready().reads().isEmpty());
   }
 }

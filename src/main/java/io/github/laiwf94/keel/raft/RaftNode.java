@@ -105,6 +105,7 @@ public final class RaftNode {
   private record PendingRead(long context, ReadMode mode, long index, long seq) {}
 
   private long now;
+  private long clockFloor;
   private long leaseExpiry;
   private final TreeMap<Long, Long> seqSentAt = new TreeMap<>();
   private final List<PendingRead> readsAwaitingTermCommit = new ArrayList<>();
@@ -191,17 +192,20 @@ public final class RaftNode {
   }
 
   /**
-   * Tells the node that {@code ticks} ticks passed while it could not be ticked, because its thread
-   * was paused (a stalled fsync, a long garbage collection). Only the lease clock moves, so a
-   * leader whose lease ran out during the pause confirms its next lease read with a heartbeat round
-   * instead of answering from a stale state. Timers do not move: firing them in a burst after a
-   * pause would only start needless elections.
+   * Tells the node how many tick periods have really passed since it started, by the driver's
+   * monotonic clock. Ticks can fall behind real time while the driver's thread is paused (a stalled
+   * fsync, a long garbage collection); the lease is measured on whichever of the two is ahead, so a
+   * leader whose lease ran out during a pause confirms its next lease read with a heartbeat round
+   * instead of answering from a stale state. Timers still run on ticks only, so a pause does not
+   * fire them in a burst.
    */
-  public void elapse(long ticks) {
-    if (ticks < 0) {
-      throw new IllegalArgumentException("ticks must not be negative: " + ticks);
-    }
-    now += ticks;
+  public void observeClock(long ticksSinceStart) {
+    clockFloor = Math.max(clockFloor, ticksSinceStart);
+  }
+
+  /** The lease clock, in ticks. */
+  private long clock() {
+    return Math.max(now, clockFloor);
   }
 
   private void tickLeader() {
@@ -418,7 +422,7 @@ public final class RaftNode {
   }
 
   private void startRead(PendingRead r) {
-    if (r.mode() == ReadMode.LEASE && now < leaseExpiry) {
+    if (r.mode() == ReadMode.LEASE && clock() < leaseExpiry) {
       readsReady.add(new Ready.ReadState(r.context(), commitIndex));
       return;
     }
@@ -963,7 +967,7 @@ public final class RaftNode {
 
   private void broadcastHeartbeat() {
     seq++;
-    seqSentAt.put(seq, now);
+    seqSentAt.put(seq, clock());
     for (String peer : progress.keySet()) {
       sendAppend(peer, true);
     }
