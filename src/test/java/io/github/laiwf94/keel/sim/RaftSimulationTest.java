@@ -4,11 +4,13 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import io.github.laiwf94.keel.raft.RaftNode;
 import io.github.laiwf94.keel.replica.Outcome;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Random;
 import java.util.Set;
 import java.util.TreeMap;
 import org.junit.jupiter.api.Test;
@@ -114,5 +116,116 @@ class RaftSimulationTest {
   void makesProgressWithoutFaults() {
     Result r = run(7, Simulation.Options.defaults().withFaults(false));
     assertTrue(r.acked().size() > 100, "only " + r.acked().size() + " writes acknowledged");
+  }
+
+  /** A quiet five-node cluster with a leader and one committed write, and no random faults. */
+  static Simulation quietCluster(long seed) {
+    Simulation sim =
+        new Simulation(seed, Simulation.Options.defaults().withFaults(false), ListMachine::new);
+    sim.startAll();
+    sim.runUntil(1_000);
+    assertTrue(sim.leader().isPresent(), "no leader");
+    assertTrue(commits(sim, "first"), "first write did not commit");
+    return sim;
+  }
+
+  /** Proposes at the current leader and runs for a second; true if the write applied. */
+  static boolean commits(Simulation sim, String cmd) {
+    boolean[] applied = {false};
+    Simulation.SimNode leader = sim.leader().orElseThrow(() -> new AssertionError("no leader"));
+    sim.propose(leader.id, Simulation.bytes(cmd), o -> applied[0] = o instanceof Outcome.Applied);
+    sim.runUntil(sim.now() + 1_000);
+    return applied[0];
+  }
+
+  /**
+   * The leader can still send but hears nothing: its heartbeats keep the followers from timing out,
+   * so only check-quorum gets the cluster moving again. It must step down and a new leader must
+   * take over.
+   */
+  @Test
+  void aLeaderThatCanSendButNotHearStepsDown() {
+    Simulation sim = quietCluster(11);
+    Simulation.SimNode old = sim.leader().orElseThrow();
+    long term = old.replica.node().term();
+    Set<String> others = new HashSet<>(sim.nodes.keySet());
+    others.remove(old.id);
+    sim.partitionOneWay(others);
+    sim.runUntil(sim.now() + 2_000);
+    Simulation.SimNode next = sim.leader().orElseThrow(() -> new AssertionError("no leader"));
+    assertNotEquals(old.id, next.id);
+    assertTrue(next.replica.node().term() > term);
+    assertNotEquals(RaftNode.Role.LEADER, old.replica.node().role());
+    assertTrue(commits(sim, "after"), "the new leader cannot commit");
+    sim.checkLogMatching();
+    assertEquals(1, sim.oneWayFaults);
+  }
+
+  /** The leader hears everything but cannot send: the others replace it and it learns of that. */
+  @Test
+  void aLeaderThatCanHearButNotSendIsReplaced() {
+    Simulation sim = quietCluster(12);
+    Simulation.SimNode old = sim.leader().orElseThrow();
+    sim.partitionOneWay(Set.of(old.id));
+    sim.runUntil(sim.now() + 2_000);
+    Simulation.SimNode next = sim.leader().orElseThrow(() -> new AssertionError("no leader"));
+    assertNotEquals(old.id, next.id);
+    assertEquals(RaftNode.Role.FOLLOWER, old.replica.node().role());
+    assertEquals(next.replica.node().term(), old.replica.node().term());
+    assertTrue(commits(sim, "after"));
+    sim.heal();
+    sim.runUntil(sim.now() + 1_000);
+    sim.checkLogMatching();
+    assertEquals(
+        ((ListMachine) next.machine).applied, ((ListMachine) old.machine).applied, "old leader");
+  }
+
+  /**
+   * The leader's disk hangs for longer than an election timeout in the middle of a write. The rest
+   * elect a new leader; when the disk returns the old leader catches up on the time it lost, steps
+   * down, and the write it was persisting is either committed everywhere or nowhere.
+   */
+  @Test
+  void aStalledLeaderDiskCostsLeadershipButNoWrite() {
+    Simulation sim = quietCluster(13);
+    Simulation.SimNode old = sim.leader().orElseThrow();
+    sim.stallDisk(old.id, 800);
+    Outcome[] stuck = {null};
+    sim.propose(old.id, Simulation.bytes("stuck"), o -> stuck[0] = o);
+    sim.runUntil(sim.now() + 400);
+    Simulation.SimNode next = sim.leader().orElseThrow(() -> new AssertionError("no leader"));
+    assertNotEquals(old.id, next.id, "the others did not replace a leader stuck in an fsync");
+    assertTrue(old.busy(sim.now()), "the old leader should still be inside its fsync");
+    sim.runUntil(sim.now() + 1_000);
+    assertNotEquals(RaftNode.Role.LEADER, old.replica.node().role());
+    assertTrue(sim.lateTicks > 0, "the old leader did not account for the ticks it missed");
+    assertEquals(1, sim.diskStalls);
+    assertTrue(commits(sim, "after"));
+    sim.checkLogMatching();
+    List<String> applied = ((ListMachine) sim.leader().orElseThrow().machine).applied;
+    if (stuck[0] instanceof Outcome.Applied) {
+      assertTrue(applied.contains("stuck"), "an acknowledged write was lost");
+    }
+    for (Simulation.SimNode n : sim.nodes.values()) {
+      assertEquals(applied, ((ListMachine) n.machine).applied, n.id);
+    }
+  }
+
+  /**
+   * With the new faults off nothing is drawn from their random source, so a seed replays exactly
+   * the run it replayed before they existed.
+   */
+  @Test
+  void classicFaultsLeaveTheNewFaultSourceUntouched() {
+    Simulation.Options classic = Simulation.Options.defaults().withClassicFaults();
+    Simulation sim = new Simulation(42, classic, ListMachine::new);
+    sim.startAll();
+    sim.runUntil(classic.durationMs());
+    assertTrue(!sim.faultLog.isEmpty(), "the classic faults did not run");
+    assertEquals(new Random(Simulation.faultSeed(42)).nextLong(), sim.faultRnd.nextLong());
+    assertEquals(0, sim.oneWayFaults + sim.slowSyncs + sim.fsyncFailures + sim.lateTicks);
+    Result a = run(42, classic);
+    assertEquals(a.trace(), run(42, classic).trace());
+    assertNotEquals(a.trace(), run(42, Simulation.Options.defaults()).trace());
   }
 }

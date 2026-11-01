@@ -215,6 +215,40 @@ class KvSimulationTest {
     assertTrue(withPowerLoss.get() >= 20, "power loss hit only " + withPowerLoss + " of 40");
   }
 
+  /** One-way partitions and every kind of disk fault are on by default and turn up across seeds. */
+  @Test
+  void oneWayPartitionsAndDiskFaultsHappenInMostSeeds() {
+    AtomicInteger oneWay = new AtomicInteger();
+    AtomicInteger slow = new AtomicInteger();
+    AtomicInteger stalls = new AtomicInteger();
+    AtomicInteger failures = new AtomicInteger();
+    AtomicInteger late = new AtomicInteger();
+    LongStream.range(0, 40)
+        .parallel()
+        .forEach(
+            seed -> {
+              Simulation sim =
+                  run(seed, Simulation.Options.defaults(), () -> new KvMachine(60_000, 1_000))
+                      .sim();
+              count(oneWay, sim.oneWayFaults);
+              count(slow, sim.slowSyncs);
+              count(stalls, sim.diskStalls);
+              count(failures, sim.fsyncFailures);
+              count(late, sim.lateTicks);
+            });
+    assertEquals(40, oneWay.get(), "one-way partitions");
+    assertEquals(40, slow.get(), "slow syncs");
+    assertTrue(stalls.get() >= 25, "disk stalls in only " + stalls + " of 40");
+    assertTrue(failures.get() >= 10, "fsync failures in only " + failures + " of 40");
+    assertTrue(late.get() >= 25, "ticks caught up after a stall in only " + late + " of 40");
+  }
+
+  private static void count(AtomicInteger seeds, long events) {
+    if (events > 0) {
+      seeds.incrementAndGet();
+    }
+  }
+
   @Test
   void clientsMakeProgress() {
     Run r =

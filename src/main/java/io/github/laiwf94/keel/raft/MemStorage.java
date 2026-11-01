@@ -71,7 +71,26 @@ public final class MemStorage implements Storage {
 
   /** Drops every write that was not synced, as a power failure would. */
   public void crash() {
+    crash(0);
+  }
+
+  /**
+   * Keeps the first {@code keep} unsynced writes and drops the rest, as a failed or interrupted
+   * fsync that got part of the way through would. Writes reach the disk in the order they were
+   * made, so what survives is always a prefix.
+   */
+  public void crash(int keep) {
+    if (keep < 0 || keep > pending.size()) {
+      throw new IllegalArgumentException(
+          "can keep 0 to " + pending.size() + " unsynced writes, not " + keep);
+    }
+    pending.subList(0, keep).forEach(Runnable::run);
     pending.clear();
+  }
+
+  /** Number of writes made since the last sync. */
+  public int unsyncedWrites() {
+    return pending.size();
   }
 
   /** Number of syncs that had something to write. */
