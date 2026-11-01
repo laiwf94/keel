@@ -34,6 +34,8 @@ A fourth rule is less often written down. A node that has just started behaves a
 
 Leadership transfer (thesis section 3.10). `RaftNode.transferLeadership(target)` hands leadership to another voter without waiting for a timeout. The leader stops accepting proposals (they are refused with the target as the leader hint), sends the target whatever it is missing, and once the target's log matches its own sends it `TimeoutNow`. The target starts a real election at once, skipping the pre-vote, and marks its vote requests as a transfer. Voters grant a transfer vote even while they still hear from the leader, because the leader asked for it; stickiness would otherwise make the transfer wait out a timeout. With an up-to-date log the target wins in about one round trip. If it has not taken over within one election timeout, the leader gives up and takes proposals again. Membership changes are refused while a transfer is in progress. Because a transfer vote passes the stickiness rule that lease reads rely on, a leader that has sent `TimeoutNow` voids its lease for the rest of its term, even if the transfer fails, since a delayed `TimeoutNow` could still start an election; its lease reads then wait for a heartbeat round like ReadIndex reads.
 
+Operators reach this through `POST /v1/leader?to=<id>`, behind the admin token, and through graceful shutdown. The event loop starts the transfer (towards the named voter, or the voter in step with the most of the log) and answers once another node is known to lead, which is when the new leader's first heartbeat arrives, or with a failure if the target has not taken over within an election timeout. On SIGTERM a leader hands off before it closes anything: the HTTP port stays open so clients are redirected to the new leader, and the peer port stays open so `TimeoutNow` and the new leader's first round get through. If no voter takes over within two of the longest election timeouts the node stops anyway and the others elect a leader as after a crash. Writes the old leader had appended but not committed when it stepped down are reported as unknown, like any write caught by a leader change, and a retry under the same session is safe.
+
 Election timeouts are drawn from `[electionTicks, 2 * electionTicks)` with a seeded random source. The defaults are a 25 ms tick, 10 election ticks (250 to 500 ms) and 2 heartbeat ticks (50 ms).
 
 ## Replication and the commit rule
@@ -106,7 +108,7 @@ Sending never blocks the event loop. Each peer has a bounded queue drained by it
 
 The HTTP API runs on the JDK's built-in server with a virtual thread per request. Values are raw bytes in the body; versions are log indexes and appear as ETags, so compare-and-set is `If-Match` and create-only is `If-None-Match: *`. A follower answers with a redirect to the leader's advertised address, or 503 with `Retry-After` while there is no leader. A write whose outcome is unknown, because leadership changed or the request timed out, gets 503 or 504 and says so in the body.
 
-Every input is checked before anything is proposed. Keys are strictly percent-decoded, must be valid UTF-8 without control characters, and are limited to 1 KiB. Values are limited to 1 MiB, and that is checked against `Content-Length` before the body is read. Bearer tokens are compared as SHA-256 hashes with a constant-time comparison. Membership changes need a separate admin token and are disabled when none is configured.
+Every input is checked before anything is proposed. Keys are strictly percent-decoded, must be valid UTF-8 without control characters, and are limited to 1 KiB. Values are limited to 1 MiB, and that is checked against `Content-Length` before the body is read. Bearer tokens are compared as SHA-256 hashes with a constant-time comparison. Membership changes and leadership transfer need a separate admin token and are disabled when none is configured.
 
 ## How it is checked
 
@@ -141,8 +143,6 @@ The whole key space and the session table live in memory, and snapshots are seri
 Snapshots are sent in one message of at most 256 MiB, and the log is rewritten after each snapshot. Chunked snapshot transfer and a segmented log would remove both limits.
 
 Only the leader serves linearizable and lease reads. Followers serve only stale reads.
-
-There is no leadership transfer, so planned maintenance on the leader costs an election timeout.
 
 Each session allows one outstanding request. Concurrent writers need one session each.
 

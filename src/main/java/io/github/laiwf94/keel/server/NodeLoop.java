@@ -14,6 +14,10 @@ import io.github.laiwf94.keel.replica.ReadOutcome;
 import io.github.laiwf94.keel.replica.Replica;
 import io.github.laiwf94.keel.replica.StateMachine;
 import java.security.SecureRandom;
+import java.time.Duration;
+import java.util.ArrayList;
+import java.util.Iterator;
+import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.BlockingQueue;
@@ -50,6 +54,8 @@ public final class NodeLoop implements AutoCloseable {
   private final Metrics.Histogram proposalSeconds;
   private final Metrics.Histogram readSeconds;
   private final Thread thread;
+  // Leadership transfers waiting for an outcome. Touched only on the loop thread.
+  private final List<TransferWatch> transfers = new ArrayList<>();
   private volatile NodeStatus status;
   private volatile boolean running = true;
 
@@ -186,6 +192,89 @@ public final class NodeLoop implements AutoCloseable {
     return f;
   }
 
+  private record TransferWatch(
+      long term, long deadlineNanos, CompletableFuture<TransferOutcome> future) {}
+
+  /**
+   * Hands leadership to {@code target}, or to the most caught-up voter if it is empty (see {@link
+   * RaftNode#transferLeadership}). Completes once another node is known to lead, or with why not:
+   * the target did not take over within an election timeout, or {@code timeout} passed first.
+   */
+  public CompletableFuture<TransferOutcome> transferLeadership(
+      Optional<String> target, Duration timeout) {
+    CompletableFuture<TransferOutcome> f = new CompletableFuture<>();
+    long deadline = System.nanoTime() + timeout.toNanos();
+    Runnable task =
+        () -> {
+          RaftNode node = replica.node();
+          if (node.role() != RaftNode.Role.LEADER) {
+            f.complete(new TransferOutcome.NotLeader(node.leader()));
+            return;
+          }
+          Optional<String> to = target.isPresent() ? target : node.bestTransferTarget();
+          if (to.isEmpty()) {
+            f.complete(new TransferOutcome.Rejected("there is no other voter to hand over to"));
+            return;
+          }
+          if (to.get().equals(id)) {
+            f.complete(new TransferOutcome.Transferred(id, node.term()));
+            return;
+          }
+          try {
+            node.transferLeadership(to.get());
+          } catch (IllegalArgumentException e) {
+            f.complete(new TransferOutcome.Rejected(e.getMessage()));
+            return;
+          }
+          log.info("transfer_start", "term", node.term(), "to", to.get());
+          transfers.add(new TransferWatch(node.term(), deadline, f));
+        };
+    if (!submit(task)) {
+      overloaded.inc();
+      f.complete(new TransferOutcome.Failed("node is overloaded or stopping"));
+    }
+    return f;
+  }
+
+  /** Completes the transfers whose outcome is now known. Runs on the loop thread every round. */
+  private void checkTransfers() {
+    if (transfers.isEmpty()) {
+      return;
+    }
+    RaftNode node = replica.node();
+    long now = System.nanoTime();
+    for (Iterator<TransferWatch> it = transfers.iterator(); it.hasNext(); ) {
+      TransferWatch w = it.next();
+      TransferOutcome o = null;
+      boolean stillLeads = node.role() == RaftNode.Role.LEADER && node.term() == w.term();
+      if (!stillLeads && node.leader().isPresent()) {
+        o = new TransferOutcome.Transferred(node.leader().get(), node.term());
+      } else if (stillLeads && node.transferee().isEmpty()) {
+        o =
+            new TransferOutcome.Failed(
+                "the target did not take over within an election timeout; " + id + " still leads");
+      } else if (now - w.deadlineNanos() >= 0) {
+        o =
+            new TransferOutcome.Failed(
+                stillLeads
+                    ? "timed out while the target caught up; " + id + " still leads"
+                    : "timed out before a new leader was known");
+      }
+      if (o != null) {
+        it.remove();
+        log.info("transfer_done", "outcome", o);
+        w.future().complete(o);
+      }
+    }
+  }
+
+  private void failTransfers() {
+    for (TransferWatch w : transfers) {
+      w.future().complete(new TransferOutcome.Failed("node is stopping"));
+    }
+    transfers.clear();
+  }
+
   private boolean submit(Runnable task) {
     return running && inbox.offer(task);
   }
@@ -217,6 +306,7 @@ public final class NodeLoop implements AutoCloseable {
         }
         replica.process();
         publishStatus();
+        checkTransfers();
       }
     } catch (InterruptedException e) {
       Thread.currentThread().interrupt();
@@ -224,6 +314,8 @@ public final class NodeLoop implements AutoCloseable {
       running = false;
       log.error("fatal", "error", e.toString());
       onFatal.run();
+    } finally {
+      failTransfers();
     }
   }
 

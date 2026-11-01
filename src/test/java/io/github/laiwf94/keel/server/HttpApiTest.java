@@ -232,6 +232,42 @@ class HttpApiTest {
     assertEquals(401, add.statusCode());
   }
 
+  HttpResponse<String> transfer(String node, String query, String token) throws Exception {
+    return send(
+        HttpRequest.newBuilder(URI.create(cluster.url(node) + "/v1/leader" + query))
+            .header("Authorization", "Bearer " + token)
+            .POST(HttpRequest.BodyPublishers.noBody())
+            .build());
+  }
+
+  @Test
+  void leaderTransferEndpointChecksItsInputWithoutMovingLeadership() throws Exception {
+    long term = cluster.servers.get(leader).loop().status().term();
+    assertEquals(401, transfer(leader, "", "client-token").statusCode());
+    assertEquals(401, transfer(leader, "", "nope").statusCode());
+    assertEquals(
+        405,
+        send(req(leader, "/v1/leader").header("Authorization", "Bearer admin-token").GET().build())
+            .statusCode());
+    HttpResponse<String> bad = transfer(leader, "?to=n%2F1", "admin-token");
+    assertEquals(400, bad.statusCode(), bad.body());
+    HttpResponse<String> stranger = transfer(leader, "?to=n42", "admin-token");
+    assertEquals(409, stranger.statusCode(), stranger.body());
+    assertTrue(stranger.body().contains("not a voter"), stranger.body());
+    // Asking the leader to hand over to itself changes nothing.
+    HttpResponse<String> self = transfer(leader, "?to=" + leader, "admin-token");
+    assertEquals(200, self.statusCode(), self.body());
+    assertTrue(self.body().contains("\"leader\":\"" + leader + "\""), self.body());
+    // A follower points at the leader, keeping the query.
+    HttpResponse<String> moved = transfer(follower, "?to=" + follower, "admin-token");
+    assertEquals(307, moved.statusCode(), moved.body());
+    assertEquals(
+        cluster.url(leader) + "/v1/leader?to=" + follower,
+        moved.headers().firstValue("Location").orElseThrow());
+    assertEquals(leader, cluster.leaderId());
+    assertEquals(term, cluster.servers.get(leader).loop().status().term());
+  }
+
   @Test
   void membershipEndpoints() throws Exception {
     HttpResponse<String> list = send(req(leader, "/v1/members").GET().build());

@@ -360,6 +360,32 @@ class ElectionTest {
   }
 
   @Test
+  void theBestTransferTargetIsTheVoterWithTheMostOfTheLog() {
+    TestCluster c = new TestCluster(3, 27);
+    RaftNode leader = c.awaitLeader();
+    String lagging = otherThan(c, leader.id());
+    String current = otherThan(c, leader.id(), lagging);
+    assertTrue(c.node(current).bestTransferTarget().isEmpty(), "a follower has no target");
+    c.isolated.add(lagging);
+    for (int i = 0; i < 5; i++) {
+      leader.propose(ReplicationTest.cmd("c" + i));
+    }
+    c.flush();
+    assertEquals(current, leader.bestTransferTarget().orElseThrow());
+    // Once the lagging node is back in step and the other one falls behind, they swap.
+    c.isolated.clear();
+    c.isolated.add(current);
+    c.ticks(c.opts.heartbeatTicks() * 3);
+    for (int i = 0; i < 5; i++) {
+      leader.propose(ReplicationTest.cmd("d" + i));
+    }
+    c.flush();
+    assertEquals(lagging, leader.bestTransferTarget().orElseThrow());
+    TestCluster solo = new TestCluster(1, 28);
+    assertTrue(solo.awaitLeader().bestTransferTarget().isEmpty(), "a lone voter has no target");
+  }
+
+  @Test
   void transferRejectsBadTargetsAndKeepsTheLatestRequest() {
     TestCluster c = new TestCluster(3, 26);
     RaftNode leader = c.awaitLeader();

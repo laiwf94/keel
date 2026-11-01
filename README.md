@@ -62,7 +62,9 @@ $ curl -s -X PUT -H 'Keel-Client: 4' -H 'Keel-Seq: 1' --data 1 localhost:8081/v1
 
 The Java client in `io.github.laiwf94.keel.client.KeelClient` does all of this for you: it follows redirects, keeps a session, and retries under the same sequence number.
 
-Other endpoints are `DELETE /v1/kv/{key}`, `GET /v1/status`, `GET /v1/members`, `POST /v1/members?id=&peer=&client=` and `DELETE /v1/members/{id}` (both need the admin token), `GET /metrics` in the Prometheus text format, and `GET /healthz`. Set `KEEL_CLIENT_TOKEN` to require a bearer token on the client API and `KEEL_ADMIN_TOKEN` to enable membership changes.
+Other endpoints are `DELETE /v1/kv/{key}`, `GET /v1/status`, `GET /v1/members`, `POST /v1/members?id=&peer=&client=`, `DELETE /v1/members/{id}` and `POST /v1/leader?to={id}` (all three need the admin token), `GET /metrics` in the Prometheus text format, and `GET /healthz`. Set `KEEL_CLIENT_TOKEN` to require a bearer token on the client API and `KEEL_ADMIN_TOKEN` to enable membership changes and leadership transfer.
+
+`POST /v1/leader?to=n2` hands leadership to n2 in about one round trip and answers with the new leader and term once it has taken over; without `to`, the most caught-up voter takes over. A node that stops on SIGTERM while it leads does the same before it closes its ports, so a rolling restart does not wait out an election timeout.
 
 ## What happens when things break
 
@@ -137,7 +139,7 @@ A write is acknowledged only after it is on disk on the leader and on at least o
 
 ## What it does not do
 
-All data lives in memory and is snapshotted to disk, so the data set is bounded by the heap. Snapshots are sent in one message of at most 256 MiB. Only the leader serves linearizable and lease reads. Each session allows one outstanding request. Peer traffic is authenticated with HMAC-SHA256 but not encrypted, so run it on a private network. Lease reads assume clock rates differ by less than 25% between nodes; ReadIndex, the default, assumes nothing about clocks. There is no leadership transfer. Every founding node must start with the same member list, and a node that loses its disk must rejoin under a new id.
+All data lives in memory and is snapshotted to disk, so the data set is bounded by the heap. Snapshots are sent in one message of at most 256 MiB. Only the leader serves linearizable and lease reads. Each session allows one outstanding request. Peer traffic is authenticated with HMAC-SHA256 but not encrypted, so run it on a private network. Lease reads assume clock rates differ by less than 25% between nodes; ReadIndex, the default, assumes nothing about clocks. Every founding node must start with the same member list, and a node that loses its disk must rejoin under a new id.
 
 docs/DESIGN.md explains the design, the reasons behind it, the failure modes and the trade-offs in detail.
 

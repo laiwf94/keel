@@ -5,6 +5,7 @@ import io.github.laiwf94.keel.net.PeerTransport;
 import io.github.laiwf94.keel.obs.Log;
 import io.github.laiwf94.keel.obs.Metrics;
 import io.github.laiwf94.keel.raft.Configuration;
+import io.github.laiwf94.keel.raft.RaftNode;
 import io.github.laiwf94.keel.raft.RaftOptions;
 import io.github.laiwf94.keel.storage.FileStorage;
 import java.io.IOException;
@@ -15,6 +16,9 @@ import java.nio.file.Path;
 import java.time.Clock;
 import java.time.Duration;
 import java.util.Optional;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicReference;
 
 /** One keel node: storage, peer transport, event loop and HTTP API wired together. */
@@ -49,14 +53,31 @@ public final class KeelServer implements AutoCloseable {
   private final NodeLoop loop;
   private final HttpApi http;
   private final Log log;
+  private final Duration handoffTimeout;
+  private boolean closed;
 
   private KeelServer(
-      FileStorage storage, PeerTransport transport, NodeLoop loop, HttpApi http, Log log) {
+      FileStorage storage,
+      PeerTransport transport,
+      NodeLoop loop,
+      HttpApi http,
+      Log log,
+      Duration handoffTimeout) {
     this.storage = storage;
     this.transport = transport;
     this.loop = loop;
     this.http = http;
     this.log = log;
+    this.handoffTimeout = handoffTimeout;
+  }
+
+  /**
+   * How long a leader that is shutting down waits for another voter to take over: the transfer
+   * itself gives up after one election timeout, and the new leader announces itself with its first
+   * heartbeat, so two of the longest election timeouts is ample.
+   */
+  static Duration handoffTimeout(RaftOptions raft, NodeLoop.Settings loop) {
+    return Duration.ofMillis(4L * raft.electionTicks() * loop.tickMs());
   }
 
   /** Opens storage, binds both ports and starts serving. */
@@ -110,7 +131,11 @@ public final class KeelServer implements AutoCloseable {
               metrics,
               log,
               new HttpApi.Options(
-                  c.clientToken(), c.adminToken(), c.requestTimeout(), Clock.systemUTC()));
+                  c.clientToken(),
+                  c.adminToken(),
+                  c.requestTimeout(),
+                  handoffTimeout(c.raft(), c.loop()),
+                  Clock.systemUTC()));
       if (storage.tornBytesDropped() > 0) {
         log.warn("torn_tail", "bytes_dropped", storage.tornBytesDropped());
       }
@@ -125,7 +150,8 @@ public final class KeelServer implements AutoCloseable {
           http.port(),
           "members",
           loop.status().config().ids());
-      return new KeelServer(storage, transport, loop, http, log);
+      return new KeelServer(
+          storage, transport, loop, http, log, handoffTimeout(c.raft(), c.loop()));
     } catch (IOException | RuntimeException e) {
       if (loop != null) {
         loop.close();
@@ -169,12 +195,59 @@ public final class KeelServer implements AutoCloseable {
     return loop;
   }
 
+  /**
+   * Stops the node gracefully: a leader first hands leadership to the most caught-up voter, while
+   * both ports stay open so the handoff can finish and clients are pointed at the new leader, then
+   * everything closes. A leader that cannot hand off (it is the only voter, or no voter takes over
+   * in time) closes anyway and the others elect a leader after an election timeout, as after a
+   * crash.
+   */
   @Override
-  public void close() {
+  public synchronized void close() {
+    if (!closed) {
+      handOff();
+    }
+    closeWithoutHandoff();
+  }
+
+  /** Stops the node at once, leaving any leadership to be won in an election. */
+  public synchronized void closeWithoutHandoff() {
+    if (closed) {
+      return;
+    }
+    closed = true;
     log.info("stopping");
     http.close();
     transport.close();
     loop.close();
     storage.close();
+  }
+
+  /** Hands leadership to another voter if this node leads; returns how that went. */
+  public Optional<TransferOutcome> handOff() {
+    if (loop.status().role() != RaftNode.Role.LEADER) {
+      return Optional.empty();
+    }
+    long start = System.nanoTime();
+    TransferOutcome o;
+    try {
+      o =
+          loop.transferLeadership(Optional.empty(), handoffTimeout)
+              .get(handoffTimeout.toMillis() + 1_000, TimeUnit.MILLISECONDS);
+    } catch (TimeoutException e) {
+      o = new TransferOutcome.Failed("the event loop did not answer in time");
+    } catch (InterruptedException e) {
+      Thread.currentThread().interrupt();
+      o = new TransferOutcome.Failed("interrupted");
+    } catch (ExecutionException e) {
+      o = new TransferOutcome.Failed(e.getCause().toString());
+    }
+    long ms = (System.nanoTime() - start) / 1_000_000;
+    if (o instanceof TransferOutcome.Transferred t) {
+      log.info("handoff", "leader", t.leader(), "term", t.term(), "ms", ms);
+    } else {
+      log.warn("handoff_failed", "outcome", o, "ms", ms);
+    }
+    return Optional.of(o);
   }
 }

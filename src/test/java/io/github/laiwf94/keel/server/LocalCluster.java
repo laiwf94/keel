@@ -135,7 +135,16 @@ final class LocalCluster implements AutoCloseable {
     }
   }
 
+  /** Stops a node at once, as a crash would, without handing off leadership. */
   void stop(String id) {
+    KeelServer s = servers.remove(id);
+    if (s != null) {
+      s.closeWithoutHandoff();
+    }
+  }
+
+  /** Stops a node gracefully: a leader hands off leadership first. */
+  void shutdown(String id) {
     KeelServer s = servers.remove(id);
     if (s != null) {
       s.close();

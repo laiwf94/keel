@@ -284,6 +284,40 @@ public final class RaftNode {
     }
   }
 
+  /**
+   * The voter best placed to take over from this leader: one that is streaming entries in step with
+   * the leader if there is one, then the one with the most of the log, then the first in the
+   * configuration. Empty if this node is not the leader or is the only voter.
+   */
+  public Optional<String> bestTransferTarget() {
+    if (role != Role.LEADER) {
+      return Optional.empty();
+    }
+    String best = NONE;
+    Progress bestPr = null;
+    for (var e : progress.entrySet()) {
+      String peer = e.getKey();
+      Progress pr = e.getValue();
+      if (peer.equals(id) || !config().isVoter(peer)) {
+        continue;
+      }
+      if (bestPr == null || betterTarget(pr, bestPr)) {
+        best = peer;
+        bestPr = pr;
+      }
+    }
+    return best.isEmpty() ? Optional.empty() : Optional.of(best);
+  }
+
+  private static boolean betterTarget(Progress a, Progress b) {
+    boolean aInStep = a.state == Progress.State.REPLICATE;
+    boolean bInStep = b.state == Progress.State.REPLICATE;
+    if (aInStep != bInStep) {
+      return aInStep;
+    }
+    return a.match > b.match;
+  }
+
   private void abortTransfer() {
     transferee = NONE;
     transferElapsed = 0;

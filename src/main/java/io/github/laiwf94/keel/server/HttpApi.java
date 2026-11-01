@@ -48,6 +48,7 @@ import java.util.regex.Pattern;
  * POST   /v1/sessions        returns a client id for Keel-Client / Keel-Seq headers
  * GET    /v1/status
  * GET    /v1/members         POST /v1/members?id=&amp;peer=&amp;client=   DELETE /v1/members/{id}
+ * POST   /v1/leader[?to=id]  hands leadership to {@code id}, or to the most caught-up voter
  * GET    /metrics            GET /healthz
  * </pre>
  *
@@ -55,11 +56,16 @@ import java.util.regex.Pattern;
  * Content-Length before the body is read, header formats and tokens.
  */
 public final class HttpApi implements AutoCloseable {
-  /** Settings for the API: tokens, timeouts and the clock used to stamp commands. */
+  /**
+   * Settings for the API: tokens, timeouts and the clock used to stamp commands.
+   *
+   * @param transferTimeout how long POST /v1/leader waits for the new leader to be known
+   */
   public record Options(
       Optional<String> clientToken,
       Optional<String> adminToken,
       Duration requestTimeout,
+      Duration transferTimeout,
       Clock clock) {}
 
   private static final Pattern REQUEST_ID = Pattern.compile("[A-Za-z0-9._-]{1,64}");
@@ -286,6 +292,11 @@ public final class HttpApi implements AutoCloseable {
       }
       return membershipOutcome(ex, await(loop.removeServer(id)));
     }
+    if (path.equals("/v1/leader")) {
+      requireMethod(method, "POST");
+      authorizeAdmin(ex);
+      return transferLeader(ex);
+    }
     return Response.error(404, "no such endpoint");
   }
 
@@ -332,7 +343,7 @@ public final class HttpApi implements AutoCloseable {
 
   private void authorizeAdmin(HttpExchange ex) throws BadRequest {
     if (adminTokenHash == null) {
-      throw new BadRequest(403, "membership changes are disabled: no admin token is configured");
+      throw new BadRequest(403, "admin endpoints are disabled: no admin token is configured");
     }
     authorize(ex, adminTokenHash);
   }
@@ -617,6 +628,39 @@ public final class HttpApi implements AutoCloseable {
     return Response.json(307, fields("error", "not the leader", "leader", m.get().id()))
         .with("Location", target)
         .with("Keel-Leader", m.get().id());
+  }
+
+  private Response transferLeader(HttpExchange ex) throws BadRequest {
+    String to = query(ex).get("to");
+    Optional<String> target = Optional.empty();
+    if (to != null) {
+      try {
+        target = Optional.of(Member.validateId(to));
+      } catch (IllegalArgumentException e) {
+        throw new BadRequest(400, "invalid member id in to");
+      }
+    }
+    String from = loop.status().id();
+    TransferOutcome o;
+    try {
+      o =
+          loop.transferLeadership(target, opts.transferTimeout())
+              .get(opts.transferTimeout().toMillis() + 1_000, TimeUnit.MILLISECONDS);
+    } catch (TimeoutException e) {
+      throw new BadRequest(504, "timed out; leadership may or may not have moved");
+    } catch (InterruptedException e) {
+      Thread.currentThread().interrupt();
+      throw new BadRequest(503, "interrupted");
+    } catch (ExecutionException e) {
+      throw new IllegalStateException(e.getCause());
+    }
+    return switch (o) {
+      case TransferOutcome.Transferred t ->
+          Response.json(200, fields("leader", t.leader(), "term", t.term(), "previous", from));
+      case TransferOutcome.NotLeader n -> redirect(ex, n.leaderHint());
+      case TransferOutcome.Rejected r -> Response.error(409, r.reason());
+      case TransferOutcome.Failed f -> Response.error(503, f.reason()).with("Retry-After", "1");
+    };
   }
 
   private Response addMember(HttpExchange ex) throws BadRequest {

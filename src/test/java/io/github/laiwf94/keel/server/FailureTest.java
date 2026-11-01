@@ -93,7 +93,12 @@ class FailureTest {
   }
 
   static void verifyAll(LocalCluster c, Map<String, String> acked) throws Exception {
-    try (KeelClient k = client(c)) {
+    verifyAll(() -> client(c), acked);
+  }
+
+  static void verifyAll(java.util.function.Supplier<KeelClient> clients, Map<String, String> acked)
+      throws Exception {
+    try (KeelClient k = clients.get()) {
       for (var e : acked.entrySet()) {
         var v = k.get(e.getKey(), "linearizable");
         assertTrue(v.isPresent(), "acknowledged write lost: " + e.getKey());
@@ -236,6 +241,138 @@ class FailureTest {
               HttpResponse.BodyHandlers.ofString());
       assertEquals(503, read.statusCode(), read.body());
       http.close();
+    }
+  }
+
+  static long field(String json, String name) {
+    java.util.regex.Matcher m =
+        java.util.regex.Pattern.compile("\"" + name + "\":(\\d+)").matcher(json);
+    assertTrue(m.find(), name + " missing from " + json);
+    return Long.parseLong(m.group(1));
+  }
+
+  @Test
+  void leadershipMovesOverHttpUnderLoadWithoutLosingAWrite() throws Exception {
+    try (ProcessCluster c = new ProcessCluster(tmp, 3).startAll()) {
+      String old = c.leader();
+      long term = c.status(old).orElseThrow().term();
+      String target = c.ports.keySet().stream().filter(id -> !id.equals(old)).findFirst().get();
+      String third =
+          c.ports.keySet().stream()
+              .filter(id -> !id.equals(old) && !id.equals(target))
+              .findFirst()
+              .get();
+      Writers w = new Writers(c::client, 4);
+      Thread.sleep(800);
+      long start = System.nanoTime();
+      HttpResponse<String> r = c.transfer(old, target);
+      long ms = (System.nanoTime() - start) / 1_000_000;
+      assertEquals(200, r.statusCode(), r.body());
+      assertTrue(r.body().contains("\"leader\":\"" + target + "\""), r.body());
+      assertTrue(r.body().contains("\"previous\":\"" + old + "\""), r.body());
+      // One election, started by TimeoutNow: the term moves by exactly one. With 10 ms ticks the
+      // election timeout is 100 to 200 ms; the handover is bounded by catch-up and one round trip.
+      assertEquals(term + 1, field(r.body(), "term"), r.body());
+      assertTrue(ms < 2_000, "transfer took " + ms + " ms");
+      assertEquals("leader", c.status(target).orElseThrow().role());
+      // A node that does not lead points the caller at the one that does.
+      HttpResponse<String> redirected = c.transfer(third, old);
+      assertEquals(307, redirected.statusCode(), redirected.body());
+      assertEquals(
+          c.url(target) + "/v1/leader?to=" + old,
+          redirected.headers().firstValue("Location").orElseThrow());
+      // Without a target, the most caught-up voter takes over.
+      HttpResponse<String> any = c.transfer(target, null);
+      assertEquals(200, any.statusCode(), any.body());
+      assertEquals(term + 2, field(any.body(), "term"), any.body());
+      assertTrue(!any.body().contains("\"leader\":\"" + target + "\""), any.body());
+      int before = w.acked.size();
+      Thread.sleep(800);
+      w.close();
+      assertTrue(w.acked.size() > before, "no progress after the transfers");
+      verifyAll(c::client, w.acked);
+    }
+  }
+
+  @Test
+  void sigtermOnTheLeaderHandsOffBeforeExit() throws Exception {
+    try (ProcessCluster c = new ProcessCluster(tmp, 3).startAll()) {
+      String old = c.leader();
+      long term = c.status(old).orElseThrow().term();
+      Writers w = new Writers(c::client, 4);
+      Thread.sleep(800);
+      Process p = c.procs.get(old);
+      p.destroy(); // SIGTERM
+      assertTrue(p.waitFor(10, java.util.concurrent.TimeUnit.SECONDS), "the leader did not exit");
+      String log = c.log(old);
+      int handoff = log.indexOf("\"event\":\"handoff\"");
+      int stopping = log.indexOf("\"event\":\"stopping\"");
+      assertTrue(handoff >= 0, "no handoff before exit:\n" + log);
+      assertTrue(handoff < stopping, "the ports closed before the handoff:\n" + log);
+      String next = c.leader(old);
+      assertEquals(term + 1, c.status(next).orElseThrow().term());
+      assertTrue(log.contains("\"leader\":\"" + next + "\""), log);
+      int before = w.acked.size();
+      Thread.sleep(800);
+      c.launch(old);
+      Thread.sleep(500);
+      w.close();
+      assertTrue(w.acked.size() > before, "no progress after the handoff");
+      verifyAll(c::client, w.acked);
+    }
+  }
+
+  @Test
+  void aTransferToAnUnreachableVoterFailsAndTheLeaderKeepsLeading() throws Exception {
+    try (LocalCluster c = new LocalCluster(tmp, 3, true)) {
+      c.adminToken = Optional.of("admin");
+      c.startAll();
+      String leader = c.leaderId();
+      long term = c.servers.get(leader).loop().status().term();
+      String target = c.ports.keySet().stream().filter(id -> !id.equals(leader)).findFirst().get();
+      c.isolate(target);
+      HttpClient http = HttpClient.newHttpClient();
+      HttpResponse<String> r =
+          http.send(
+              HttpRequest.newBuilder(URI.create(c.url(leader) + "/v1/leader?to=" + target))
+                  .header("Authorization", "Bearer admin")
+                  .POST(HttpRequest.BodyPublishers.noBody())
+                  .build(),
+              HttpResponse.BodyHandlers.ofString());
+      assertEquals(503, r.statusCode(), r.body());
+      assertTrue(r.body().contains("still leads"), r.body());
+      var s = c.servers.get(leader).loop().status();
+      assertEquals(RaftNode.Role.LEADER, s.role());
+      assertEquals(term, s.term());
+      try (KeelClient k = client(c)) {
+        k.put("after", "ok".getBytes(StandardCharsets.UTF_8));
+      }
+      http.close();
+    }
+  }
+
+  @Test
+  void gracefulShutdownHandsOffInProcessAndALoneVoterJustStops() throws Exception {
+    try (LocalCluster c = new LocalCluster(tmp.resolve("three"), 3).startAll()) {
+      String old = c.leaderId();
+      long term = c.servers.get(old).loop().status().term();
+      KeelServer s = c.servers.get(old);
+      var o = s.handOff().orElseThrow();
+      assertTrue(o instanceof TransferOutcome.Transferred, o.toString());
+      String next = ((TransferOutcome.Transferred) o).leader();
+      assertNotEquals(old, next);
+      assertEquals(term + 1, ((TransferOutcome.Transferred) o).term());
+      assertTrue(s.handOff().isEmpty(), "a follower has nothing to hand off");
+      c.shutdown(old);
+      c.shutdown(next); // hands off again, to the last node standing
+      assertEquals(1, c.servers.size());
+    }
+    try (LocalCluster c = new LocalCluster(tmp.resolve("one"), 1).startAll()) {
+      KeelServer s = c.awaitLeader();
+      var o = s.handOff().orElseThrow();
+      assertTrue(o instanceof TransferOutcome.Rejected, o.toString());
+      c.shutdown("n1");
+      assertTrue(c.logs.toString(StandardCharsets.UTF_8).contains("handoff_failed"));
     }
   }
 }
