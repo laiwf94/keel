@@ -34,6 +34,10 @@ class RaftSimulationTest {
             String cmd = "w" + next[0]++;
             List<String> ids = new ArrayList<>(sim.nodes.keySet());
             String target = ids.get(sim.rnd.nextInt(ids.size()));
+            if (!sim.plan.step(sim.now(), "write " + cmd + " at " + target)) {
+              sim.schedule(5 + sim.rnd.nextInt(20), writer[0]);
+              return;
+            }
             sim.propose(
                 target,
                 Simulation.bytes(cmd),
@@ -93,13 +97,12 @@ class RaftSimulationTest {
 
   @Test
   void safetyAndDurabilityUnderRandomFaults() {
-    Seeds.run("RaftSimulationTest", 300, seed -> run(seed, Simulation.Options.defaults()));
+    Seeds.run(300, seed -> run(seed, Simulation.Options.defaults()));
   }
 
   @Test
   void threeNodeClusters() {
-    Seeds.run(
-        "RaftSimulationTest", 100, seed -> run(seed, Simulation.Options.defaults().withNodes(3)));
+    Seeds.run(100, seed -> run(seed, Simulation.Options.defaults().withNodes(3)));
   }
 
   @Test

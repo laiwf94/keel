@@ -105,6 +105,11 @@ final class SimKvClient {
     }
     String key = keys.get(sim.rnd.nextInt(keys.size()));
     int pick = sim.rnd.nextInt(13);
+    if (!sim.plan.step(sim.now(), "c" + id + " " + describe(pick, key))) {
+      // The plan leaves this operation out; the client pauses about as long as one takes.
+      sim.schedule(10 + sim.rnd.nextInt(10), this::next);
+      return;
+    }
     if (pick >= 10) {
       read(history.call(id, History.Kind.GET, key, null, -1), sim.now() + OP_TIMEOUT_MS);
       return;
@@ -127,6 +132,20 @@ final class SimKvClient {
       cmd = Command.delete(sim.now(), clientId, seq, key, expected);
     }
     send(op, cmd.encode(), sim.now() + OP_TIMEOUT_MS);
+  }
+
+  /** The operation {@link #next} issues for a given pick, in words. */
+  static String describe(int pick, String key) {
+    if (pick >= 10) {
+      return "get " + key;
+    } else if (pick < 6) {
+      return "put " + key;
+    } else if (pick < 8) {
+      return "put " + key + " if unchanged";
+    } else if (pick == 8) {
+      return "delete " + key;
+    }
+    return "delete " + key + " if unchanged";
   }
 
   private void send(History.Op op, byte[] cmd, long deadline) {

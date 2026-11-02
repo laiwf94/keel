@@ -25,6 +25,7 @@ import java.util.PriorityQueue;
 import java.util.Random;
 import java.util.Set;
 import java.util.TreeMap;
+import java.util.TreeSet;
 import java.util.function.BiConsumer;
 import java.util.function.Consumer;
 import java.util.function.Supplier;
@@ -261,6 +262,10 @@ final class Simulation {
   final Random faultRnd;
 
   final Options opts;
+
+  /** Which faults may happen; see {@link Plan}. */
+  final Plan plan = Plan.current();
+
   final Invariants invariants = new Invariants();
   final Map<String, SimNode> nodes = new TreeMap<>();
   final Configuration config;
@@ -452,18 +457,21 @@ final class Simulation {
     faultLog.add(now + " one-way " + from + " cannot reach the rest");
   }
 
-  /** Cuts each directed link independently with probability {@code p}. */
+  /** Cuts each directed link independently with probability {@code p}, if the plan allows it. */
   private void cutRandomLinks(double p) {
-    blockedOneWay.clear();
     List<String> cut = new ArrayList<>();
     for (String a : nodes.keySet()) {
       for (String b : nodes.keySet()) {
         if (!a.equals(b) && faultRnd.nextDouble() < p) {
-          blockedOneWay.add(a + ">" + b);
           cut.add(a + ">" + b);
         }
       }
     }
+    if (!plan.fault(now, "one-way links cut " + cut)) {
+      return;
+    }
+    blockedOneWay.clear();
+    blockedOneWay.addAll(cut);
     oneWayFaults++;
     faultLog.add(now + " one-way links cut " + cut);
   }
@@ -585,7 +593,10 @@ final class Simulation {
 
       @Override
       public void sync() {
-        if (opts.faults() && now < opts.durationMs() && rnd.nextInt(2000) == 0) {
+        if (opts.faults()
+            && now < opts.durationMs()
+            && rnd.nextInt(2000) == 0
+            && plan.fault(now, "power loss during fsync on " + n.id)) {
           throw new PowerLoss();
         }
         int writes = m.unsyncedWrites();
@@ -594,9 +605,18 @@ final class Simulation {
           n.stallNext = 0;
           if (ms == 0 && opts.faults() && opts.diskFaults() && now < opts.durationMs()) {
             if (faultRnd.nextDouble() < n.disk.failRate()) {
-              throw new FsyncFailure(faultRnd.nextInt(writes + 1));
+              int kept = faultRnd.nextInt(writes + 1);
+              if (plan.fault(
+                  now, "fsync fails on " + n.id + " keeping " + kept + " of " + writes)) {
+                throw new FsyncFailure(kept);
+              }
             }
             ms = n.disk.syncMs(faultRnd);
+            if (ms >= DiskProfile.MIN_STALL_MS
+                && !plan.fault(now, "disk on " + n.id + " stalls for " + ms + " ms")) {
+              // Without the stall the sync takes as long as this disk's syncs usually do.
+              ms = Math.round(n.disk.meanSyncMs());
+            }
           }
           if (ms > 0) {
             slowSyncs++;
@@ -730,24 +750,36 @@ final class Simulation {
       case 0 ->
           leader.ifPresent(
               l -> {
-                Set<String> others = new HashSet<>(nodes.keySet());
-                others.remove(l.id);
-                partitionOneWay(others);
+                if (plan.fault(now, "leader " + l.id + " can send but not hear")) {
+                  Set<String> others = new HashSet<>(nodes.keySet());
+                  others.remove(l.id);
+                  partitionOneWay(others);
+                }
               });
-      case 1 -> leader.ifPresent(l -> partitionOneWay(Set.of(l.id)));
+      case 1 ->
+          leader.ifPresent(
+              l -> {
+                if (plan.fault(now, "leader " + l.id + " can hear but not send")) {
+                  partitionOneWay(Set.of(l.id));
+                }
+              });
       case 2 -> {
-        Set<String> side = new HashSet<>();
+        Set<String> side = new TreeSet<>();
         for (String id : nodes.keySet()) {
           if (faultRnd.nextBoolean()) {
             side.add(id);
           }
         }
-        partitionOneWay(side);
+        if (plan.fault(now, side + " cannot reach the rest")) {
+          partitionOneWay(side);
+        }
       }
       case 3 -> cutRandomLinks(0.25);
       default -> {
-        blockedOneWay.clear();
-        faultLog.add(now + " heal one-way cuts");
+        if (blockedOneWay.isEmpty() || plan.fault(now, "heal one-way cuts")) {
+          blockedOneWay.clear();
+          faultLog.add(now + " heal one-way cuts");
+        }
       }
     }
     schedule(
@@ -765,33 +797,53 @@ final class Simulation {
     List<String> ids = new ArrayList<>(nodes.keySet());
     int choice = rnd.nextInt(6);
     switch (choice) {
-      case 0 -> crash(ids.get(rnd.nextInt(ids.size())));
+      case 0 -> {
+        String id = ids.get(rnd.nextInt(ids.size()));
+        if (nodes.get(id).up && plan.fault(now, "crash " + id)) {
+          crash(id);
+        }
+      }
       case 1 -> {
         for (String id : ids) {
-          if (!retired.contains(id)) {
+          if (!retired.contains(id) && !nodes.get(id).up && plan.fault(now, "restart " + id)) {
             restart(id);
           }
         }
       }
       case 2 -> {
-        Set<String> side = new HashSet<>();
+        Set<String> side = new TreeSet<>();
         for (String id : ids) {
           if (rnd.nextBoolean()) {
             side.add(id);
           }
         }
-        heal();
-        partition(side);
+        if (plan.fault(now, "partition " + side + " from the rest")) {
+          heal();
+          partition(side);
+        }
       }
       case 3 ->
           leader()
               .ifPresent(
                   l -> {
-                    heal();
-                    partition(Set.of(l.id));
+                    if (plan.fault(now, "isolate leader " + l.id)) {
+                      heal();
+                      partition(Set.of(l.id));
+                    }
                   });
-      case 4 -> leader().ifPresent(l -> crash(l.id));
-      default -> heal();
+      case 4 ->
+          leader()
+              .ifPresent(
+                  l -> {
+                    if (plan.fault(now, "crash leader " + l.id)) {
+                      crash(l.id);
+                    }
+                  });
+      default -> {
+        if ((blocked.isEmpty() && blockedOneWay.isEmpty()) || plan.fault(now, "heal")) {
+          heal();
+        }
+      }
     }
     schedule(nextFaultGap(), this::fault);
   }

@@ -57,9 +57,12 @@ tasks.test {
     useJUnitPlatform()
     maxHeapSize = "1g"
     // Simulation seeds: -Dkeel.sim.seeds=N runs N seeds per simulation test, -Dkeel.sim.seed=S
-    // replays one.
+    // replays one, -Dkeel.sim.faults and -Dkeel.sim.steps replay it with only those faults and
+    // client steps, and -Dkeel.sim.shrink=true shrinks it (at most -Dkeel.sim.shrink.budget
+    // replays).
     systemProperty("keel.sim.seeds", providers.systemProperty("keel.sim.seeds").getOrElse("1000"))
-    providers.systemProperty("keel.sim.seed").orNull?.let { systemProperty("keel.sim.seed", it) }
+    listOf("keel.sim.seed", "keel.sim.faults", "keel.sim.steps", "keel.sim.shrink", "keel.sim.shrink.budget")
+        .forEach { name -> providers.systemProperty(name).orNull?.let { systemProperty(name, it) } }
     testLogging {
         events("failed")
         exceptionFormat = org.gradle.api.tasks.testing.logging.TestExceptionFormat.FULL

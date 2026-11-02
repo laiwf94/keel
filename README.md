@@ -149,6 +149,8 @@ docs/DESIGN.md explains the design, the reasons behind it, the failure modes and
 ./gradlew check                                     # format, Error Prone, tests, 90% line coverage
 ./gradlew test --tests '*SimulationTest*' -Dkeel.sim.seeds=10000
 ./gradlew test --tests '*KvSimulationTest*' -Dkeel.sim.seed=1234   # replay one seed
+./gradlew test --tests '*KvSimulationTest.historiesAreLinearizableUnderFaults' \
+    -Dkeel.sim.seed=1234 -Dkeel.sim.shrink=true      # shrink a failing seed to its causes
 bench/run.sh local                                  # benchmark three local JVMs
 scripts/verify-commits.sh                           # run the gate on every commit
 ```

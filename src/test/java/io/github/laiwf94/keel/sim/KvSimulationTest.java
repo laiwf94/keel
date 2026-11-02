@@ -75,30 +75,23 @@ class KvSimulationTest {
 
   @Test
   void historiesAreLinearizableUnderFaults() {
-    Seeds.run("KvSimulationTest", 300, seed -> checkSeed(seed, Simulation.Options.defaults()));
+    Seeds.run(300, seed -> checkSeed(seed, Simulation.Options.defaults()));
   }
 
   @Test
   void historiesAreLinearizableOnThreeNodes() {
-    Seeds.run(
-        "KvSimulationTest",
-        100,
-        seed -> checkSeed(seed, Simulation.Options.defaults().withNodes(3)));
+    Seeds.run(100, seed -> checkSeed(seed, Simulation.Options.defaults().withNodes(3)));
   }
 
   @Test
   void leaseReadsStayLinearizableAtTheEdgeOfTheDriftBound() {
     // Rates within 10% either way: at worst 1.1 / 0.9 = 1.22, under electionTicks / leaseTicks.
-    Seeds.run(
-        "KvSimulationTest",
-        200,
-        seed -> checkSeed(seed, Simulation.Options.defaults().withDrift(0.1)));
+    Seeds.run(200, seed -> checkSeed(seed, Simulation.Options.defaults().withDrift(0.1)));
   }
 
   @Test
   void historiesAreLinearizableWhileServersJoinAndLeave() {
     Seeds.run(
-        "KvSimulationTest",
         300,
         seed -> {
           Simulation.Options opts = Simulation.Options.defaults();
