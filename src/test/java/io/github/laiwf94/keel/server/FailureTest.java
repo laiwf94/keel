@@ -254,6 +254,11 @@ class FailureTest {
   @Test
   void leadershipMovesOverHttpUnderLoadWithoutLosingAWrite() throws Exception {
     try (ProcessCluster c = new ProcessCluster(tmp, 3).startAll()) {
+      c.leader();
+      Writers w = new Writers(c::client, 4);
+      Thread.sleep(800);
+      // Read the leader after the warm-up: with 10 ms ticks a pause on a busy machine can cost the
+      // first leader its term while the JVMs warm up under load (#78).
       String old = c.leader();
       long term = c.status(old).orElseThrow().term();
       String target = c.ports.keySet().stream().filter(id -> !id.equals(old)).findFirst().get();
@@ -262,8 +267,6 @@ class FailureTest {
               .filter(id -> !id.equals(old) && !id.equals(target))
               .findFirst()
               .get();
-      Writers w = new Writers(c::client, 4);
-      Thread.sleep(800);
       long start = System.nanoTime();
       HttpResponse<String> r = c.transfer(old, target);
       long ms = (System.nanoTime() - start) / 1_000_000;
@@ -297,10 +300,12 @@ class FailureTest {
   @Test
   void sigtermOnTheLeaderHandsOffBeforeExit() throws Exception {
     try (ProcessCluster c = new ProcessCluster(tmp, 3).startAll()) {
-      String old = c.leader();
-      long term = c.status(old).orElseThrow().term();
+      c.leader();
       Writers w = new Writers(c::client, 4);
       Thread.sleep(800);
+      // The leader as of now, not as of start-up (#78).
+      String old = c.leader();
+      long term = c.status(old).orElseThrow().term();
       Process p = c.procs.get(old);
       p.destroy(); // SIGTERM
       assertTrue(p.waitFor(10, java.util.concurrent.TimeUnit.SECONDS), "the leader did not exit");
