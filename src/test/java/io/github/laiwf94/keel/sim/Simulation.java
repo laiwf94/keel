@@ -157,6 +157,25 @@ final class Simulation {
           raft);
     }
 
+    /** Faults and clients run for {@code ms} of virtual time instead of six seconds. */
+    Options withDuration(long ms) {
+      return new Options(
+          nodes,
+          ms,
+          tickMs,
+          minDelayMs,
+          maxDelayMs,
+          dropRate,
+          duplicateRate,
+          faults,
+          meanFaultGapMs,
+          snapshotEvery,
+          maxDrift,
+          oneWayPartitions,
+          diskFaults,
+          raft);
+    }
+
     Options withSnapshotEvery(long every) {
       return new Options(
           nodes,

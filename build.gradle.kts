@@ -70,6 +70,14 @@ tasks.test {
     finalizedBy(tasks.jacocoTestReport)
 }
 
+// Times the linearizability checker against the search it replaced; see LinearizabilityBenchmark.
+tasks.register<JavaExec>("linearizabilityBenchmark") {
+    description = "Times the linearizability checker on long histories."
+    classpath = sourceSets.test.get().runtimeClasspath
+    mainClass = "io.github.laiwf94.keel.sim.LinearizabilityBenchmark"
+    maxHeapSize = "1g"
+}
+
 jacoco {
     toolVersion = "0.8.15"
 }

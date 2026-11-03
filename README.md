@@ -152,6 +152,7 @@ docs/DESIGN.md explains the design, the reasons behind it, the failure modes and
 ./gradlew test --tests '*KvSimulationTest.historiesAreLinearizableUnderFaults' \
     -Dkeel.sim.seed=1234 -Dkeel.sim.shrink=true      # shrink a failing seed to its causes
 bench/run.sh local                                  # benchmark three local JVMs
+./gradlew linearizabilityBenchmark                  # time the linearizability checker
 scripts/verify-commits.sh                           # run the gate on every commit
 ```
 

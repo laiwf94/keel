@@ -1,8 +1,13 @@
 package io.github.laiwf94.keel.sim;
 
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertTimeout;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import java.time.Duration;
+import java.util.List;
+import java.util.SplittableRandom;
 import org.junit.jupiter.api.Test;
 
 class LinearizabilityTest {
@@ -135,5 +140,73 @@ class LinearizabilityTest {
     h.write(del(0, 5), true, 5);
     h.write(del(0, 3), false, 0);
     assertTrue(ok());
+  }
+
+  /**
+   * A small history with up to two random corruptions: a version moved, zeroed or taken from
+   * another operation, a read value taken from another write, an outcome flipped, or an answer
+   * lost.
+   */
+  private static List<History.Op> randomHistory(long seed) {
+    SplittableRandom rnd = new SplittableRandom(seed);
+    int n = 3 + rnd.nextInt(40);
+    double openRate = rnd.nextInt(4) * 0.07;
+    List<History.Op> ops =
+        HistoryGenerator.linearizable(
+            seed, new HistoryGenerator.Shape(n, 2 + rnd.nextInt(4), 1 + rnd.nextInt(2), openRate));
+    for (int m = rnd.nextInt(3); m > 0; m--) {
+      History.Op o = ops.get(rnd.nextInt(ops.size()));
+      if (o.ret == History.OPEN) {
+        continue;
+      }
+      switch (rnd.nextInt(6)) {
+        case 0 -> o.version += rnd.nextInt(5) - 2;
+        case 1 -> o.version = ops.get(rnd.nextInt(ops.size())).version;
+        case 2 -> o.version = 0;
+        case 3 -> o.readValue = ops.get(rnd.nextInt(ops.size())).value;
+        case 4 -> o.ok = !o.ok;
+        default -> o.ret = History.OPEN;
+      }
+    }
+    return ops;
+  }
+
+  @Test
+  void agreesWithTheUnoptimizedSearchOnRandomHistories() {
+    int violations = 0;
+    for (long seed = 0; seed < 20_000; seed++) {
+      List<History.Op> ops = randomHistory(seed);
+      boolean expected = LinearizabilityReference.check(ops);
+      long s = seed;
+      assertEquals(
+          expected,
+          Linearizability.check(ops).isEmpty(),
+          () -> "seed " + s + ":\n" + ops.stream().map(History.Op::toString).toList());
+      violations += expected ? 0 : 1;
+    }
+    // Both outcomes are well represented.
+    assertTrue(violations > 4_000 && violations < 12_000, "violations: " + violations);
+  }
+
+  /**
+   * The checker stays fast on histories far longer than the simulator's: a generous bound that the
+   * search it replaced, quadratic in the length of a key's history, does not meet at this size.
+   * LinearizabilityBenchmark has the measured times.
+   */
+  @Test
+  void hundredThousandOperationHistoriesCheckQuickly() {
+    var shape = HistoryGenerator.Shape.simulatorLike(100_000);
+    List<History.Op> good = HistoryGenerator.linearizable(1, shape);
+    assertTimeout(Duration.ofSeconds(3), () -> assertTrue(Linearizability.check(good).isEmpty()));
+
+    List<History.Op> bad =
+        HistoryGenerator.linearizable(2, new HistoryGenerator.Shape(100_000, 4, 3, 0.0005));
+    History.Op stale = HistoryGenerator.staleRead(bad, 2);
+    String violation =
+        assertTimeout(Duration.ofSeconds(3), () -> Linearizability.check(bad).orElseThrow());
+    assertTrue(violation.startsWith("not linearizable on key " + stale.key), violation);
+    // The report shows the neighbourhood of the violation, not the whole key.
+    assertTrue(violation.contains(stale.toString()), violation);
+    assertTrue(violation.lines().count() < 60, violation);
   }
 }
