@@ -58,6 +58,13 @@ class BenchTest {
       KeelClient.Options opts =
           new KeelClient.Options(
               eps, Optional.empty(), Duration.ofSeconds(1), Duration.ofSeconds(5));
+      // The read workloads preload their keys, so the cluster has taken writes before they are
+      // timed. Do the same for the write workload: on a cold JVM a new leader can stall the first
+      // writes for longer than the whole measured window.
+      try (KeelClient warm = new KeelClient(opts)) {
+        warm.openSession();
+        warm.put("bench-warm", new byte[64]);
+      }
       ByteArrayOutputStream buf = new ByteArrayOutputStream();
       PrintStream out = new PrintStream(buf, true, StandardCharsets.UTF_8);
       List<Bench.Result> results =
