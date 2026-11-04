@@ -209,4 +209,38 @@ class LinearizabilityTest {
     assertTrue(violation.contains(stale.toString()), violation);
     assertTrue(violation.lines().count() < 60, violation);
   }
+
+  /**
+   * A long history on many keys takes the parallel path, where keys are numbered in chunks and most
+   * first appear after the operations used to seed the numbering, so the chunks' numbers have to be
+   * mapped. Each key's verdict must still match the unoptimized search.
+   */
+  @Test
+  void longHistoriesOnManyKeysAgreeWithTheUnoptimizedSearch() {
+    for (long seed = 0; seed < 4; seed++) {
+      List<History.Op> ops =
+          HistoryGenerator.linearizable(
+              seed, new HistoryGenerator.Shape(40_000, 8, 2_000, seed % 2 == 0 ? 0.002 : 0));
+      assertTrue(LinearizabilityReference.check(ops));
+      assertTrue(Linearizability.check(ops).isEmpty(), "seed " + seed);
+      History.Op stale = HistoryGenerator.staleRead(ops, seed);
+      assertFalse(LinearizabilityReference.check(ops));
+      String violation = Linearizability.check(ops).orElseThrow();
+      assertTrue(violation.startsWith("not linearizable on key " + stale.key + ":"), violation);
+    }
+  }
+
+  /**
+   * A failing search over a history with one unanswered write in 500 used to run out of the 1 GiB
+   * test heap at 30,000 operations; the search it replaced still does.
+   */
+  @Test
+  void aFailingSearchWithUnansweredWritesFitsTheTestHeap() {
+    List<History.Op> ops =
+        HistoryGenerator.linearizable(30_000, new HistoryGenerator.Shape(30_000, 4, 3, 0.002));
+    History.Op stale = HistoryGenerator.staleRead(ops, 30_000);
+    String violation =
+        assertTimeout(Duration.ofSeconds(30), () -> Linearizability.check(ops).orElseThrow());
+    assertTrue(violation.startsWith("not linearizable on key " + stale.key + ":"), violation);
+  }
 }

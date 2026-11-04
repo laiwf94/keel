@@ -114,6 +114,9 @@ final class LinearizabilityBenchmark {
           }
         } catch (OutOfMemoryError e) {
           out[k] = "out of memory";
+          // Collect what the failed search left before the other checker runs; without this, G1
+          // can still be short of space when it starts and charge the failure to it.
+          System.gc();
           continue;
         }
         if (r >= 0) {
