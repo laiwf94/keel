@@ -6,6 +6,8 @@ import static org.junit.jupiter.api.Assertions.assertTimeout;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.time.Duration;
+import java.util.Arrays;
+import java.util.Comparator;
 import java.util.List;
 import java.util.SplittableRandom;
 import org.junit.jupiter.api.Test;
@@ -242,5 +244,65 @@ class LinearizabilityTest {
     String violation =
         assertTimeout(Duration.ofSeconds(30), () -> Linearizability.check(ops).orElseThrow());
     assertTrue(violation.startsWith("not linearizable on key " + stale.key + ":"), violation);
+  }
+
+  /**
+   * Long histories of a few keys are cut at pins into stretches searched in parallel. Whether they
+   * are linearizable must not change, with or without unanswered writes, which the stretches may
+   * each apply, and whether the stretches line up or the single search has to take over.
+   */
+  @Test
+  void stretchesSearchedInParallelAgreeWithTheUnoptimizedSearch() {
+    for (long seed = 0; seed < 6; seed++) {
+      double openRate = seed % 3 == 0 ? 0 : seed % 3 == 1 ? 0.0005 : 0.002;
+      List<History.Op> ops =
+          HistoryGenerator.linearizable(
+              seed, new HistoryGenerator.Shape(20_000, 3 + (int) (seed % 3), 2, openRate));
+      assertTrue(LinearizabilityReference.check(ops), "seed " + seed);
+      assertTrue(Linearizability.check(ops).isEmpty(), "seed " + seed);
+      // A stale read is not linearizable by construction; the old search cannot fit the failing
+      // searches with unanswered writes in the test heap, so it is not asked.
+      History.Op stale = HistoryGenerator.staleRead(ops, seed);
+      String violation = Linearizability.check(ops).orElseThrow();
+      assertTrue(violation.startsWith("not linearizable on key " + stale.key + ":"), violation);
+      assertTrue(violation.contains(stale.toString()), violation);
+      // The same history checks the same way every time, whichever stretch finishes first.
+      assertEquals(violation, Linearizability.check(ops).orElseThrow());
+    }
+  }
+
+  /**
+   * sortBy is a stable sort, on sorted, nearly sorted and scrambled input, with and without ties.
+   */
+  @Test
+  void sortByIsAStableSort() {
+    SplittableRandom rnd = new SplittableRandom(7);
+    for (int round = 0; round < 500; round++) {
+      int n = round % 10 == 0 ? rnd.nextInt(33) : rnd.nextInt(3_000);
+      long[] key = new long[n];
+      int shape = round % 5;
+      for (int i = 0; i < n; i++) {
+        key[i] =
+            switch (shape) {
+              case 0 -> rnd.nextLong(1L << rnd.nextInt(1, 63)); // any range
+              case 1 -> i * 10L + rnd.nextInt(40); // nearly sorted
+              case 2 -> n - i; // reversed
+              case 3 -> i; // sorted
+              default -> rnd.nextInt(5); // few distinct keys
+            };
+      }
+      Integer[] boxed = new Integer[n];
+      int[] idx = new int[n];
+      for (int i = 0; i < n; i++) {
+        int v = shape == 0 || shape == 4 ? rnd.nextInt(n) : i;
+        boxed[i] = v;
+        idx[i] = v;
+      }
+      Arrays.sort(boxed, Comparator.comparingLong(v -> key[v])); // stable
+      Linearizability.sortBy(idx, key);
+      for (int i = 0; i < n; i++) {
+        assertEquals((int) boxed[i], idx[i], "round " + round + " at " + i);
+      }
+    }
   }
 }

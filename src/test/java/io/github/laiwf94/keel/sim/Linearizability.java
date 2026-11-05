@@ -10,6 +10,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.IntStream;
 import java.util.stream.Stream;
 
@@ -20,7 +21,7 @@ import java.util.stream.Stream;
  * <p>This is the algorithm of Wing and Gong as improved by Lowe ("Testing for linearizability",
  * 2017): a depth-first search over the call/return list that linearizes pending calls one at a time
  * and backtracks when a return is reached before its call was linearized, with a cache of visited
- * configurations. Porcupine and Knossos use the same approach. Four things keep it fast on long
+ * configurations. Porcupine and Knossos use the same approach. Five things keep it fast on long
  * histories:
  *
  * <ul>
@@ -39,12 +40,20 @@ import java.util.stream.Stream;
  *       are dropped, the search stops once every answered operation is placed, unanswered writes
  *       are tried last, and a configuration reached with more of them applied than before is
  *       pruned, so they no longer multiply the work of a failing search.
+ *   <li>Pins: an answered read or applied write that runs alone, called after every operation
+ *       before it returned, leaves one configuration that every linearization goes through. A
+ *       search that fails below a pin it reached with nothing unanswered applied fails everywhere,
+ *       so it stops there instead of backtracking through the whole history, and a long key is cut
+ *       at pins into stretches that are searched in parallel.
  * </ul>
  *
  * <p>The rest is the cost of a step. The operations of a key are copied into arrays in the order
- * the search reads them, the operations it may try at each point are computed once by a sweep, the
- * cache and the stack are arrays, and a set of states is a small sorted array, so that a step is a
- * few array reads and allocates at most the state it produces.
+ * the search reads them, the operations it may try at each point are found once for every return by
+ * looking back a few ranks, the cache and the stack are arrays, and a set of states is a small
+ * sorted array, so that a step is a few array reads and allocates at most the state it produces. A
+ * state's hash is computed only once a search caches it, and unanswered writes are compared by
+ * numbers rather than by their values: for a long history each value is a string somewhere else in
+ * memory, and reading it is usually a cache miss.
  *
  * <p>{@link LinearizabilityReference} keeps the search as it was before, as an oracle.
  *
@@ -59,18 +68,21 @@ import java.util.stream.Stream;
 final class Linearizability {
   private Linearizability() {}
 
-  /** A value and its version. The hash is computed once, since the search hashes states a lot. */
+  /**
+   * A value and its version. The hash is computed on first use and kept, since the search hashes
+   * states a lot once it backtracks, but a search that never does should not pay for it: hashing
+   * the value reads the string, which for a long history is usually a cache miss.
+   */
   static final class State {
     static final State ABSENT = new State(null, 0);
 
     private final String value;
     private final long version;
-    private final int hash;
+    private int hash; // 0 until computed, like String's
 
     State(String value, long version) {
       this.value = value;
       this.version = version;
-      this.hash = Objects.hashCode(value) * 31 + Long.hashCode(version);
     }
 
     String value() {
@@ -92,15 +104,17 @@ final class Linearizability {
 
     @Override
     public boolean equals(Object o) {
-      return o instanceof State s
-          && s.hash == hash
-          && s.version == version
-          && Objects.equals(s.value, value);
+      return o instanceof State s && s.version == version && Objects.equals(s.value, value);
     }
 
     @Override
     public int hashCode() {
-      return hash;
+      int h = hash;
+      if (h == 0) {
+        h = Objects.hashCode(value) * 31 + Long.hashCode(version);
+        hash = h; // a benign race: every thread computes the same value
+      }
+      return h;
     }
 
     @Override
@@ -110,8 +124,10 @@ final class Linearizability {
 
     /** A total order, used to keep a set of states as a sorted array. */
     static int compare(State a, State b) {
-      if (a.hash != b.hash) {
-        return Integer.compare(a.hash, b.hash);
+      int ha = a.hashCode();
+      int hb = b.hashCode();
+      if (ha != hb) {
+        return Integer.compare(ha, hb);
       }
       if (a.version != b.version) {
         return Long.compare(a.version, b.version);
@@ -619,7 +635,7 @@ final class Linearizability {
    * unanswered writes sit in a list of their own, by call, and may be linearized at any point after
    * their call or never. The search succeeds as soon as every answered operation is placed. At each
    * step it tries the answered operations first and the unanswered ones last, and only those that
-   * could help there ({@link #helps}), so it leaves them out unless it needs them. Unanswered
+   * could help there ({@link Walk#helps}), so it leaves them out unless it needs them. Unanswered
    * deletes, and puts whose value no answered read returns, are interchangeable with the others of
    * the same kind and condition; such a class is applied in call order, so only its earliest
    * unapplied member is ever tried.
@@ -633,7 +649,7 @@ final class Linearizability {
    *
    * <p>Finished configurations go into an open-addressing table, with the unanswered operations
    * that were applied when each was reached ({@link Seen}), and a later visit that an earlier one
-   * covers is pruned ({@link #visit}). Without that, k unanswered writes would multiply the
+   * covers is pruned ({@link Walk#visit}). Without that, k unanswered writes would multiply the
    * configurations of a failing search by up to 2^k.
    */
   private static final class Search {
@@ -665,45 +681,27 @@ final class Linearizability {
     private final int[][] members; // of each class, by call
     private final boolean[] alone; // a class of one: a put whose value an answered read returns
     private final boolean[] loose; // unconditional and interchangeable: counts may be relaxed
-    private final int[] appliedOfClass;
+    // What unanswered write o does to the value: equal numbers for the same kind and value, so
+    // that helps() compares numbers instead of strings.
+    private final int[] effectOf;
     private final int classWords; // longs in a bit set of classes
-    private final long[] applied;
-    private long[] appliedNow; // a copy of applied, or null after a change
-    private final Seen root = new Seen(NO_BITS); // where shortages before any move go
-    // Every visit when there are no unanswered operations, which leaves nothing to compare.
-    private final Seen plain = new Seen(NO_BITS);
-    private final Ints failing = new Ints();
-    private final List<State[]> observed = new ArrayList<>(); // after candidate reads, conflicts
-    private final Ints blocked = new Ints();
-
-    // The table of finished configurations, by linear probing. A slot's key is its hash in the
-    // high half and its prefix + 1 in the low half, so 0 marks a free slot.
-    private long[] slotKey = new long[INITIAL];
-    private int[][] slotWindow = new int[INITIAL][];
-    private State[][] slotStates = new State[INITIAL][];
-    private Seen[] slotSeen = new Seen[INITIAL];
-    private int used;
-    private long probed; // the key slot() last looked for
-    // The prefixes of the configurations in the table, so that most visits need not hash.
-    private final long[] finishedAt;
-
-    // The stack: what to restore on backtracking. A frame that linearized an answered operation
-    // holds its rank and its position among the candidates; one that applied an unanswered
-    // operation holds -1 and the index of that operation.
-    private int depth;
-    private final int[] frameRank;
-    private final int[] framePos;
-    private final State[][] frameStates;
-    private final int[] framePrefix;
-    private final int[][] frameWindow;
-    private final Seen[] frameSeen;
-
-    private State[] states = {State.ABSENT};
-    private int prefix;
-    private int[] window = NONE;
-    private int deepest;
+    // pin[p]: every linearization reaches one configuration right after rank p, see pins().
+    private final boolean[] pin;
+    private final int pins;
 
     private static final int INITIAL = 256;
+
+    /** The fewest ranks in a stretch searched on its own; see {@link #search}. */
+    private static final int STRETCH = 2048;
+
+    /**
+     * Steps per operation a stretch other than the first may take before it gives up. A search that
+     * passes takes a few; one that fails can take far more, and when it is not the first to fail,
+     * the single search would never have gone there.
+     */
+    private static final long STEPS = 64;
+
+    private final AtomicInteger stopAt = new AtomicInteger(); // the first stretch that failed
 
     /** The search over the operations {@code mine} of {@code f}, given in input order. */
     Search(Fields f, int[] mine) {
@@ -765,17 +763,35 @@ final class Linearizability {
         call[r] = calls[j];
         ret[r] = rets[j];
       }
-      // The values of unanswered puts that an answered read returned.
-      Set<String> openValues = new HashSet<>();
-      for (History.Op o : openAsCalled) {
-        if (o.kind == History.Kind.PUT) {
-          openValues.add(o.value);
+      // The values of unanswered puts that an answered read returned. A read's value is compared
+      // with theirs only if its hash is one of theirs, found in a sorted array.
+      Ints openPuts = new Ints();
+      for (int o = 0; o < opens; o++) {
+        if (openAsCalled[o].kind == History.Kind.PUT && openAsCalled[o].value != null) {
+          openPuts.add(o);
         }
       }
+      long[] openHashes = new long[openPuts.size]; // hash in the high half, index in the low
+      for (int i = 0; i < openPuts.size; i++) {
+        int o = openPuts.items[i];
+        openHashes[i] = ((long) openAsCalled[o].value.hashCode() << 32) | o;
+      }
+      Arrays.sort(openHashes);
       Set<String> read = new HashSet<>();
-      for (int r = 0; r < n && !openValues.isEmpty(); r++) {
-        if (kindOf(r) == History.Kind.GET && value[r] != null && openValues.contains(value[r])) {
-          read.add(value[r]);
+      for (int r = 0; r < n && openHashes.length > 0; r++) {
+        String v = value[r];
+        if (kind[r] != code(History.Kind.GET) || v == null) {
+          continue;
+        }
+        long h = (long) v.hashCode() << 32;
+        int at = Arrays.binarySearch(openHashes, h);
+        for (int i = at < 0 ? -at - 1 : at;
+            i < openHashes.length && (openHashes[i] & 0xFFFF_FFFF_0000_0000L) == h;
+            i++) {
+          if (v.equals(openAsCalled[(int) openHashes[i]].value)) {
+            read.add(v);
+            break;
+          }
         }
       }
 
@@ -822,69 +838,67 @@ final class Linearizability {
       for (int o = 0; o < opens; o++) {
         members[classOf[o]][sizes[classOf[o]]++] = o;
       }
-      appliedOfClass = new int[firstOfClass.length];
+      effectOf = new int[opens];
+      Map<List<Object>, Integer> effects = new HashMap<>();
+      for (int o = 0; o < opens; o++) {
+        int s = n + o;
+        effectOf[o] =
+            effects.computeIfAbsent(Arrays.asList(kindOf(s), value[s]), k -> effects.size());
+      }
       classWords = (firstOfClass.length + 63) / 64;
-      applied = new long[(opens + 63) / 64];
 
       candStart = new int[n + 1];
       cand = candidates();
-      finishedAt = new long[(n + 64) / 64];
-      int maxDepth = n + opens + 1;
-      frameRank = new int[maxDepth];
-      framePos = new int[maxDepth];
-      frameStates = new State[maxDepth][];
-      framePrefix = new int[maxDepth];
-      frameWindow = new int[maxDepth][];
-      frameSeen = opens == 0 ? null : new Seen[maxDepth]; // every visit is plain without them
+      pin = new boolean[n];
+      pins = pins();
     }
 
     /**
-     * Fills {@link #candStart} and returns {@link #cand}: a sweep over the calls and returns in
-     * time order that keeps the operations running, in call order. An event at the same time as
-     * another keeps the order of the list it replaces: by rank, the call before the return.
+     * Fills {@link #candStart} and returns {@link #cand}. The operations running at the return of
+     * rank p are p and the higher ranks called before it; since returns grow with rank, the ranks p
+     * whose return a rank r is called before are the few just below r, found by looking back from
+     * r. Each list is then put in call order, ties by rank, which is the order of a sweep over the
+     * calls and returns in time.
      */
     private int[] candidates() {
-      int[] byCall = new int[n];
+      int[] first = new int[n]; // the lowest rank whose return rank r is called before
+      int[] count = new int[n + 1];
       for (int r = 0; r < n; r++) {
-        byCall[r] = r;
+        int p = r;
+        while (p > 0 && call[r] < ret[p - 1]) {
+          p--;
+        }
+        first[r] = p;
+        count[p]++; // r is a candidate from p to r
+        count[r + 1]--;
       }
-      sortBy(byCall, call); // slots below n are the answered operations, by rank
-      int[] out = new int[Math.max(16, 2 * n)]; // grows if more than two run at once on average
       int size = 0;
-      int[] running = new int[8];
       int live = 0;
-      int c = 0;
       for (int p = 0; p < n; p++) {
-        long end = ret[p];
-        while (c < n) {
-          int r = byCall[c];
-          long t = call[r];
-          if (t > end || (t == end && r > p)) {
-            break; // the call event comes after this return
-          }
-          if (live == running.length) {
-            running = Arrays.copyOf(running, live * 2);
-          }
-          running[live++] = r;
-          c++;
-        }
+        live += count[p];
         candStart[p] = size;
-        if (size + live > out.length) {
-          out = Arrays.copyOf(out, Math.max(out.length * 2, size + live));
-        }
-        // Copied by hand: there are only as many as there are concurrent clients.
-        int at = -1;
-        for (int i = 0; i < live; i++) {
-          out[size + i] = running[i];
-          at = running[i] == p ? i : at;
-        }
         size += live;
-        for (int i = at + 1; i < live; i++) {
-          running[i - 1] = running[i];
-        }
-        live--;
       }
       candStart[n] = size;
+      int[] out = new int[size];
+      int[] at = Arrays.copyOf(candStart, n);
+      for (int r = 0; r < n; r++) {
+        for (int p = first[r]; p <= r; p++) {
+          out[at[p]++] = r;
+        }
+      }
+      // Into call order, by insertion: there are only as many as there are concurrent clients.
+      for (int p = 0; p < n; p++) {
+        for (int i = candStart[p] + 1; i < candStart[p + 1]; i++) {
+          int v = out[i];
+          int j = i - 1;
+          while (j >= candStart[p] && call[out[j]] > call[v]) {
+            out[j + 1] = out[j];
+            j--;
+          }
+          out[j + 1] = v;
+        }
+      }
       return out;
     }
 
@@ -893,201 +907,8 @@ final class Linearizability {
           from, KINDS[kind[s]], s >= n, ok[s], expected[s], version[s], value[s]);
     }
 
-    boolean run() {
-      int pos = 0; // among the candidates of the current prefix
-      int nextOpen = 0;
-      while (true) {
-        if (prefix == n) {
-          return true;
-        }
-        int at = candStart[prefix] + pos;
-        if (at < candStart[prefix + 1]) {
-          int r = cand[at];
-          if (r != prefix && inWindow(r)) {
-            pos++;
-            continue;
-          }
-          State[] next = stepAll(states, r);
-          if (next.length > 0) {
-            int savedPrefix = prefix;
-            int[] savedWindow = window;
-            place(r);
-            Seen seen = visit(next);
-            if (seen != null) {
-              push(r, pos, savedPrefix, savedWindow, seen);
-              states = next;
-              pos = 0;
-              nextOpen = 0;
-              continue;
-            }
-            prefix = savedPrefix;
-            window = savedWindow;
-          }
-          pos++;
-          continue;
-        }
-        // Every candidate has been tried: unanswered writes called before the return of rank
-        // prefix may go here.
-        long limit = ret[prefix];
-        boolean moved = false;
-        if (nextOpen < opens && call[n + nextOpen] < limit) {
-          needs();
-          if (failing.size == 0 && blocked.size == 0 && observed.isEmpty()) {
-            nextOpen = opens; // helps() would turn every one of them down
-          }
-        }
-        for (; nextOpen < opens && call[n + nextOpen] < limit; nextOpen++) {
-          int o = nextOpen;
-          if (o != head(classOf[o])) {
-            continue; // applied, or a member of its class called earlier is not
-          }
-          State[] next = stepAll(states, n + o);
-          if (next.length == 0 || !helps(n + o, next)) {
-            continue;
-          }
-          flip(o);
-          Seen seen = onStack(next) ? null : visit(next);
-          if (seen != null) {
-            push(-1, o, prefix, window, seen);
-            states = next;
-            moved = true;
-            break;
-          }
-          flip(o);
-        }
-        if (moved) {
-          pos = 0;
-          nextOpen = 0;
-          continue;
-        }
-        if (depth == 0) {
-          return false;
-        }
-        depth--;
-        Seen seen = frameSeen == null ? plain : frameSeen[depth];
-        finish(seen);
-        current().addShortOf(seen);
-        states = frameStates[depth];
-        prefix = framePrefix[depth];
-        window = frameWindow[depth];
-        if (frameRank[depth] >= 0) {
-          pos = framePos[depth] + 1;
-          nextOpen = 0;
-        } else {
-          int o = framePos[depth];
-          flip(o);
-          pos = candStart[prefix + 1] - candStart[prefix];
-          needs();
-          nextOpen = o + 1;
-        }
-      }
-    }
-
-    private void push(int rank, int pos, int savedPrefix, int[] savedWindow, Seen seen) {
-      frameRank[depth] = rank;
-      framePos[depth] = pos;
-      frameStates[depth] = states;
-      framePrefix[depth] = savedPrefix;
-      frameWindow[depth] = savedWindow;
-      if (frameSeen != null) {
-        frameSeen[depth] = seen;
-      }
-      depth++;
-    }
-
     private History.Kind kindOf(int s) {
       return KINDS[kind[s]];
-    }
-
-    private boolean inWindow(int rank) {
-      for (int w : window) {
-        if (w >= rank) {
-          return w == rank;
-        }
-      }
-      return false;
-    }
-
-    /**
-     * Collects what an unanswered write could help with here: the candidates that fit no state, and
-     * the waiting unanswered conditional writes that no state lets match.
-     */
-    private void needs() {
-      failing.size = 0;
-      blocked.size = 0;
-      observed.clear();
-      for (int at = candStart[prefix]; at < candStart[prefix + 1]; at++) {
-        int r = cand[at];
-        if (r != prefix && inWindow(r)) {
-          continue;
-        }
-        State[] after = stepAll(states, r);
-        if (after.length == 0) {
-          failing.add(r);
-        } else if (kindOf(r) == History.Kind.GET || !ok[r]) {
-          observed.add(after);
-        }
-      }
-      long limit = ret[prefix];
-      for (int o = 0; o < opens && call[n + o] < limit; o++) {
-        int s = n + o;
-        if (!isApplied(o) && expected[s] != -1 && !couldMatch(states, expected[s])) {
-          blocked.add(s);
-        }
-      }
-      // A class runs short here if all of it that has been called is applied, yet one more would
-      // be worth trying.
-      for (int c = 0; c < firstOfClass.length; c++) {
-        if (appliedOfClass[c] > 0 && !alone[c]) {
-          int h = head(c);
-          if (h < 0 || call[n + h] >= limit) {
-            int s = n + members[c][0];
-            State[] after = stepAll(states, s);
-            if (after.length > 0 && helps(s, after)) {
-              current().markShortOf(c, classWords);
-            }
-          }
-        }
-      }
-    }
-
-    /**
-     * Whether the unanswered write in slot {@code w}, which leads to {@code after}, is worth trying
-     * here: whether some candidate fits no state now but fits one of {@code after}, or a waiting
-     * conditional write with a different effect could match only after it.
-     *
-     * <p>That is enough. Take a linearization that applies an unanswered write w here, and let b be
-     * the next operation. If b fits the states without w, then either b overwrites the value and w
-     * can be dropped, or b is a conflict or a read that leaves the value alone, and w can move
-     * after b: what b observed did not need w, and a state whose version w left unknown allows
-     * whatever the same state with b's version does. That fails only if w is conditional and b pins
-     * the version to one w does not expect, so that case is tried too. An unanswered conditional
-     * write in between can be moved the same way unless it can only match after w. Repeating this
-     * moves w to a point that passes this test, or out of the linearization.
-     */
-    private boolean helps(int w, State[] after) {
-      if (expected[w] != -1 && couldMatch(states, expected[w])) {
-        // A read or a conflict may pin the version so that w no longer matches after it.
-        for (State[] o : observed) {
-          if (!couldMatch(o, expected[w])) {
-            return true;
-          }
-        }
-      }
-      for (int i = 0; i < failing.size; i++) {
-        if (stepAll(after, failing.items[i]).length > 0) {
-          return true;
-        }
-      }
-      for (int i = 0; i < blocked.size; i++) {
-        int c = blocked.items[i];
-        // If c has the same effect as w, applying c after w changes nothing w did not.
-        boolean same = kind[c] == kind[w] && Objects.equals(value[c], value[w]);
-        if (!same && couldMatch(after, expected[c])) {
-          return true;
-        }
-      }
-      return false;
     }
 
     private static boolean couldMatch(State[] states, long expected) {
@@ -1099,200 +920,649 @@ final class Linearizability {
       return false;
     }
 
-    /** Adds the answered operation of return rank {@code rank} to the linearized set. */
-    private void place(int rank) {
-      if (rank != prefix) {
-        int at = -Arrays.binarySearch(window, rank) - 1;
-        int[] w = new int[window.length + 1];
-        System.arraycopy(window, 0, w, 0, at);
-        w[at] = rank;
-        System.arraycopy(window, at, w, at + 1, window.length - at);
-        window = w;
-        return;
-      }
-      prefix++;
-      int skip = 0;
-      while (skip < window.length && window[skip] == prefix) {
-        prefix++;
-        skip++;
-      }
-      if (skip > 0) {
-        window = skip == window.length ? NONE : Arrays.copyOfRange(window, skip, window.length);
-      }
-      deepest = Math.max(deepest, prefix);
-    }
-
     /**
-     * Whether a configuration still being searched, an ancestor of this one, is the same as ({@link
-     * #prefix}, {@link #window}, {@code next}); if so, it covers this visit. Only moves that apply
-     * unanswered operations keep the prefix and window, so only the frames at the top of the stack
-     * that made such moves can lead from it to here. An ancestor's search has not finished, so
-     * every class counts as short of operations.
+     * The search from one configuration with nothing applied, ({@code from}, no window, {@code
+     * start}), until it places every rank below {@code end}: the whole history, or the stretch
+     * between two pins.
      */
-    private boolean onStack(State[] next) {
-      for (int d = depth - 1; d >= 0; d--) {
-        State[] at = d == depth - 1 ? states : frameStates[d + 1];
-        if (Arrays.equals(at, next)) {
-          current().markAll(classWords);
-          return true;
-        }
-        if (frameRank[d] >= 0) {
-          return false; // this frame's move changed the prefix or window
+    final class Walk {
+      private final int[] appliedOfClass;
+      private final long[] applied;
+      private long[] appliedNow; // a copy of applied, or null after a change
+      private final Seen root = new Seen(NO_BITS); // where shortages before any move go
+      // Every visit when there are no unanswered operations, which leaves nothing to compare.
+      private final Seen plain = new Seen(NO_BITS);
+      private final Ints failing = new Ints();
+      private final List<State[]> observed = new ArrayList<>(); // after candidate reads, conflicts
+      private final Ints blocked = new Ints();
+
+      // The table of finished configurations, by linear probing. A slot's key is its hash in the
+      // high half and its prefix + 1 in the low half, so 0 marks a free slot.
+      private long[] slotKey = new long[INITIAL];
+      private int[][] slotWindow = new int[INITIAL][];
+      private State[][] slotStates = new State[INITIAL][];
+      private Seen[] slotSeen = new Seen[INITIAL];
+      private int used;
+      private long probed; // the key slot() last looked for
+      // The prefixes of the configurations in the table, so that most visits need not hash.
+      private final long[] finishedAt;
+
+      // The stack: what to restore on backtracking. A frame that linearized an answered operation
+      // holds its rank and its position among the candidates; one that applied an unanswered
+      // operation holds -1 and the index of that operation.
+      private int depth;
+      private final int[] frameRank;
+      private final int[] framePos;
+      private final State[][] frameStates;
+      private final int[] framePrefix;
+      private final int[][] frameWindow;
+      private final Seen[] frameSeen;
+
+      private State[] states;
+      private int prefix;
+      private int[] window = NONE;
+      private int deepest;
+      private final int from;
+      private final int end;
+      private int appliedCount; // of the unanswered operations
+      private final int index; // of the stretch
+      private final long budget; // of steps
+      private final int firstOpen; // the unanswered operations before it are left out
+      boolean aborted;
+
+      /**
+       * A search of the stretch {@code index} from ({@code from}, no window, {@code start}) to
+       * {@code end}, giving up after {@code budget} steps, that may apply the unanswered operations
+       * from {@code firstOpen} on. Those before it are left out by marking them applied.
+       */
+      Walk(int index, int from, State start, int end, long budget, int firstOpen) {
+        this.index = index;
+        this.budget = budget;
+        this.from = from;
+        this.end = end;
+        prefix = from;
+        deepest = from;
+        states = new State[] {start};
+        appliedOfClass = new int[firstOfClass.length];
+        applied = new long[(opens + 63) / 64];
+        finishedAt = new long[(end - from + 64) / 64];
+        int maxDepth = end - from + opens + 1;
+        frameRank = new int[maxDepth];
+        framePos = new int[maxDepth];
+        frameStates = new State[maxDepth][];
+        framePrefix = new int[maxDepth];
+        frameWindow = new int[maxDepth][];
+        frameSeen = opens == 0 ? null : new Seen[maxDepth]; // every visit is plain without them
+        this.firstOpen = firstOpen;
+        for (int o = 0; o < firstOpen; o++) {
+          applied[o >>> 6] |= 1L << o;
+          appliedOfClass[classOf[o]]++; // the earliest of each class, so heads stay right
         }
       }
-      return false;
-    }
 
-    private int hash(State[] next) {
-      return (prefix * 31 + Arrays.hashCode(window)) * 31 + Arrays.hashCode(next);
-    }
-
-    /**
-     * The slot of the configuration ({@link #prefix}, {@link #window}, {@code next}), or a free
-     * one.
-     */
-    private int slot(State[] next) {
-      int hash = hash(next);
-      long key = ((long) hash << 32) | (prefix + 1L);
-      probed = key;
-      int mask = slotKey.length - 1;
-      int i = (hash * 0x9E3779B9) >>> Integer.numberOfLeadingZeros(mask);
-      while (true) {
-        long k = slotKey[i];
-        if (k == 0
-            || (k == key
-                && Arrays.equals(slotWindow[i], window)
-                && Arrays.equals(slotStates[i], next))) {
-          return i;
+      /** The unanswered operations this search applied, as a bit set. */
+      long[] ownApplied() {
+        long[] out = applied.clone();
+        for (int o = 0; o < firstOpen; o++) {
+          out[o >>> 6] &= ~(1L << o);
         }
-        i = (i + 1) & mask;
+        return out;
       }
-    }
 
-    /**
-     * Returns a new visit of the configuration ({@link #prefix}, {@link #window}, {@code next})
-     * with the unanswered operations now applied, or null if an earlier visit whose search has
-     * finished covers it.
-     *
-     * <p>An earlier visit covers this one if it had applied no unanswered operation that this one
-     * has not, since those are optional and having more of them left can only allow more. It also
-     * covers this one if it had applied more interchangeable ones of some classes, provided it
-     * never ran short of any of those classes: this search would make the same moves with earlier
-     * operations of the same classes, so the extra ones left could not help. A visit still being
-     * searched is an ancestor, which has applied no more than this one, so it covers this one too;
-     * {@link #onStack} finds it.
-     */
-    private Seen visit(State[] next) {
-      if ((finishedAt[prefix >>> 6] & (1L << prefix)) != 0) {
-        for (Seen e = slotSeen[slot(next)]; e != null; e = e.next) {
-          if (covers(e)) {
-            current().addShortOf(e);
-            return null;
+      /** Whether nothing is applied: after a search that passed, whether it needed nothing. */
+      boolean clean() {
+        return appliedCount == 0;
+      }
+
+      /**
+       * Whether the search passed. False also if it was {@link #aborted}: it ran out of {@link
+       * #budget}, or another stretch made its answer useless.
+       */
+      boolean run() {
+        int pos = 0; // among the candidates of the current prefix
+        int nextOpen = 0;
+        long steps = 0;
+        while (true) {
+          if (prefix >= end) {
+            return true;
           }
-        }
-      }
-      return opens == 0 ? plain : new Seen(appliedNow());
-    }
-
-    /**
-     * Enters the configuration of the frame being popped, ({@link #prefix}, {@link #window}, {@link
-     * #states}), into the table, now that the search below it has finished.
-     */
-    private void finish(Seen seen) {
-      int i = slot(states);
-      if (slotKey[i] != 0) {
-        if (seen != plain) {
-          seen.next = slotSeen[i];
-          slotSeen[i] = seen;
-        }
-        return;
-      }
-      slotKey[i] = probed;
-      finishedAt[prefix >>> 6] |= 1L << prefix;
-      slotWindow[i] = window;
-      slotStates[i] = states;
-      slotSeen[i] = seen;
-      if (++used * 2 > slotKey.length) {
-        grow();
-      }
-    }
-
-    /** Makes the table four times larger, so that a long failing search rehashes little. */
-    private void grow() {
-      long[] keys = slotKey;
-      int[][] windows = slotWindow;
-      State[][] stateSets = slotStates;
-      Seen[] seens = slotSeen;
-      int capacity = keys.length * 4;
-      slotKey = new long[capacity];
-      slotWindow = new int[capacity][];
-      slotStates = new State[capacity][];
-      slotSeen = new Seen[capacity];
-      int mask = capacity - 1;
-      int shift = Integer.numberOfLeadingZeros(mask);
-      for (int j = 0; j < keys.length; j++) {
-        if (keys[j] != 0) {
-          int i = ((int) (keys[j] >>> 32) * 0x9E3779B9) >>> shift;
-          while (slotKey[i] != 0) {
-            i = (i + 1) & mask;
-          }
-          slotKey[i] = keys[j];
-          slotWindow[i] = windows[j];
-          slotStates[i] = stateSets[j];
-          slotSeen[i] = seens[j];
-        }
-      }
-    }
-
-    private boolean covers(Seen e) {
-      for (int i = 0; i < applied.length; i++) {
-        long extra = e.applied[i] & ~applied[i];
-        while (extra != 0) {
-          int o = i * 64 + Long.numberOfTrailingZeros(extra);
-          extra &= extra - 1;
-          int c = classOf[o];
-          if (!loose[c] || e.isShortOf(c)) {
+          if ((++steps & 1023) == 0 && (steps > budget || stopAt.get() < index)) {
+            aborted = true;
             return false;
           }
+          int at = candStart[prefix] + pos;
+          if (at < candStart[prefix + 1]) {
+            int r = cand[at];
+            if (r != prefix && inWindow(r)) {
+              pos++;
+              continue;
+            }
+            State[] next = stepAll(states, r);
+            if (next.length > 0) {
+              int savedPrefix = prefix;
+              int[] savedWindow = window;
+              place(r);
+              Seen seen = visit(next);
+              if (seen != null) {
+                push(r, pos, savedPrefix, savedWindow, seen);
+                states = next;
+                pos = 0;
+                nextOpen = 0;
+                continue;
+              }
+              prefix = savedPrefix;
+              window = savedWindow;
+            }
+            pos++;
+            continue;
+          }
+          // Every candidate has been tried: unanswered writes called before the return of rank
+          // prefix may go here.
+          long limit = ret[prefix];
+          boolean moved = false;
+          if (nextOpen < opens && call[n + nextOpen] < limit) {
+            needs();
+            if (failing.size == 0 && blocked.size == 0 && observed.isEmpty()) {
+              nextOpen = opens; // helps() would turn every one of them down
+            }
+          }
+          for (; nextOpen < opens && call[n + nextOpen] < limit; nextOpen++) {
+            int o = nextOpen;
+            if (o != head(classOf[o])) {
+              continue; // applied, or a member of its class called earlier is not
+            }
+            State[] next = stepAll(states, n + o);
+            if (next.length == 0 || !helps(n + o, next)) {
+              continue;
+            }
+            flip(o);
+            Seen seen = onStack(next) ? null : visit(next);
+            if (seen != null) {
+              push(-1, o, prefix, window, seen);
+              states = next;
+              moved = true;
+              break;
+            }
+            flip(o);
+          }
+          if (moved) {
+            pos = 0;
+            nextOpen = 0;
+            continue;
+          }
+          if (depth == 0) {
+            return false;
+          }
+          depth--;
+          if (frameRank[depth] >= 0 && pin[frameRank[depth]] && appliedCount == 0) {
+            // Every linearization passes the configuration this frame reached, and none of the
+            // others can do better than this one, which had nothing applied (see pins()).
+            return false;
+          }
+          Seen seen = frameSeen == null ? plain : frameSeen[depth];
+          finish(seen);
+          current().addShortOf(seen);
+          states = frameStates[depth];
+          prefix = framePrefix[depth];
+          window = frameWindow[depth];
+          if (frameRank[depth] >= 0) {
+            pos = framePos[depth] + 1;
+            nextOpen = 0;
+          } else {
+            int o = framePos[depth];
+            flip(o);
+            pos = candStart[prefix + 1] - candStart[prefix];
+            needs();
+            nextOpen = o + 1;
+          }
         }
       }
-      return true;
-    }
 
-    /** The visit being searched, where the shortages found now are recorded. */
-    private Seen current() {
-      return depth == 0 || frameSeen == null ? root : frameSeen[depth - 1];
-    }
-
-    /** The unanswered operations applied now, as an array no one changes. */
-    private long[] appliedNow() {
-      if (appliedNow == null) {
-        appliedNow = applied.clone();
+      private void push(int rank, int pos, int savedPrefix, int[] savedWindow, Seen seen) {
+        frameRank[depth] = rank;
+        framePos[depth] = pos;
+        frameStates[depth] = states;
+        framePrefix[depth] = savedPrefix;
+        frameWindow[depth] = savedWindow;
+        if (frameSeen != null) {
+          frameSeen[depth] = seen;
+        }
+        depth++;
       }
-      return appliedNow;
-    }
 
-    /** The first operation of class {@code c} not applied yet, or -1. */
-    private int head(int c) {
-      int k = appliedOfClass[c];
-      return k < members[c].length ? members[c][k] : -1;
-    }
+      private boolean inWindow(int rank) {
+        for (int w : window) {
+          if (w >= rank) {
+            return w == rank;
+          }
+        }
+        return false;
+      }
 
-    private boolean isApplied(int o) {
-      return (applied[o >>> 6] & (1L << o)) != 0;
-    }
+      /**
+       * Collects what an unanswered write could help with here: the candidates that fit no state,
+       * and the waiting unanswered conditional writes that no state lets match.
+       */
+      private void needs() {
+        failing.size = 0;
+        blocked.size = 0;
+        observed.clear();
+        for (int at = candStart[prefix]; at < candStart[prefix + 1]; at++) {
+          int r = cand[at];
+          if (r != prefix && inWindow(r)) {
+            continue;
+          }
+          State[] after = stepAll(states, r);
+          if (after.length == 0) {
+            failing.add(r);
+          } else if (kindOf(r) == History.Kind.GET || !ok[r]) {
+            observed.add(after);
+          }
+        }
+        long limit = ret[prefix];
+        for (int o = 0; o < opens && call[n + o] < limit; o++) {
+          int s = n + o;
+          if (!isApplied(o) && expected[s] != -1 && !couldMatch(states, expected[s])) {
+            blocked.add(s);
+          }
+        }
+        // A class runs short here if all of it that has been called is applied, yet one more would
+        // be worth trying.
+        for (int c = 0; c < firstOfClass.length; c++) {
+          if (appliedOfClass[c] > 0 && !alone[c]) {
+            int h = head(c);
+            if (h < 0 || call[n + h] >= limit) {
+              int s = n + members[c][0];
+              State[] after = stepAll(states, s);
+              if (after.length > 0 && helps(s, after)) {
+                current().markShortOf(c, classWords);
+              }
+            }
+          }
+        }
+      }
 
-    private void flip(int o) {
-      applied[o >>> 6] ^= 1L << o;
-      appliedNow = null;
-      appliedOfClass[classOf[o]] += isApplied(o) ? 1 : -1;
+      /**
+       * Whether the unanswered write in slot {@code w}, which leads to {@code after}, is worth
+       * trying here: whether some candidate fits no state now but fits one of {@code after}, or a
+       * waiting conditional write with a different effect could match only after it.
+       *
+       * <p>That is enough. Take a linearization that applies an unanswered write w here, and let b
+       * be the next operation. If b fits the states without w, then either b overwrites the value
+       * and w can be dropped, or b is a conflict or a read that leaves the value alone, and w can
+       * move after b: what b observed did not need w, and a state whose version w left unknown
+       * allows whatever the same state with b's version does. That fails only if w is conditional
+       * and b pins the version to one w does not expect, so that case is tried too. An unanswered
+       * conditional write in between can be moved the same way unless it can only match after w.
+       * Repeating this moves w to a point that passes this test, or out of the linearization.
+       */
+      private boolean helps(int w, State[] after) {
+        if (expected[w] != -1 && couldMatch(states, expected[w])) {
+          // A read or a conflict may pin the version so that w no longer matches after it.
+          for (State[] o : observed) {
+            if (!couldMatch(o, expected[w])) {
+              return true;
+            }
+          }
+        }
+        for (int i = 0; i < failing.size; i++) {
+          if (stepAll(after, failing.items[i]).length > 0) {
+            return true;
+          }
+        }
+        for (int i = 0; i < blocked.size; i++) {
+          int c = blocked.items[i];
+          // If c has the same effect as w, applying c after w changes nothing w did not.
+          boolean same = effectOf[c - n] == effectOf[w - n];
+          if (!same && couldMatch(after, expected[c])) {
+            return true;
+          }
+        }
+        return false;
+      }
+
+      /** Adds the answered operation of return rank {@code rank} to the linearized set. */
+      private void place(int rank) {
+        if (rank != prefix) {
+          int at = -Arrays.binarySearch(window, rank) - 1;
+          int[] w = new int[window.length + 1];
+          System.arraycopy(window, 0, w, 0, at);
+          w[at] = rank;
+          System.arraycopy(window, at, w, at + 1, window.length - at);
+          window = w;
+          return;
+        }
+        prefix++;
+        int skip = 0;
+        while (skip < window.length && window[skip] == prefix) {
+          prefix++;
+          skip++;
+        }
+        if (skip > 0) {
+          window = skip == window.length ? NONE : Arrays.copyOfRange(window, skip, window.length);
+        }
+        deepest = Math.max(deepest, prefix);
+      }
+
+      /**
+       * Whether a configuration still being searched, an ancestor of this one, is the same as
+       * ({@link #prefix}, {@link #window}, {@code next}); if so, it covers this visit. Only moves
+       * that apply unanswered operations keep the prefix and window, so only the frames at the top
+       * of the stack that made such moves can lead from it to here. An ancestor's search has not
+       * finished, so every class counts as short of operations.
+       */
+      private boolean onStack(State[] next) {
+        for (int d = depth - 1; d >= 0; d--) {
+          State[] at = d == depth - 1 ? states : frameStates[d + 1];
+          if (Arrays.equals(at, next)) {
+            current().markAll(classWords);
+            return true;
+          }
+          if (frameRank[d] >= 0) {
+            return false; // this frame's move changed the prefix or window
+          }
+        }
+        return false;
+      }
+
+      private int hash(State[] next) {
+        return (prefix * 31 + Arrays.hashCode(window)) * 31 + Arrays.hashCode(next);
+      }
+
+      /**
+       * The slot of the configuration ({@link #prefix}, {@link #window}, {@code next}), or a free
+       * one.
+       */
+      private int slot(State[] next) {
+        int hash = hash(next);
+        long key = ((long) hash << 32) | (prefix + 1L);
+        probed = key;
+        int mask = slotKey.length - 1;
+        int i = (hash * 0x9E3779B9) >>> Integer.numberOfLeadingZeros(mask);
+        while (true) {
+          long k = slotKey[i];
+          if (k == 0
+              || (k == key
+                  && Arrays.equals(slotWindow[i], window)
+                  && Arrays.equals(slotStates[i], next))) {
+            return i;
+          }
+          i = (i + 1) & mask;
+        }
+      }
+
+      /**
+       * Returns a new visit of the configuration ({@link #prefix}, {@link #window}, {@code next})
+       * with the unanswered operations now applied, or null if an earlier visit whose search has
+       * finished covers it.
+       *
+       * <p>An earlier visit covers this one if it had applied no unanswered operation that this one
+       * has not, since those are optional and having more of them left can only allow more. It also
+       * covers this one if it had applied more interchangeable ones of some classes, provided it
+       * never ran short of any of those classes: this search would make the same moves with earlier
+       * operations of the same classes, so the extra ones left could not help. A visit still being
+       * searched is an ancestor, which has applied no more than this one, so it covers this one
+       * too; {@link #onStack} finds it.
+       */
+      private Seen visit(State[] next) {
+        if ((finishedAt[(prefix - from) >>> 6] & (1L << (prefix - from))) != 0) {
+          for (Seen e = slotSeen[slot(next)]; e != null; e = e.next) {
+            if (covers(e)) {
+              current().addShortOf(e);
+              return null;
+            }
+          }
+        }
+        return opens == 0 ? plain : new Seen(appliedNow());
+      }
+
+      /**
+       * Enters the configuration of the frame being popped, ({@link #prefix}, {@link #window},
+       * {@link #states}), into the table, now that the search below it has finished.
+       */
+      private void finish(Seen seen) {
+        int i = slot(states);
+        if (slotKey[i] != 0) {
+          if (seen != plain) {
+            seen.next = slotSeen[i];
+            slotSeen[i] = seen;
+          }
+          return;
+        }
+        slotKey[i] = probed;
+        finishedAt[(prefix - from) >>> 6] |= 1L << (prefix - from);
+        slotWindow[i] = window;
+        slotStates[i] = states;
+        slotSeen[i] = seen;
+        if (++used * 2 > slotKey.length) {
+          grow();
+        }
+      }
+
+      /** Makes the table four times larger, so that a long failing search rehashes little. */
+      private void grow() {
+        long[] keys = slotKey;
+        int[][] windows = slotWindow;
+        State[][] stateSets = slotStates;
+        Seen[] seens = slotSeen;
+        int capacity = keys.length * 4;
+        slotKey = new long[capacity];
+        slotWindow = new int[capacity][];
+        slotStates = new State[capacity][];
+        slotSeen = new Seen[capacity];
+        int mask = capacity - 1;
+        int shift = Integer.numberOfLeadingZeros(mask);
+        for (int j = 0; j < keys.length; j++) {
+          if (keys[j] != 0) {
+            int i = ((int) (keys[j] >>> 32) * 0x9E3779B9) >>> shift;
+            while (slotKey[i] != 0) {
+              i = (i + 1) & mask;
+            }
+            slotKey[i] = keys[j];
+            slotWindow[i] = windows[j];
+            slotStates[i] = stateSets[j];
+            slotSeen[i] = seens[j];
+          }
+        }
+      }
+
+      private boolean covers(Seen e) {
+        for (int i = 0; i < applied.length; i++) {
+          long extra = e.applied[i] & ~applied[i];
+          while (extra != 0) {
+            int o = i * 64 + Long.numberOfTrailingZeros(extra);
+            extra &= extra - 1;
+            int c = classOf[o];
+            if (!loose[c] || e.isShortOf(c)) {
+              return false;
+            }
+          }
+        }
+        return true;
+      }
+
+      /** The visit being searched, where the shortages found now are recorded. */
+      private Seen current() {
+        return depth == 0 || frameSeen == null ? root : frameSeen[depth - 1];
+      }
+
+      /** The unanswered operations applied now, as an array no one changes. */
+      private long[] appliedNow() {
+        if (appliedNow == null) {
+          appliedNow = applied.clone();
+        }
+        return appliedNow;
+      }
+
+      /** The first operation of class {@code c} not applied yet, or -1. */
+      private int head(int c) {
+        int k = appliedOfClass[c];
+        return k < members[c].length ? members[c][k] : -1;
+      }
+
+      private boolean isApplied(int o) {
+        return (applied[o >>> 6] & (1L << o)) != 0;
+      }
+
+      private void flip(int o) {
+        applied[o >>> 6] ^= 1L << o;
+        appliedNow = null;
+        int d = isApplied(o) ? 1 : -1;
+        appliedOfClass[classOf[o]] += d;
+        appliedCount += d;
+      }
     }
 
     /** Empty if linearizable, else what the search could not get past. */
     Optional<String> verdict(String key) {
-      if (run()) {
-        return Optional.empty();
+      int stuck = search();
+      return stuck < 0 ? Optional.empty() : Optional.of(report(key, stuck));
+    }
+
+    /**
+     * Returns -1 if the history is linearizable, else the deepest prefix the search reached.
+     *
+     * <p>A long history with pins is cut at some of them into stretches that are searched in
+     * parallel, each from the configuration its pin leads to with nothing applied (see pins()).
+     * Each stretch first leaves out the unanswered operations called before its pin returned, so no
+     * two stretches can apply the same one; only if that fails is it searched again with all of
+     * them.
+     *
+     * <ul>
+     *   <li>If every stretch passes and no two applied the same unanswered operation, their
+     *       linearizations join into one: each starts from the state the one before it ends in, and
+     *       every unanswered operation it applies is still unapplied there.
+     *   <li>If a stretch fails with every unanswered operation available, and the ones before it
+     *       passed with nothing applied, those are the pieces of the single search, which reaches
+     *       the failing stretch the same way, so it is not linearizable and the deepest prefix is
+     *       the same.
+     *   <li>Otherwise the single search is run instead. A stretch that fails from nothing applied
+     *       fails from anything more, so the answer would still be no, but the single search may
+     *       get stuck earlier, and its report is the one to give.
+     * </ul>
+     */
+    private int search() {
+      int[] bounds = stretches();
+      int k = bounds.length - 1;
+      if (k > 1) {
+        Walk[] walks = new Walk[k];
+        boolean[] passed = new boolean[k];
+        boolean[] restricted = new boolean[k]; // passed without the earlier unanswered operations
+        stopAt.set(Integer.MAX_VALUE);
+        IntStream.range(0, k)
+            .parallel()
+            .forEach(
+                i -> {
+                  State start = i == 0 ? State.ABSENT : afterPin(bounds[i] - 1);
+                  // The first stretch is the start of the single search, so its work is never
+                  // wasted; the others give up if their search grows far beyond a pass.
+                  long budget =
+                      i == 0 ? Long.MAX_VALUE : STEPS * (bounds[i + 1] - bounds[i] + opens);
+                  int fresh = i == 0 ? 0 : firstCalledAfter(ret[bounds[i] - 1]);
+                  Walk w = new Walk(i, bounds[i], start, bounds[i + 1], budget, fresh);
+                  boolean pass = w.run();
+                  restricted[i] = pass && fresh > 0;
+                  if (!pass && fresh > 0 && !w.aborted) {
+                    w = new Walk(i, bounds[i], start, bounds[i + 1], budget, 0);
+                    pass = w.run();
+                  }
+                  walks[i] = w;
+                  passed[i] = pass;
+                  if (!pass) {
+                    stopAt.accumulateAndGet(i, Math::min); // the stretches after it are moot
+                  }
+                });
+        long[] used = new long[(opens + 63) / 64];
+        boolean clean = true;
+        boolean joins = true;
+        for (int i = 0; i < k && joins; i++) {
+          if (!passed[i]) {
+            if (clean && !walks[i].aborted) {
+              return walks[i].deepest;
+            }
+            joins = false;
+            break;
+          }
+          long[] mine = walks[i].ownApplied();
+          for (int j = 0; j < used.length; j++) {
+            joins &= restricted[i] || (used[j] & mine[j]) == 0;
+            used[j] |= mine[j];
+          }
+          clean &= walks[i].clean();
+        }
+        if (joins) {
+          return -1;
+        }
       }
+      Walk w = new Walk(0, 0, State.ABSENT, n, Long.MAX_VALUE, 0);
+      return w.run() ? -1 : w.deepest;
+    }
+
+    /** The one state a pin leaves. */
+    private State afterPin(int p) {
+      return kindOf(p) == History.Kind.DELETE ? State.ABSENT : new State(value[p], version[p]);
+    }
+
+    /** The first unanswered operation called after {@code t}, or {@link #opens} if none is. */
+    private int firstCalledAfter(long t) {
+      int lo = 0;
+      int hi = opens;
+      while (lo < hi) {
+        int mid = (lo + hi) >>> 1;
+        if (call[n + mid] > t) {
+          hi = mid;
+        } else {
+          lo = mid + 1;
+        }
+      }
+      return lo;
+    }
+
+    /**
+     * Where the stretches searched in parallel begin, then {@link #n}: rank 0 and the rank after
+     * each chosen pin, at least {@link #STRETCH} ranks apart. One stretch unless the history is
+     * long enough to be worth splitting.
+     */
+    private int[] stretches() {
+      if (!fields.parallel || n < 2 * STRETCH || pins == 0) {
+        return new int[] {0, n};
+      }
+      Ints bounds = new Ints();
+      bounds.add(0);
+      for (int p = 0; p < n - STRETCH; p++) {
+        if (pin[p] && p + 1 - bounds.items[bounds.size - 1] >= STRETCH) {
+          bounds.add(p + 1);
+        }
+      }
+      bounds.add(n);
+      return Arrays.copyOf(bounds.items, bounds.size);
+    }
+
+    /**
+     * Marks the pins and returns how many there are. Rank p is a pin if it is called after every
+     * lower rank returned and no other answered operation is called before it returns, and if it
+     * leaves one state whatever it is applied to: a read, or a write that applied. Then every
+     * linearization places it on its own, at prefix p with an empty window, and goes on from the
+     * same configuration, (p + 1, no window, that state), with some set of unanswered operations
+     * applied. A visit with none applied covers every other: each operation the others have left it
+     * has left too. So once the search below a pin it reached with nothing applied is over without
+     * success, the history is not linearizable, and the search stops instead of trying every
+     * alternative below the pin, which could only lead back to it.
+     */
+    private int pins() {
+      int count = 0;
+      for (int p = 0; p < n; p++) {
+        boolean lone = candStart[p + 1] - candStart[p] == 1 && (p == 0 || call[p] > ret[p - 1]);
+        History.Kind k = kindOf(p);
+        if (lone && (k == History.Kind.GET || ok[p])) {
+          pin[p] = true;
+          count++;
+        }
+      }
+      return count;
+    }
+
+    private String report(String key, int deepest) {
       History.Op[] answered = new History.Op[n];
       for (int r = 0; r < n; r++) {
         answered[r] = fields.ops[answeredAt[r]];
@@ -1313,7 +1583,7 @@ final class Linearizability {
           .filter(o -> o.call <= stuck.ret && (o.ret >= since || o.ret == History.OPEN))
           .sorted(Comparator.comparingLong(o -> o.call))
           .forEach(o -> sb.append("\n  ").append(o));
-      return Optional.of(sb.toString());
+      return sb.toString();
     }
   }
 }
