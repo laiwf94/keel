@@ -1,6 +1,8 @@
 package io.github.laiwf94.keel.sim;
 
 import io.github.laiwf94.keel.kv.KvMachine;
+import java.lang.management.CompilationMXBean;
+import java.lang.management.ManagementFactory;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
@@ -13,9 +15,17 @@ import java.util.function.Supplier;
  * it with {@code ./gradlew linearizabilityBenchmark}, or with {@code --args=--simulator} for only
  * the simulator's histories; it prints a Markdown table. Each case is run after a warm-up and the
  * median of several runs is reported. The test JVM's 1 GiB heap applies.
+ *
+ * <p>The warm-up lasts until a round of both checkers passes without the JIT compiler spending any
+ * time, at least {@link #MIN_WARMUP} rounds and at most {@link #MAX_WARMUP}. A fixed three rounds
+ * was not enough: on the first long histories the compiler was still at work for several of the
+ * timed runs, and the new checker's median at 100,000 operations was mostly compilation.
  */
 final class LinearizabilityBenchmark {
   private LinearizabilityBenchmark() {}
+
+  private static final int MIN_WARMUP = 3;
+  private static final int MAX_WARMUP = 20;
 
   private static boolean fast(List<History.Op> ops) {
     return Linearizability.check(ops).isEmpty();
@@ -92,15 +102,20 @@ final class LinearizabilityBenchmark {
 
   /**
    * Median wall time per history for the reference and the new checker, or why one could not
-   * finish. The two take turns, after three warm-up rounds, so that both see the same JIT and
-   * garbage collector state.
+   * finish. The two take turns, after the warm-up, so that both see the same JIT and garbage
+   * collector state.
    */
   private static String[] time(Case c, List<List<History.Op>> hs) {
     List<Predicate<List<History.Op>>> checkers =
         List.of(LinearizabilityReference::check, LinearizabilityBenchmark::fast);
+    CompilationMXBean jit = ManagementFactory.getCompilationMXBean();
     long[][] runs = new long[2][c.runs()];
     String[] out = new String[2];
-    for (int r = -3; r < c.runs(); r++) {
+    boolean warming = true;
+    int warmups = 0;
+    int r = 0;
+    while (r < c.runs()) {
+      long compiling = jit.getTotalCompilationTime();
       for (int k = 0; k < 2; k++) {
         if (out[k] != null) {
           continue;
@@ -110,9 +125,16 @@ final class LinearizabilityBenchmark {
           out[k] = "out of memory";
           continue;
         }
-        if (r >= 0) {
+        if (!warming) {
           runs[k][r] = (System.nanoTime() - start) / hs.size();
         }
+      }
+      if (warming) {
+        warmups++;
+        boolean settled = jit.getTotalCompilationTime() == compiling;
+        warming = !(warmups >= MIN_WARMUP && settled) && warmups < MAX_WARMUP;
+      } else {
+        r++;
       }
     }
     for (int k = 0; k < 2; k++) {

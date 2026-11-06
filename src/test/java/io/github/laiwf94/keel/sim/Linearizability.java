@@ -53,7 +53,8 @@ import java.util.stream.Stream;
  * sorted array, so that a step is a few array reads and allocates at most the state it produces. A
  * state's hash is computed only once a search caches it, and unanswered writes are compared by
  * numbers rather than by their values: for a long history each value is a string somewhere else in
- * memory, and reading it is usually a cache miss.
+ * memory, and reading it is usually a cache miss. For the same reason a report of a violation reads
+ * only the operations it shows.
  *
  * <p>{@link LinearizabilityReference} keeps the search as it was before, as an oracle.
  *
@@ -1498,6 +1499,21 @@ final class Linearizability {
       return w.run() ? -1 : w.deepest;
     }
 
+    /** The lowest rank that returns after {@code t}, or {@link #n} if none does. */
+    private int firstReturnAfter(long t) {
+      int lo = 0;
+      int hi = n;
+      while (lo < hi) {
+        int mid = (lo + hi) >>> 1;
+        if (ret[mid] > t) {
+          hi = mid;
+        } else {
+          lo = mid + 1;
+        }
+      }
+      return lo;
+    }
+
     /** The one state a pin leaves. */
     private State afterPin(int p) {
       return kindOf(p) == History.Kind.DELETE ? State.ABSENT : new State(value[p], version[p]);
@@ -1562,27 +1578,54 @@ final class Linearizability {
       return count;
     }
 
+    /**
+     * Describes where the search got stuck: the operation of rank {@code deepest} and the
+     * operations around it. Only the ranks that can appear are read, since on a long history each
+     * is an object somewhere else in memory: those that return after the stuck one is called, which
+     * are the ranks from a point found by binary search up to it, and the ranks running at its
+     * return.
+     */
     private String report(String key, int deepest) {
-      History.Op[] answered = new History.Op[n];
-      for (int r = 0; r < n; r++) {
-        answered[r] = fields.ops[answeredAt[r]];
-      }
-      History.Op stuck = answered[deepest];
+      History.Op stuck = fields.ops[answeredAt[deepest]];
       StringBuilder sb =
           new StringBuilder("not linearizable on key ")
               .append(key)
               .append(": no order of the operations explains ")
               .append(stuck)
               .append("\nthe operations up to it, with those running at the same time:");
-      long from = answered[Math.max(0, deepest - 8)].call;
-      for (History.Op o : answered) {
-        from = o.ret > stuck.call ? Math.min(from, o.call) : from;
+      // The higher ranks called before the stuck one returns are its candidates. Any other higher
+      // rank is called after that return, so it is not shown, and its call is later than the
+      // return of rank deepest - 8, which bounds the earliest call shown from below.
+      Ints later = new Ints();
+      for (int at = candStart[deepest]; at < candStart[deepest + 1]; at++) {
+        if (cand[at] > deepest) {
+          later.add(cand[at]);
+        }
       }
-      long since = from;
-      Stream.concat(Arrays.stream(answered), Arrays.stream(openAsCalled))
-          .filter(o -> o.call <= stuck.ret && (o.ret >= since || o.ret == History.OPEN))
-          .sorted(Comparator.comparingLong(o -> o.call))
-          .forEach(o -> sb.append("\n  ").append(o));
+      Arrays.sort(later.items, 0, later.size); // rank order, as before the sort by call below
+      long from = call[Math.max(0, deepest - 8)];
+      for (int r = firstReturnAfter(call[deepest]); r <= deepest; r++) {
+        from = Math.min(from, call[r]);
+      }
+      for (int i = 0; i < later.size; i++) {
+        from = Math.min(from, call[later.items[i]]);
+      }
+      List<History.Op> shown = new ArrayList<>();
+      for (int r = firstReturnAfter(from - 1); r <= deepest; r++) {
+        shown.add(fields.ops[answeredAt[r]]);
+      }
+      for (int i = 0; i < later.size; i++) {
+        shown.add(fields.ops[answeredAt[later.items[i]]]);
+      }
+      for (History.Op o : openAsCalled) {
+        if (o.call <= stuck.ret) {
+          shown.add(o);
+        }
+      }
+      shown.sort(Comparator.comparingLong(o -> o.call)); // stable: ties stay in that order
+      for (History.Op o : shown) {
+        sb.append("\n  ").append(o);
+      }
       return sb.toString();
     }
   }

@@ -9,6 +9,7 @@ import java.time.Duration;
 import java.util.Arrays;
 import java.util.Comparator;
 import java.util.List;
+import java.util.Optional;
 import java.util.SplittableRandom;
 import org.junit.jupiter.api.Test;
 
@@ -142,6 +143,34 @@ class LinearizabilityTest {
     h.write(del(0, 5), true, 5);
     h.write(del(0, 3), false, 0);
     assertTrue(ok());
+  }
+
+  /**
+   * An operation that runs across many returns, as a slow one can while other clients keep going,
+   * is a candidate at every one of them. The answer must be the unoptimized search's, and a
+   * violation must be reported where it is, with the slow operation among those shown.
+   */
+  @Test
+  void anOperationRunningAcrossManyReturnsChecksTheSameWay() {
+    for (int writes : new int[] {10, 62, 63, 64, 200}) {
+      for (boolean stale : new boolean[] {false, true}) {
+        History hist = new History();
+        History.Op slow = hist.call(0, History.Kind.GET, "k", null, -1); // sees the empty key
+        for (int i = 0; i < writes; i++) {
+          hist.write(hist.call(1 + i % 3, History.Kind.PUT, "k", "v" + i, -1), true, 2L * i + 2);
+        }
+        History.Op last = hist.call(4, History.Kind.GET, "k", null, -1);
+        // A read of the first value, long overwritten, is stale.
+        hist.read(last, stale ? "v0" : "v" + (writes - 1), stale ? 2 : 2L * writes);
+        hist.read(slow, null, 0);
+        String what = writes + " writes" + (stale ? ", stale" : "");
+        Optional<String> violation = Linearizability.check(hist.ops);
+        assertEquals(LinearizabilityReference.check(hist.ops), violation.isEmpty(), what);
+        assertEquals(!stale, violation.isEmpty(), what);
+        violation.ifPresent(v -> assertTrue(v.contains(last.toString()), what + ": " + v));
+        violation.ifPresent(v -> assertTrue(v.contains(slow.toString()), what + ": " + v));
+      }
+    }
   }
 
   /**
