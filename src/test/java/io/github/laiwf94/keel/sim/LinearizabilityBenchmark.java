@@ -106,17 +106,8 @@ final class LinearizabilityBenchmark {
           continue;
         }
         long start = System.nanoTime();
-        try {
-          for (List<History.Op> h : hs) {
-            if (checkers.get(k).test(h) != c.linearizable()) {
-              throw new AssertionError(c.name() + ": wrong answer");
-            }
-          }
-        } catch (OutOfMemoryError e) {
+        if (!finishes(checkers.get(k), c, hs)) {
           out[k] = "out of memory";
-          // Collect what the failed search left before the other checker runs; without this, G1
-          // can still be short of space when it starts and charge the failure to it.
-          System.gc();
           continue;
         }
         if (r >= 0) {
@@ -132,5 +123,32 @@ final class LinearizabilityBenchmark {
       }
     }
     return out;
+  }
+
+  /**
+   * Runs {@code checker} on every history and checks its answers; false if it ran out of memory.
+   *
+   * <p>The error is caught here, in a method that holds no objects of its own while the checker
+   * runs, and the heap is collected before it returns (#80). A compiled frame that reaches a path
+   * it never took while it was compiled, such as a handler, or a branch on an answer it had never
+   * seen, deoptimizes, which re-allocates the objects the compiler had eliminated, such as a
+   * for-each loop's iterator. Right after the failure the heap is still full of what the failed
+   * search left, and that allocation throws a second OutOfMemoryError, out of the benchmark. The
+   * collection also keeps G1 from still being short of space when the other checker starts, which
+   * would charge the failure to it.
+   */
+  private static boolean finishes(
+      Predicate<List<History.Op>> checker, Case c, List<List<History.Op>> hs) {
+    try {
+      for (int i = 0; i < hs.size(); i++) {
+        if (checker.test(hs.get(i)) != c.linearizable()) {
+          throw new AssertionError(c.name() + ": wrong answer");
+        }
+      }
+      return true;
+    } catch (OutOfMemoryError e) {
+      System.gc();
+      return false;
+    }
   }
 }
