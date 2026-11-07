@@ -301,6 +301,82 @@ class LinearizabilityTest {
   }
 
   /**
+   * The forward pass makes a walk's first moves and hands over to a walk where it gets stuck, then
+   * takes over again past a pin; a walk that handed back with unanswered writes applied and then
+   * fails sends the search back to the last pin passed without any. Whatever the path, the answer
+   * and the report must be those of walks alone: on small random histories, which take every path,
+   * and on long ones of a few keys, searched in stretches, with and without unanswered writes.
+   */
+  @Test
+  void theForwardPassGivesTheAnswersAndReportsOfWalksAlone() {
+    int violations = 0;
+    for (long seed = 0; seed < 10_000; seed++) {
+      List<History.Op> ops = randomHistory(seed);
+      Optional<String> walks = Linearizability.check(ops, false);
+      assertEquals(walks, Linearizability.check(ops, true), "seed " + seed);
+      violations += walks.isPresent() ? 1 : 0;
+    }
+    assertTrue(violations > 2_000, "violations: " + violations);
+    for (long seed = 0; seed < 6; seed++) {
+      double openRate = seed % 3 == 0 ? 0 : seed % 3 == 1 ? 0.0005 : 0.002;
+      List<History.Op> ops =
+          HistoryGenerator.linearizable(
+              seed, new HistoryGenerator.Shape(20_000, 3 + (int) (seed % 3), 2, openRate));
+      assertEquals(Optional.empty(), Linearizability.check(ops, true), "seed " + seed);
+      assertEquals(Optional.empty(), Linearizability.check(ops, false), "seed " + seed);
+      HistoryGenerator.staleRead(ops, seed);
+      assertEquals(
+          Linearizability.check(ops, false), Linearizability.check(ops, true), "seed " + seed);
+    }
+  }
+
+  /**
+   * The candidate lists are, for each return, the operations running at it in call order, ties by
+   * rank, as a direct look at every pair finds them: with a few clients, with many, and with some
+   * operations running across hundreds of returns, which the lists reach by a slower path.
+   */
+  @Test
+  void candidateListsAreTheOperationsRunningAtEachReturn() {
+    SplittableRandom rnd = new SplittableRandom(11);
+    for (int round = 0; round < 300; round++) {
+      int n = 1 + rnd.nextInt(round % 10 == 0 ? 8 : 600);
+      int clients = 1 + rnd.nextInt(round % 3 == 0 ? 40 : 6);
+      // Each client runs one operation at a time; a few run for a long time.
+      long[][] spans = new long[n][];
+      long[] free = new long[clients];
+      for (int i = 0; i < n; i++) {
+        int c = rnd.nextInt(clients);
+        long call = free[c] + rnd.nextInt(5);
+        long length = 1L + (rnd.nextInt(50) == 0 ? rnd.nextInt(2_000) : rnd.nextInt(20));
+        spans[i] = new long[] {call, call + length};
+        free[c] = call + length + 1;
+      }
+      Arrays.sort(spans, Comparator.comparingLong((long[] x) -> x[1]));
+      long[] call = new long[n];
+      long[] ret = new long[n];
+      for (int r = 0; r < n; r++) {
+        call[r] = spans[r][0];
+        ret[r] = spans[r][1];
+      }
+      int[] candStart = new int[n + 1];
+      int[] cand = Linearizability.candidates(call, ret, n, candStart);
+      for (int p = 0; p < n; p++) {
+        Integer[] expected = new Integer[n - p];
+        int size = 0;
+        for (int r = p; r < n; r++) {
+          if (r == p || call[r] < ret[p]) {
+            expected[size++] = r;
+          }
+        }
+        Arrays.sort(expected, 0, size, Comparator.comparingLong(r -> call[r])); // stable
+        int[] got = Arrays.copyOfRange(cand, candStart[p], candStart[p + 1]);
+        int[] want = Arrays.stream(expected, 0, size).mapToInt(Integer::intValue).toArray();
+        assertEquals(Arrays.toString(want), Arrays.toString(got), "round " + round + " at " + p);
+      }
+    }
+  }
+
+  /**
    * sortBy is a stable sort, on sorted, nearly sorted and scrambled input, with and without ties.
    */
   @Test
