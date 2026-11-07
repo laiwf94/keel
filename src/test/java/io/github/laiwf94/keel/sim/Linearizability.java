@@ -273,7 +273,7 @@ final class Linearizability {
    * of a long history are checked in parallel, since each is a partition of its own.
    */
   static Optional<String> check(List<History.Op> ops) {
-    Fields f = new Fields(ops.toArray(new History.Op[0]));
+    Fields f = new Fields(ops.toArray());
     int keys = f.names.size();
     int[] start = new int[keys + 1];
     for (int[] chunk : f.keyOf) {
@@ -297,18 +297,20 @@ final class Linearizability {
       order[k] = k;
     }
     Arrays.sort(order, Comparator.comparing(f.names::get));
+    // The searches are all set up before any runs, so that the arrays of every operation's fields
+    // are garbage while they run, and a collection then has less to copy.
+    Search[] searches = new Search[keys];
+    IntStream byKey = IntStream.range(0, keys);
+    (f.parallel && keys > 1 ? byKey.parallel() : byKey)
+        .forEach(
+            k -> searches[k] = new Search(f, Arrays.copyOfRange(members, start[k], start[k + 1])));
+    List<String> names = f.names; // not f, which is no longer needed
     // An array splits evenly between threads; a TreeMap of a few keys may not split at all.
     Stream<Integer> stream = Arrays.stream(order);
-    if (f.parallel && keys > 1) {
+    if (keys > 1 && searches[0].parallel) {
       stream = stream.parallel();
     }
-    return stream
-        .map(
-            k ->
-                new Search(f, Arrays.copyOfRange(members, start[k], start[k + 1]))
-                    .verdict(f.names.get(k)))
-        .toList()
-        .stream()
+    return stream.map(k -> searches[k].verdict(names.get(k))).toList().stream()
         .flatMap(Optional::stream)
         .findFirst();
   }
@@ -326,7 +328,7 @@ final class Linearizability {
     static final int BITS = 13;
     static final int MASK = (1 << BITS) - 1;
 
-    final History.Op[] ops;
+    final Object[] ops; // History.Op, as ArrayList.toArray copies them without a check of each
     final byte[][] kind; // codes, see KINDS
     final boolean[][] ok;
     final long[][] expected;
@@ -338,7 +340,7 @@ final class Linearizability {
     final List<String> names;
     final boolean parallel;
 
-    Fields(History.Op[] ops) {
+    Fields(Object[] ops) {
       this.ops = ops;
       int n = ops.length;
       int chunks = (n + MASK) >>> BITS;
@@ -353,7 +355,7 @@ final class Linearizability {
       parallel = n >= PARALLEL_FROM;
       Keys seed = new Keys();
       for (int i = 0; i < Math.min(n, 256); i++) {
-        seed.id(ops[i].key);
+        seed.id(((History.Op) ops[i]).key);
       }
       Keys[] local = new Keys[chunks];
       IntStream range = IntStream.range(0, chunks);
@@ -392,7 +394,7 @@ final class Linearizability {
       ret[c] = rets;
       keyOf[c] = ids;
       for (int j = 0; j < size; j++) {
-        History.Op op = ops[from + j];
+        History.Op op = (History.Op) ops[from + j];
         kinds[j] = code(op.kind);
         oks[j] = op.ok;
         expects[j] = op.expected;
@@ -655,7 +657,8 @@ final class Linearizability {
    */
   private static final class Search {
     private final int n; // answered operations
-    private final Fields fields; // for the report
+    private final Object[] ops; // every operation of the history, for the report
+    private final boolean parallel; // whether the history is long enough to split
     private final int[] answeredAt; // the input position of each answered operation, by rank
     private final History.Op[] openAsCalled; // by call, for the report
 
@@ -691,6 +694,9 @@ final class Linearizability {
     private final int pins;
 
     private static final int INITIAL = 256;
+
+    /** The frames a search's stack starts with. */
+    private static final int FRAMES = 256;
 
     /** The fewest ranks in a stretch searched on its own; see {@link #search}. */
     private static final int STRETCH = 2048;
@@ -739,7 +745,7 @@ final class Linearizability {
       opens = byCall.length;
       openAsCalled = new History.Op[opens];
       for (int o = 0; o < opens; o++) {
-        openAsCalled[o] = f.ops[mine[byCall[o]]];
+        openAsCalled[o] = (History.Op) f.ops[mine[byCall[o]]];
       }
 
       int slots = n + opens;
@@ -750,7 +756,8 @@ final class Linearizability {
       value = new String[slots];
       call = new long[slots];
       ret = new long[n];
-      fields = f;
+      ops = f.ops;
+      parallel = f.parallel;
       answeredAt = new int[n];
       for (int r = 0; r < n; r++) {
         int j = byRet[r];
@@ -858,36 +865,32 @@ final class Linearizability {
      * Fills {@link #candStart} and returns {@link #cand}. The operations running at the return of
      * rank p are p and the higher ranks called before it; since returns grow with rank, the ranks p
      * whose return a rank r is called before are the few just below r, found by looking back from
-     * r. Each list is then put in call order, ties by rank, which is the order of a sweep over the
-     * calls and returns in time.
+     * r. That look-back is done twice, once to size the lists and once to fill them, so that no
+     * array has to keep its result. Each list is then put in call order, ties by rank, which is the
+     * order of a sweep over the calls and returns in time.
      */
     private int[] candidates() {
-      int[] first = new int[n]; // the lowest rank whose return rank r is called before
-      int[] count = new int[n + 1];
+      // First the length of each list, at candStart[p + 1], then where each list starts.
       for (int r = 0; r < n; r++) {
-        int p = r;
-        while (p > 0 && call[r] < ret[p - 1]) {
-          p--;
+        for (int p = r; p >= 0 && (p == r || call[r] < ret[p]); p--) {
+          candStart[p + 1]++; // r is a candidate of p
         }
-        first[r] = p;
-        count[p]++; // r is a candidate from p to r
-        count[r + 1]--;
       }
-      int size = 0;
-      int live = 0;
       for (int p = 0; p < n; p++) {
-        live += count[p];
-        candStart[p] = size;
-        size += live;
+        candStart[p + 1] += candStart[p];
       }
-      candStart[n] = size;
-      int[] out = new int[size];
-      int[] at = Arrays.copyOf(candStart, n);
-      for (int r = 0; r < n; r++) {
-        for (int p = first[r]; p <= r; p++) {
-          out[at[p]++] = r;
+      // Each list is filled from its end, so that candStart[p] ends where it began. Ranks are
+      // filled in decreasing order, so each list is in rank order.
+      int[] out = new int[candStart[n]];
+      int[] end = candStart;
+      for (int r = n - 1; r >= 0; r--) {
+        for (int p = r; p >= 0 && (p == r || call[r] < ret[p]); p--) {
+          out[--end[p + 1]] = r;
         }
       }
+      // end[p + 1] is now the start of list p + 1, so the starts are shifted by one place.
+      System.arraycopy(end, 1, candStart, 0, n);
+      candStart[n] = out.length;
       // Into call order, by insertion: there are only as many as there are concurrent clients.
       for (int p = 0; p < n; p++) {
         for (int i = candStart[p] + 1; i < candStart[p + 1]; i++) {
@@ -952,12 +955,12 @@ final class Linearizability {
       // holds its rank and its position among the candidates; one that applied an unanswered
       // operation holds -1 and the index of that operation.
       private int depth;
-      private final int[] frameRank;
-      private final int[] framePos;
-      private final State[][] frameStates;
-      private final int[] framePrefix;
-      private final int[][] frameWindow;
-      private final Seen[] frameSeen;
+      private int[] frameRank;
+      private int[] framePos;
+      private State[][] frameStates;
+      private int[] framePrefix;
+      private int[][] frameWindow;
+      private Seen[] frameSeen;
 
       private State[] states;
       private int prefix;
@@ -987,13 +990,14 @@ final class Linearizability {
         appliedOfClass = new int[firstOfClass.length];
         applied = new long[(opens + 63) / 64];
         finishedAt = new long[(end - from + 64) / 64];
-        int maxDepth = end - from + opens + 1;
-        frameRank = new int[maxDepth];
-        framePos = new int[maxDepth];
-        frameStates = new State[maxDepth][];
-        framePrefix = new int[maxDepth];
-        frameWindow = new int[maxDepth][];
-        frameSeen = opens == 0 ? null : new Seen[maxDepth]; // every visit is plain without them
+        // The stack grows as needed: a search that passes pins is cut back at each (see push).
+        int frames = Math.min(end - from + opens + 1, FRAMES);
+        frameRank = new int[frames];
+        framePos = new int[frames];
+        frameStates = new State[frames][];
+        framePrefix = new int[frames];
+        frameWindow = new int[frames][];
+        frameSeen = opens == 0 ? null : new Seen[frames]; // every visit is plain without them
         this.firstOpen = firstOpen;
         for (int o = 0; o < firstOpen; o++) {
           applied[o >>> 6] |= 1L << o;
@@ -1119,7 +1123,31 @@ final class Linearizability {
         }
       }
 
+      /**
+       * Pushes a frame for the move to the current configuration. A frame that placed a pin with
+       * nothing applied becomes the bottom of the stack: popping it ends the search (see run()), so
+       * the frames below it would never be popped, and dropping them keeps the stack as short as
+       * the longest stretch between such pins.
+       */
       private void push(int rank, int pos, int savedPrefix, int[] savedWindow, Seen seen) {
+        if (rank >= 0 && pin[rank] && appliedCount == 0) {
+          Arrays.fill(frameStates, 0, depth, null); // no longer reachable
+          Arrays.fill(frameWindow, 0, depth, null);
+          if (frameSeen != null) {
+            Arrays.fill(frameSeen, 0, depth, null);
+          }
+          depth = 0;
+        } else if (depth == frameRank.length) {
+          int frames = 2 * depth;
+          frameRank = Arrays.copyOf(frameRank, frames);
+          framePos = Arrays.copyOf(framePos, frames);
+          frameStates = Arrays.copyOf(frameStates, frames);
+          framePrefix = Arrays.copyOf(framePrefix, frames);
+          frameWindow = Arrays.copyOf(frameWindow, frames);
+          if (frameSeen != null) {
+            frameSeen = Arrays.copyOf(frameSeen, frames);
+          }
+        }
         frameRank[depth] = rank;
         framePos[depth] = pos;
         frameStates[depth] = states;
@@ -1540,7 +1568,7 @@ final class Linearizability {
      * long enough to be worth splitting.
      */
     private int[] stretches() {
-      if (!fields.parallel || n < 2 * STRETCH || pins == 0) {
+      if (!parallel || n < 2 * STRETCH || pins == 0) {
         return new int[] {0, n};
       }
       Ints bounds = new Ints();
@@ -1586,7 +1614,7 @@ final class Linearizability {
      * return.
      */
     private String report(String key, int deepest) {
-      History.Op stuck = fields.ops[answeredAt[deepest]];
+      History.Op stuck = (History.Op) ops[answeredAt[deepest]];
       StringBuilder sb =
           new StringBuilder("not linearizable on key ")
               .append(key)
@@ -1612,10 +1640,10 @@ final class Linearizability {
       }
       List<History.Op> shown = new ArrayList<>();
       for (int r = firstReturnAfter(from - 1); r <= deepest; r++) {
-        shown.add(fields.ops[answeredAt[r]]);
+        shown.add((History.Op) ops[answeredAt[r]]);
       }
       for (int i = 0; i < later.size; i++) {
-        shown.add(fields.ops[answeredAt[later.items[i]]]);
+        shown.add((History.Op) ops[answeredAt[later.items[i]]]);
       }
       for (History.Op o : openAsCalled) {
         if (o.call <= stuck.ret) {
