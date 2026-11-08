@@ -75,6 +75,9 @@ tasks.register<JavaExec>("linearizabilityBenchmark") {
     description = "Times the linearizability checker on long histories."
     classpath = sourceSets.test.get().runtimeClasspath
     mainClass = "io.github.laiwf94.keel.sim.LinearizabilityBenchmark"
+    // Each checker runs in a JVM of its own with these options; a heap of its full size from the
+    // start keeps G1 from resizing it during the timed runs.
+    minHeapSize = "1g"
     maxHeapSize = "1g"
 }
 
