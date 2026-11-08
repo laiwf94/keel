@@ -11,6 +11,7 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.IntStream;
 import java.util.stream.Stream;
 
@@ -307,22 +308,31 @@ final class Linearizability {
       order[k] = k;
     }
     Arrays.sort(order, Comparator.comparing(f.names::get));
-    // The searches are all set up before any runs, so that the arrays of every operation's fields
-    // are garbage while they run, and a collection then has less to copy.
-    Search[] searches = new Search[keys];
-    IntStream byKey = IntStream.range(0, keys);
-    (f.parallel && keys > 1 ? byKey.parallel() : byKey)
-        .forEach(
-            k ->
-                searches[k] =
-                    new Search(f, Arrays.copyOfRange(members, start[k], start[k + 1]), forward));
-    List<String> names = f.names; // not f, which is no longer needed
+    // Each key is set up and searched by one task, so that a thread with no key of its own to set
+    // up, when there are fewer keys than threads, takes part in the searches of the keys that are
+    // ready instead of waiting for the rest to be set up. The arrays of every operation's fields
+    // are let go once the last key is set up, so that they are garbage while the searches that are
+    // left run, and a collection then has less to copy.
+    AtomicReference<Fields> fields = new AtomicReference<>(f);
+    AtomicInteger settingUp = new AtomicInteger(keys);
+    List<String> names = f.names;
     // An array splits evenly between threads; a TreeMap of a few keys may not split at all.
     Stream<Integer> stream = Arrays.stream(order);
-    if (keys > 1 && searches[0].parallel) {
+    if (keys > 1 && f.parallel) {
       stream = stream.parallel();
     }
-    return stream.map(k -> searches[k].verdict(names.get(k))).toList().stream()
+    return stream
+        .map(
+            k -> {
+              int[] mine = Arrays.copyOfRange(members, start[k], start[k + 1]);
+              Search search = new Search(fields.get(), mine, forward);
+              if (settingUp.decrementAndGet() == 0) {
+                fields.set(null);
+              }
+              return search.verdict(names.get(k));
+            })
+        .toList()
+        .stream()
         .flatMap(Optional::stream)
         .findFirst();
   }
@@ -1024,6 +1034,10 @@ final class Linearizability {
      */
     final class Walk {
       private final int[] appliedOfClass;
+      // Classes left out as a whole. Whether one is short is never asked: covers() asks only of
+      // the classes of operations that an earlier visit applied and this one has not, and every
+      // member of such a class is applied in every visit of this walk.
+      private final boolean[] leftOut;
       private final long[] applied;
       private long[] appliedNow; // a copy of applied, or null after a change
       private final Seen root = new Seen(NO_BITS); // where shortages before any move go
@@ -1040,6 +1054,7 @@ final class Linearizability {
       private State[][] slotStates = new State[TABLE][];
       private Seen[] slotSeen = new Seen[TABLE];
       private int used;
+      private final Ints filled = new Ints(); // the slots in use, so that reset() clears only those
       private long probed; // the key slot() last looked for
       // The prefixes of the configurations in the table, from the start, so that most visits need
       // not hash. Only the first finishedWords words may have bits set.
@@ -1082,6 +1097,10 @@ final class Linearizability {
         this.end = end;
         this.firstOpen = firstOpen;
         appliedOfClass = new int[firstOfClass.length];
+        leftOut = new boolean[firstOfClass.length];
+        for (int c = 0; c < leftOut.length; c++) {
+          leftOut[c] = members[c][members[c].length - 1] < firstOpen;
+        }
         applied = new long[(opens + 63) / 64];
         frameSeen = opens == 0 ? null : new Seen[FRAMES];
         leaveOutEarlyOpens();
@@ -1119,12 +1138,16 @@ final class Linearizability {
             slotStates = new State[TABLE][];
             slotSeen = new Seen[TABLE];
           } else {
-            Arrays.fill(slotKey, 0);
-            Arrays.fill(slotWindow, null);
-            Arrays.fill(slotStates, null);
-            Arrays.fill(slotSeen, null);
+            for (int k = 0; k < filled.size; k++) {
+              int i = filled.items[k];
+              slotKey[i] = 0;
+              slotWindow[i] = null;
+              slotStates[i] = null;
+              slotSeen[i] = null;
+            }
           }
           used = 0;
+          filled.size = 0;
         }
         Arrays.fill(finishedAt, 0, finishedWords, 0);
         finishedWords = 0;
@@ -1209,7 +1232,10 @@ final class Linearizability {
               nextOpen = opens; // helps() would turn every one of them down
             }
           }
-          for (; nextOpen < opens && call[n + nextOpen] < limit; nextOpen++) {
+          // Those left out are marked applied, so the search would pass over each of them.
+          for (nextOpen = Math.max(nextOpen, firstOpen);
+              nextOpen < opens && call[n + nextOpen] < limit;
+              nextOpen++) {
             int o = nextOpen;
             if (o != head(classOf[o])) {
               continue; // applied, or a member of its class called earlier is not
@@ -1327,7 +1353,7 @@ final class Linearizability {
           }
         }
         long limit = ret[prefix];
-        for (int o = 0; o < opens && call[n + o] < limit; o++) {
+        for (int o = firstOpen; o < opens && call[n + o] < limit; o++) {
           int s = n + o;
           if (!isApplied(o) && expected[s] != -1 && !couldMatch(states, expected[s])) {
             blocked.add(s);
@@ -1336,7 +1362,7 @@ final class Linearizability {
         // A class runs short here if all of it that has been called is applied, yet one more would
         // be worth trying.
         for (int c = 0; c < firstOfClass.length; c++) {
-          if (appliedOfClass[c] > 0 && !alone[c]) {
+          if (appliedOfClass[c] > 0 && !alone[c] && !leftOut[c]) {
             int h = head(c);
             if (h < 0 || call[n + h] >= limit) {
               int s = n + members[c][0];
@@ -1498,6 +1524,7 @@ final class Linearizability {
           return;
         }
         slotKey[i] = probed;
+        filled.add(i);
         int word = (prefix - from) >>> 6;
         if (word >= finishedAt.length) {
           finishedAt = Arrays.copyOf(finishedAt, Math.max(2 * finishedAt.length, word + 1));
@@ -1525,6 +1552,7 @@ final class Linearizability {
         slotSeen = new Seen[capacity];
         int mask = capacity - 1;
         int shift = Integer.numberOfLeadingZeros(mask);
+        filled.size = 0;
         for (int j = 0; j < keys.length; j++) {
           if (keys[j] != 0) {
             int i = ((int) (keys[j] >>> 32) * 0x9E3779B9) >>> shift;
@@ -1532,6 +1560,7 @@ final class Linearizability {
               i = (i + 1) & mask;
             }
             slotKey[i] = keys[j];
+            filled.add(i);
             slotWindow[i] = windows[j];
             slotStates[i] = stateSets[j];
             slotSeen[i] = seens[j];
