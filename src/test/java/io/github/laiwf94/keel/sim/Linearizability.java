@@ -51,15 +51,15 @@ import java.util.stream.Stream;
  * one state and no stack, handing over to the full search only where it gets stuck ({@link
  * Search.Stretch}). Its moves need not be the search's: it places a read or a conflict that fits at
  * once, since that leaves the state as it is, and otherwise the write that comes first in the log,
- * and so gets stuck about once in 2,500 operations instead of once in 25. The operations of a key
- * are copied into arrays in the order the search reads them, each stretch copying its own in
- * parallel, the operations it may try at each point are found for every return by looking back a
- * few ranks, the cache and the stack are arrays, and a set of states is a small sorted array, so
- * that a step is a few array reads and allocates at most the state it produces. A state's hash is
- * computed only once a search caches it, and unanswered writes are compared by numbers rather than
- * by their values: for a long history each value is a string somewhere else in memory, and reading
- * it is usually a cache miss. For the same reason a report of a violation reads only the operations
- * it shows.
+ * and so gets stuck about once in 2,500 operations instead of once in 25. Each operation of a key
+ * is read once, into arrays by its position in the input, and each stretch copies its own ranks
+ * from there into arrays in the order the search reads them, in parallel; the operations it may try
+ * at each point are found for every return by looking back a few ranks, the cache and the stack are
+ * arrays, and a set of states is a small sorted array, so that a step is a few array reads and
+ * allocates at most the state it produces. A state's hash is computed only once a search caches it,
+ * and unanswered writes are compared by numbers rather than by their values: for a long history
+ * each value is a string somewhere else in memory, and reading it is usually a cache miss. For the
+ * same reason a report of a violation reads only the operations it shows.
  *
  * <p>{@link LinearizabilityReference} keeps the search as it was before, as an oracle.
  *
@@ -865,6 +865,14 @@ final class Linearizability {
     private final boolean parallel; // whether the history is long enough to split
     private final boolean forward; // whether stretches start with a forward pass, see Stretch
     private final int[] answeredAt; // the input position of each answered operation, by rank
+    // The position from the key's first operation of each answered one, by rank, and the fields of
+    // every operation of the key by that position, which fill() copies in rank order.
+    private final int[] byRet;
+    private final byte[] kinds;
+    private final boolean[] oks;
+    private final long[] expecteds;
+    private final long[] versions;
+    private final String[] values;
     private final History.Op[] openAsCalled; // by call, for the report
 
     // Every operation the search may linearize, by slot: the answered ones by rank, then the
@@ -927,11 +935,17 @@ final class Linearizability {
       ops = f.ops;
       parallel = f.parallel;
       int[] mine = f.members;
-      // Positions from lo, with their return and call times, so that the sorts read small arrays.
+      // Positions from lo, with their return and call times, so that the sorts read small arrays,
+      // and the other fields, so that no operation is read again (see fill()).
       int m = hi - lo;
       long[] rets = new long[m];
       long[] calls = new long[m];
       boolean[] settles = new boolean[m]; // a read or a write that applied: one state after it
+      byte[] kinds = new byte[m];
+      boolean[] oks = new boolean[m];
+      long[] expecteds = new long[m];
+      long[] versions = new long[m];
+      String[] values = new String[m];
       int[] done = new int[m];
       String[] reads = new String[m]; // the values answered reads returned, null aside
       int readCount = 0;
@@ -942,10 +956,17 @@ final class Linearizability {
       for (int j = 0; j < m; j++) {
         History.Op op = (History.Op) ops[mine[lo + j]];
         long t = op.ret;
-        boolean read = op.kind == History.Kind.GET;
+        History.Kind k = op.kind;
+        boolean read = k == History.Kind.GET;
         rets[j] = t;
         calls[j] = op.call;
-        settles[j] = read || op.ok;
+        boolean applied = op.ok;
+        settles[j] = read || applied;
+        kinds[j] = code(k);
+        oks[j] = applied;
+        expecteds[j] = op.expected;
+        versions[j] = op.version;
+        values[j] = read ? op.readValue : op.value;
         if (t != History.OPEN) {
           firstReturn = Math.min(firstReturn, t);
           lastReturn = Math.max(lastReturn, t);
@@ -983,6 +1004,12 @@ final class Linearizability {
       ret = new long[n];
       answeredAt = new int[n];
       boolean[] settle = new boolean[n];
+      this.byRet = byRet;
+      this.kinds = kinds;
+      this.oks = oks;
+      this.expecteds = expecteds;
+      this.versions = versions;
+      this.values = values;
       for (int r = 0; r < n; r++) {
         int j = byRet[r];
         answeredAt[r] = mine[lo + j];
@@ -990,8 +1017,8 @@ final class Linearizability {
         ret[r] = rets[j];
         settle[r] = settles[j];
       }
-      // The other fields of the answered operations are copied by the stretches that search them,
-      // in parallel (see fill()); the unanswered writes are copied below.
+      // The other fields of the answered operations are copied into rank order by the stretches
+      // that search them, in parallel (see fill()); the unanswered writes are copied below.
       // The values of unanswered puts that an answered read returned. A read's value is compared
       // with theirs only if its hash is one of theirs, found in a sorted array.
       Ints openPuts = new Ints();
@@ -1078,20 +1105,21 @@ final class Linearizability {
     }
 
     /**
-     * Copies the fields of the answered operations of ranks {@code from} to {@code to - 1} from the
-     * operations into the arrays the search reads. Each stretch copies its own, in parallel.
-     * Reading the operations, each an object of its own, is most of the cost of setting a key up,
-     * and done here it is shared between all the threads instead of one per key.
+     * Copies the fields of the answered operations of ranks {@code from} to {@code to - 1} into the
+     * arrays the search reads, in rank order. Each stretch copies its own, in parallel. They are
+     * copied from the arrays the setup filled by position, not from the operations: the setup reads
+     * each operation anyway, and each is an object of its own, so reading it a second time, in rank
+     * order, cost 2.4 ms of the checker's 15 ms of CPU time on 100,000 operations, where copying
+     * from those arrays costs 0.9 ms.
      */
     private void fill(int from, int to) {
       for (int r = from; r < to; r++) {
-        History.Op op = (History.Op) ops[answeredAt[r]];
-        History.Kind k = op.kind;
-        kind[r] = code(k);
-        ok[r] = op.ok;
-        expected[r] = op.expected;
-        version[r] = op.version;
-        value[r] = k == History.Kind.GET ? op.readValue : op.value;
+        int j = byRet[r];
+        kind[r] = kinds[j];
+        ok[r] = oks[j];
+        expected[r] = expecteds[j];
+        version[r] = versions[j];
+        value[r] = values[j];
       }
     }
 
