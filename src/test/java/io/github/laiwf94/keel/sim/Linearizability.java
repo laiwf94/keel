@@ -11,7 +11,6 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.IntStream;
 import java.util.stream.Stream;
 
@@ -50,8 +49,11 @@ import java.util.stream.Stream;
  *
  * <p>The rest is the cost of a step. Most steps are first moves, which a forward pass makes with
  * one state and no stack, handing over to the full search only where it gets stuck ({@link
- * Search.Stretch}). The operations of a key are copied into arrays in the order the search reads
- * them, the operations it may try at each point are found once for every return by looking back a
+ * Search.Stretch}). Its moves need not be the search's: it places a read or a conflict that fits at
+ * once, since that leaves the state as it is, and otherwise the write that comes first in the log,
+ * and so gets stuck about once in 2,500 operations instead of once in 25. The operations of a key
+ * are copied into arrays in the order the search reads them, each stretch copying its own in
+ * parallel, the operations it may try at each point are found for every return by looking back a
  * few ranks, the cache and the stack are arrays, and a set of states is a small sorted array, so
  * that a step is a few array reads and allocates at most the state it produces. A state's hash is
  * computed only once a search caches it, and unanswered writes are compared by numbers rather than
@@ -284,25 +286,8 @@ final class Linearizability {
    * {@link Search.Walk}, which gives the same answer and the same report more slowly.
    */
   static Optional<String> check(List<History.Op> ops, boolean forward) {
-    Fields f = new Fields(ops.toArray());
+    Partition f = new Partition(ops.toArray());
     int keys = f.names.size();
-    int[] start = new int[keys + 1];
-    for (int[] chunk : f.keyOf) {
-      for (int k : chunk) {
-        start[k + 1]++;
-      }
-    }
-    for (int k = 0; k < keys; k++) {
-      start[k + 1] += start[k];
-    }
-    int[] members = new int[f.ops.length]; // the operations of each key, in input order
-    int[] at = Arrays.copyOf(start, keys);
-    for (int c = 0; c < f.keyOf.length; c++) {
-      int[] chunk = f.keyOf[c];
-      for (int j = 0; j < chunk.length; j++) {
-        members[at[chunk[j]]++] = (c << Fields.BITS) + j;
-      }
-    }
     Integer[] order = new Integer[keys];
     for (int k = 0; k < keys; k++) {
       order[k] = k;
@@ -310,11 +295,7 @@ final class Linearizability {
     Arrays.sort(order, Comparator.comparing(f.names::get));
     // Each key is set up and searched by one task, so that a thread with no key of its own to set
     // up, when there are fewer keys than threads, takes part in the searches of the keys that are
-    // ready instead of waiting for the rest to be set up. The arrays of every operation's fields
-    // are let go once the last key is set up, so that they are garbage while the searches that are
-    // left run, and a collection then has less to copy.
-    AtomicReference<Fields> fields = new AtomicReference<>(f);
-    AtomicInteger settingUp = new AtomicInteger(keys);
+    // ready instead of waiting for the rest to be set up.
     List<String> names = f.names;
     // An array splits evenly between threads; a TreeMap of a few keys may not split at all.
     Stream<Integer> stream = Arrays.stream(order);
@@ -322,15 +303,7 @@ final class Linearizability {
       stream = stream.parallel();
     }
     return stream
-        .map(
-            k -> {
-              int[] mine = Arrays.copyOfRange(members, start[k], start[k + 1]);
-              Search search = new Search(fields.get(), mine, forward);
-              if (settingUp.decrementAndGet() == 0) {
-                fields.set(null);
-              }
-              return search.verdict(names.get(k));
-            })
+        .map(k -> new Search(f, f.start[k], f.start[k + 1], forward).verdict(names.get(k)))
         .toList()
         .stream()
         .flatMap(Optional::stream)
@@ -338,50 +311,37 @@ final class Linearizability {
   }
 
   /**
-   * The fields of every operation, read once into arrays by position in the input, and the key each
-   * belongs to. Reading the operations themselves is most of the cost of a long history, since each
-   * is an object of its own, so a long history is read in parallel. The arrays come in chunks of
-   * {@code 2^BITS}, each allocated and filled by the thread that reads it, which keeps every array
-   * small enough for the young generation. Each chunk numbers the keys it meets on its own,
-   * starting from the keys of the first few operations, and its numbers are mapped to the global
-   * ones afterwards if they differ.
+   * The operations of each key, by position in the input and in input order: those of key k are
+   * {@code members[start[k]]} to {@code members[start[k + 1] - 1]}. Only the keys are read here;
+   * each key's search reads the rest of its own operations, in input order, which is the order they
+   * lie in memory when a history is built one operation at a time, so that the reads stream instead
+   * of jumping. A long history is read in parallel in chunks of {@code 2^BITS}. Each chunk numbers
+   * the keys it meets on its own, starting from the keys of the first few operations, and its
+   * numbers are mapped to the global ones afterwards if they differ; each then counts its
+   * operations of each key, and places them, at offsets that follow from all the counts.
    */
-  private static final class Fields {
+  private static final class Partition {
     static final int BITS = 13;
-    static final int MASK = (1 << BITS) - 1;
 
     final Object[] ops; // History.Op, as ArrayList.toArray copies them without a check of each
-    final byte[][] kind; // codes, see KINDS
-    final boolean[][] ok;
-    final long[][] expected;
-    final long[][] version;
-    final String[][] value; // what a put wrote or a read returned
-    final long[][] call;
-    final long[][] ret;
-    final int[][] keyOf;
     final List<String> names;
     final boolean parallel;
+    final int[] start;
+    final int[] members;
 
-    Fields(Object[] ops) {
+    Partition(Object[] ops) {
       this.ops = ops;
       int n = ops.length;
-      int chunks = (n + MASK) >>> BITS;
-      kind = new byte[chunks][];
-      ok = new boolean[chunks][];
-      expected = new long[chunks][];
-      version = new long[chunks][];
-      value = new String[chunks][];
-      call = new long[chunks][];
-      ret = new long[chunks][];
-      keyOf = new int[chunks][];
+      int chunks = (n + (1 << BITS) - 1) >>> BITS;
       parallel = n >= PARALLEL_FROM;
       Keys seed = new Keys();
       for (int i = 0; i < Math.min(n, 256); i++) {
         seed.id(((History.Op) ops[i]).key);
       }
+      int[] keyOf = new int[n];
       Keys[] local = new Keys[chunks];
-      IntStream range = IntStream.range(0, chunks);
-      (parallel ? range.parallel() : range).forEach(c -> local[c] = read(c, seed.copy()));
+      int[][] counts = new int[chunks][];
+      chunks(chunks, c -> local[c] = read(c, seed.copy(), keyOf));
       for (int c = 0; c < chunks; c++) {
         int[] ids = new int[local[c].names.size()];
         boolean same = true;
@@ -389,72 +349,53 @@ final class Linearizability {
           ids[k] = seed.id(local[c].names.get(k));
           same &= ids[k] == k;
         }
-        for (int j = 0; j < keyOf[c].length && !same; j++) {
-          keyOf[c][j] = ids[keyOf[c][j]];
+        for (int i = c << BITS, to = Math.min(n, (c + 1) << BITS); i < to && !same; i++) {
+          keyOf[i] = ids[keyOf[i]];
         }
       }
       names = seed.names;
+      int keys = names.size();
+      chunks(
+          chunks,
+          c -> {
+            int[] count = new int[keys];
+            for (int i = c << BITS, to = Math.min(n, (c + 1) << BITS); i < to; i++) {
+              count[keyOf[i]]++;
+            }
+            counts[c] = count;
+          });
+      // Each chunk's count becomes where its first operation of each key goes.
+      start = new int[keys + 1];
+      for (int k = 0; k < keys; k++) {
+        int at = start[k];
+        for (int[] count : counts) {
+          int size = count[k];
+          count[k] = at;
+          at += size;
+        }
+        start[k + 1] = at;
+      }
+      members = new int[n];
+      chunks(
+          chunks,
+          c -> {
+            int[] at = counts[c];
+            for (int i = c << BITS, to = Math.min(n, (c + 1) << BITS); i < to; i++) {
+              members[at[keyOf[i]]++] = i;
+            }
+          });
     }
 
-    private Keys read(int c, Keys keys) {
-      int from = c << BITS;
-      int size = Math.min(ops.length - from, 1 << BITS);
-      byte[] kinds = new byte[size];
-      boolean[] oks = new boolean[size];
-      long[] expects = new long[size];
-      long[] versions = new long[size];
-      String[] values = new String[size];
-      long[] calls = new long[size];
-      long[] rets = new long[size];
-      int[] ids = new int[size];
-      kind[c] = kinds;
-      ok[c] = oks;
-      expected[c] = expects;
-      version[c] = versions;
-      value[c] = values;
-      call[c] = calls;
-      ret[c] = rets;
-      keyOf[c] = ids;
-      for (int j = 0; j < size; j++) {
-        History.Op op = (History.Op) ops[from + j];
-        kinds[j] = code(op.kind);
-        oks[j] = op.ok;
-        expects[j] = op.expected;
-        versions[j] = op.version;
-        values[j] = op.kind == History.Kind.GET ? op.readValue : op.value;
-        calls[j] = op.call;
-        rets[j] = op.ret;
-        ids[j] = keys.id(op.key);
+    private void chunks(int chunks, java.util.function.IntConsumer task) {
+      IntStream range = IntStream.range(0, chunks);
+      (parallel ? range.parallel() : range).forEach(task);
+    }
+
+    private Keys read(int c, Keys keys, int[] keyOf) {
+      for (int i = c << BITS, to = Math.min(ops.length, (c + 1) << BITS); i < to; i++) {
+        keyOf[i] = keys.id(((History.Op) ops[i]).key);
       }
       return keys;
-    }
-
-    History.Kind kind(int i) {
-      return KINDS[kind[i >>> BITS][i & MASK]];
-    }
-
-    boolean ok(int i) {
-      return ok[i >>> BITS][i & MASK];
-    }
-
-    long expected(int i) {
-      return expected[i >>> BITS][i & MASK];
-    }
-
-    long version(int i) {
-      return version[i >>> BITS][i & MASK];
-    }
-
-    String value(int i) {
-      return value[i >>> BITS][i & MASK];
-    }
-
-    long call(int i) {
-      return call[i >>> BITS][i & MASK];
-    }
-
-    long ret(int i) {
-      return ret[i >>> BITS][i & MASK];
     }
   }
 
@@ -639,6 +580,63 @@ final class Linearizability {
     }
   }
 
+  /**
+   * The first {@code n} of {@code idx} sorted by {@code key[idx[i]]}, keeping equal keys in their
+   * order, given the least and greatest of those keys. Where the range of the keys and the indexes
+   * fit in one long together, each is packed into one, the key above the index, and the longs are
+   * sorted by a least significant digit radix sort over the key's bits. That reads each key once
+   * instead of once per pass through an index, and the index below breaks ties by input order.
+   * Otherwise it falls back to {@link #sortBy}.
+   */
+  static int[] sortedBy(int[] idx, int n, long[] key, long min, long max) {
+    int low = 32 - Integer.numberOfLeadingZeros(Math.max(1, key.length - 1)); // bits of an index
+    int bits = n == 0 ? 0 : 64 - Long.numberOfLeadingZeros(max - min); // the range, as unsigned
+    if (low + bits > 63) {
+      int[] out = Arrays.copyOf(idx, n);
+      sortBy(out, key);
+      return out;
+    }
+    long[] from = new long[n];
+    boolean sorted = true;
+    long prev = Long.MIN_VALUE;
+    for (int i = 0; i < n; i++) {
+      long v = ((key[idx[i]] - min) << low) | idx[i];
+      from[i] = v;
+      sorted &= prev <= v;
+      prev = v;
+    }
+    if (!sorted) {
+      int passes = (bits + 12) / 13;
+      int digit = (bits + passes - 1) / passes;
+      int radix = 1 << digit;
+      long[] to = new long[n];
+      int[] count = new int[radix + 1];
+      for (int p = 0; p < passes; p++) {
+        int shift = low + p * digit;
+        Arrays.fill(count, 0);
+        for (int i = 0; i < n; i++) {
+          count[(int) ((from[i] >>> shift) & (radix - 1)) + 1]++;
+        }
+        for (int d = 0; d < radix; d++) {
+          count[d + 1] += count[d];
+        }
+        for (int i = 0; i < n; i++) {
+          long v = from[i];
+          to[count[(int) ((v >>> shift) & (radix - 1))]++] = v;
+        }
+        long[] t = from;
+        from = to;
+        to = t;
+      }
+    }
+    int[] out = new int[n];
+    int mask = (1 << low) - 1;
+    for (int i = 0; i < n; i++) {
+      out[i] = (int) from[i] & mask;
+    }
+    return out;
+  }
+
   /** How far back {@link #candidates} looks without a branch; see there. */
   private static final int NEAR = 4;
 
@@ -659,20 +657,48 @@ final class Linearizability {
    * than everything else in the setup of a key.
    */
   static int[] candidates(long[] call, long[] ret, int n, int[] candStart) {
-    int[] lo = new int[n + NEAR];
+    return candidates(call, ret, 0, n, candStart);
+  }
+
+  /**
+   * As {@link #candidates(long[], long[], int, int[])}, for the ranks {@code from} to {@code to -
+   * 1} alone: the list of rank p is {@code out[candStart[p - from]]} to {@code out[candStart[p -
+   * from + 1] - 1]}, and candStart has {@code to - from + 1} ints. The range must not be crossed:
+   * {@code from} is 0 or every rank from it on is called after rank {@code from - 1} returns, and
+   * {@code to} is the number of ranks or no rank from it on is called before rank {@code to - 1}
+   * returns. Both hold where the ranges begin and end after pins, so that the lists of the
+   * stretches between pins can be made each on its own, in parallel, and are the same as in the
+   * lists of the whole history.
+   */
+  static int[] candidates(long[] call, long[] ret, int from, int to, int[] candStart) {
+    return candidates(call, lows(call, ret, from, to), from, to, candStart);
+  }
+
+  /**
+   * For the ranks {@code from} to {@code to - 1}, with the same conditions as {@link
+   * #candidates(long[], long[], int, int, int[])}: lo[r - from] is the lowest rank, less from, that
+   * returns after rank r is called, followed by {@link #NEAR} entries of {@code Integer.MAX_VALUE}
+   * and then the most ranks any rank runs past. Rank r is among the ranks running at the return of
+   * rank p >= from exactly when r == p, or r > p and lo[r - from] <= p - from; when no rank runs
+   * past more than NEAR, those are among the NEAR ranks after p.
+   */
+  static int[] lows(long[] call, long[] ret, int from, int to) {
+    int n = to - from; // ranks are counted from `from`
+    int b = from;
+    int[] lo = new int[n + NEAR + 1];
     int farthest = 0; // the most ranks any rank runs past
     for (int r = 0; r < n; r++) {
-      long c = call[r];
+      long c = call[b + r];
       int p = r;
       if (r >= NEAR) {
         p -=
-            (ret[r - 1] > c ? 1 : 0)
-                + (ret[r - 2] > c ? 1 : 0)
-                + (ret[r - 3] > c ? 1 : 0)
-                + (ret[r - 4] > c ? 1 : 0);
+            (ret[b + r - 1] > c ? 1 : 0)
+                + (ret[b + r - 2] > c ? 1 : 0)
+                + (ret[b + r - 3] > c ? 1 : 0)
+                + (ret[b + r - 4] > c ? 1 : 0);
       }
       if (r < NEAR || p == r - NEAR) {
-        while (p > 0 && ret[p - 1] > c) {
+        while (p > 0 && ret[b + p - 1] > c) {
           p--;
         }
         farthest = Math.max(farthest, r - p);
@@ -680,6 +706,15 @@ final class Linearizability {
       lo[r] = p;
     }
     Arrays.fill(lo, n, n + NEAR, Integer.MAX_VALUE); // past the last rank: never a candidate
+    lo[n + NEAR] = farthest;
+    return lo;
+  }
+
+  /** The lists of {@link #candidates(long[], long[], int, int, int[])}, given {@link #lows}. */
+  private static int[] candidates(long[] call, int[] lo, int from, int to, int[] candStart) {
+    int n = to - from; // ranks are counted from `from` below, except where they are written out
+    int b = from;
+    int farthest = lo[n + NEAR];
     int[] far = farthest > NEAR ? new int[n + 1] : null; // how many far ranks each list has
     if (far != null) {
       for (int r = NEAR + 1; r < n; r++) {
@@ -710,14 +745,15 @@ final class Linearizability {
     int[] out = new int[start + NEAR + 1]; // room for what the last lists write past their end
     for (int p = 0; p < n; p++) {
       int k = candStart[p];
-      out[k++] = p;
-      out[k] = p + 1;
+      int q = b + p;
+      out[k++] = q;
+      out[k] = q + 1;
       k += lo[p + 1] <= p ? 1 : 0;
-      out[k] = p + 2;
+      out[k] = q + 2;
       k += lo[p + 2] <= p ? 1 : 0;
-      out[k] = p + 3;
+      out[k] = q + 3;
       k += lo[p + 3] <= p ? 1 : 0;
-      out[k] = p + 4;
+      out[k] = q + 4;
       k += lo[p + 4] <= p ? 1 : 0;
       if (far != null) {
         far[p] = k; // where its far ranks go
@@ -726,26 +762,26 @@ final class Linearizability {
     if (far != null) {
       for (int r = NEAR + 1; r < n; r++) {
         for (int p = lo[r]; p < r - NEAR; p++) {
-          out[far[p]++] = r;
+          out[far[p]++] = b + r;
         }
       }
     }
-    Arrays.fill(out, start, out.length, 0); // the last lists wrote ranks past the last one there
+    Arrays.fill(out, start, out.length, b); // the last lists wrote ranks past the last one there
     for (int p = 0; p < n; p++) {
-      int from = candStart[p];
-      int size = candStart[p + 1] - from;
+      int at = candStart[p];
+      int size = candStart[p + 1] - at;
       if (size <= 2) {
         // One compare and swap, without a branch, which does nothing to a list of one.
-        int a = out[from];
-        int b = out[from + 1];
-        int swap = (size == 2 ? 1 : 0) & (call[a] > call[b] ? 1 : 0);
-        out[from] = swap == 1 ? b : a;
-        out[from + 1] = swap == 1 ? a : b;
+        int x = out[at];
+        int y = out[at + 1];
+        int swap = (size == 2 ? 1 : 0) & (call[x] > call[y] ? 1 : 0);
+        out[at] = swap == 1 ? y : x;
+        out[at + 1] = swap == 1 ? x : y;
       } else {
-        for (int i = from + 1; i < from + size; i++) { // by insertion, which keeps ties in order
+        for (int i = at + 1; i < at + size; i++) { // by insertion, which keeps ties in order
           int v = out[i];
           int j = i - 1;
-          while (j >= from && call[out[j]] > call[v]) {
+          while (j >= at && call[out[j]] > call[v]) {
             out[j + 1] = out[j];
             j--;
           }
@@ -754,6 +790,35 @@ final class Linearizability {
       }
     }
     return out;
+  }
+
+  /**
+   * The candidate lists of a range of ranks from {@code base}: the ranks running at the return of
+   * rank p, in call order, are {@code cand[start[p - base]]} to {@code cand[start[p - base + 1] -
+   * 1]} (see {@link #candidates}). They include p, and every rank is >= p.
+   */
+  private static final class Lists {
+    private final int base;
+    private final int[] start;
+    private final int[] cand;
+
+    Lists(int base, int[] start, int[] cand) {
+      this.base = base;
+      this.start = start;
+      this.cand = cand;
+    }
+
+    int base() {
+      return base;
+    }
+
+    int[] start() {
+      return start;
+    }
+
+    int[] cand() {
+      return cand;
+    }
   }
 
   /** A growable list of ints. */
@@ -786,8 +851,8 @@ final class Linearizability {
    * operations in return order plus a window no larger than the number of concurrent clients,
    * because the search can only linearize an operation called before the first return it has not
    * passed. That return is the one of rank {@code prefix}, so the operations it may try next are
-   * those running at that return, which are computed once for every rank ({@link #cand}) instead of
-   * being found by walking a list of events.
+   * those running at that return, which are computed once for every rank of a stretch ({@link
+   * Range}) instead of being found by walking a list of events.
    *
    * <p>Finished configurations go into an open-addressing table, with the unanswered operations
    * that were applied when each was reached ({@link Seen}), and a later visit that an earlier one
@@ -813,11 +878,9 @@ final class Linearizability {
     private final long[] call;
     private final long[] ret; // of the answered ones
 
-    // The ranks of the answered operations running at the return of rank p, in call order, are
-    // cand[candStart[p]] to cand[candStart[p + 1] - 1] (see candidates()). They include p, and
-    // every rank is >= p.
-    private final int[] candStart;
-    private final int[] cand;
+    // The candidates of every rank, when a search over the whole history needs them; each stretch
+    // searched on its own finds its own (see search()).
+    private Range all;
 
     // Unanswered write o, from 0, is in slot n + o.
     private final int opens;
@@ -853,35 +916,49 @@ final class Linearizability {
     private static final long STEPS = 64;
 
     private final AtomicInteger stopAt = new AtomicInteger(); // the first stretch that failed
+    private Range stuckIn; // the candidates of the search that gave the answer
 
     /**
      * The search over the operations {@code mine} of {@code f}, given in input order, with or
      * without the {@code forward} pass.
      */
-    Search(Fields f, int[] mine, boolean forward) {
+    Search(Partition f, int lo, int hi, boolean forward) {
       this.forward = forward;
-      // Positions in mine, with their return and call times, so that the sorts read small arrays.
-      int m = mine.length;
+      ops = f.ops;
+      parallel = f.parallel;
+      int[] mine = f.members;
+      // Positions from lo, with their return and call times, so that the sorts read small arrays.
+      int m = hi - lo;
       long[] rets = new long[m];
       long[] calls = new long[m];
+      boolean[] settles = new boolean[m]; // a read or a write that applied: one state after it
       int[] done = new int[m];
+      String[] reads = new String[m]; // the values answered reads returned, null aside
+      int readCount = 0;
       Ints writes = new Ints(); // unanswered
+      long firstReturn = Long.MAX_VALUE;
       long lastReturn = Long.MIN_VALUE;
       int answers = 0;
       for (int j = 0; j < m; j++) {
-        int i = mine[j];
-        rets[j] = f.ret(i);
-        calls[j] = f.call(i);
-        if (rets[j] != History.OPEN) {
-          lastReturn = Math.max(lastReturn, rets[j]);
+        History.Op op = (History.Op) ops[mine[lo + j]];
+        long t = op.ret;
+        boolean read = op.kind == History.Kind.GET;
+        rets[j] = t;
+        calls[j] = op.call;
+        settles[j] = read || op.ok;
+        if (t != History.OPEN) {
+          firstReturn = Math.min(firstReturn, t);
+          lastReturn = Math.max(lastReturn, t);
           done[answers++] = j;
-        } else if (f.kind(i) != History.Kind.GET) {
+          if (read && op.readValue != null) {
+            reads[readCount++] = op.readValue;
+          }
+        } else if (!read) {
           writes.add(j);
         }
       }
       n = answers;
-      int[] byRet = Arrays.copyOf(done, n);
-      sortBy(byRet, rets);
+      int[] byRet = sortedBy(done, n, rets, firstReturn, lastReturn);
       Ints pending = new Ints();
       for (int k = 0; k < writes.size; k++) {
         if (calls[writes.items[k]] < lastReturn) {
@@ -893,7 +970,7 @@ final class Linearizability {
       opens = byCall.length;
       openAsCalled = new History.Op[opens];
       for (int o = 0; o < opens; o++) {
-        openAsCalled[o] = (History.Op) f.ops[mine[byCall[o]]];
+        openAsCalled[o] = (History.Op) ops[mine[lo + byCall[o]]];
       }
 
       int slots = n + opens;
@@ -904,21 +981,17 @@ final class Linearizability {
       value = new String[slots];
       call = new long[slots];
       ret = new long[n];
-      ops = f.ops;
-      parallel = f.parallel;
       answeredAt = new int[n];
+      boolean[] settle = new boolean[n];
       for (int r = 0; r < n; r++) {
         int j = byRet[r];
-        int i = mine[j];
-        answeredAt[r] = i;
-        kind[r] = f.kind[i >>> Fields.BITS][i & Fields.MASK];
-        ok[r] = f.ok(i);
-        expected[r] = f.expected(i);
-        version[r] = f.version(i);
-        value[r] = f.value(i);
+        answeredAt[r] = mine[lo + j];
         call[r] = calls[j];
         ret[r] = rets[j];
+        settle[r] = settles[j];
       }
+      // The other fields of the answered operations are copied by the stretches that search them,
+      // in parallel (see fill()); the unanswered writes are copied below.
       // The values of unanswered puts that an answered read returned. A read's value is compared
       // with theirs only if its hash is one of theirs, found in a sorted array.
       Ints openPuts = new Ints();
@@ -934,11 +1007,8 @@ final class Linearizability {
       }
       Arrays.sort(openHashes);
       Set<String> read = new HashSet<>();
-      for (int r = 0; r < n && openHashes.length > 0; r++) {
-        String v = value[r];
-        if (kind[r] != code(History.Kind.GET) || v == null) {
-          continue;
-        }
+      for (int q = 0; q < readCount && openHashes.length > 0; q++) {
+        String v = reads[q];
         long h = (long) v.hashCode() << 32;
         int at = Arrays.binarySearch(openHashes, h);
         for (int i = at < 0 ? -at - 1 : at;
@@ -1003,10 +1073,74 @@ final class Linearizability {
       }
       classWords = (firstOfClass.length + 63) / 64;
 
-      candStart = new int[n + 1];
-      cand = candidates(call, ret, n, candStart);
       pin = new boolean[n];
-      pins = pins();
+      pins = pins(settle);
+    }
+
+    /**
+     * Copies the fields of the answered operations of ranks {@code from} to {@code to - 1} from the
+     * operations into the arrays the search reads. Each stretch copies its own, in parallel.
+     * Reading the operations, each an object of its own, is most of the cost of setting a key up,
+     * and done here it is shared between all the threads instead of one per key.
+     */
+    private void fill(int from, int to) {
+      for (int r = from; r < to; r++) {
+        History.Op op = (History.Op) ops[answeredAt[r]];
+        History.Kind k = op.kind;
+        kind[r] = code(k);
+        ok[r] = op.ok;
+        expected[r] = op.expected;
+        version[r] = op.version;
+        value[r] = k == History.Kind.GET ? op.readValue : op.value;
+      }
+    }
+
+    /**
+     * The candidate lists of the ranks {@code from} to {@code to - 1}, given their {@link #lows}.
+     */
+    private Lists lists(int from, int to, int[] lo) {
+      int[] start = new int[to - from + 1];
+      return new Lists(from, start, candidates(call, lo, from, to, start));
+    }
+
+    /** The candidates of every rank, found the first time they are needed. */
+    private Range all() {
+      if (all == null) {
+        all = new Range(0, n);
+      }
+      return all;
+    }
+
+    /**
+     * The candidates of the ranks {@code from} to {@code to - 1}, a stretch between pins or every
+     * rank: {@link #lows} at once, and the lists only when a walk needs them. The forward pass has
+     * no use for the order of the lists (see {@link Stretch#forward}), and when no rank runs past
+     * more than {@link #NEAR} others it finds the candidates from lo; in most stretches it never
+     * gets stuck, and the lists are never made.
+     */
+    private final class Range {
+      final int from;
+      final int to;
+      final int[] lo;
+      private Lists lists;
+
+      Range(int from, int to) {
+        this.from = from;
+        this.to = to;
+        lo = lows(call, ret, from, to);
+      }
+
+      /** Whether every candidate of rank p is p or one of the {@link #NEAR} ranks after it. */
+      boolean near() {
+        return lo[to - from + NEAR] <= NEAR;
+      }
+
+      Lists lists() {
+        if (lists == null) {
+          lists = Search.this.lists(from, to, lo);
+        }
+        return lists;
+      }
     }
 
     private State[] stepAll(State[] from, int s) {
@@ -1083,19 +1217,26 @@ final class Linearizability {
       private final int index; // of the stretch
       private long budget; // of steps
       private final int firstOpen; // the unanswered operations before it are left out
+      private final int base; // the first rank of the candidate lists
+      private final int[] candStart;
+      private final int[] cand;
       private int handBack; // the lowest pin at which run() may return HANDED_BACK
       long steps;
       boolean aborted;
 
       /**
        * A walk over the stretch {@code index}, up to {@code end}, that may apply the unanswered
-       * operations from {@code firstOpen} on. Those before it are left out by marking them applied.
-       * Each search starts with {@link #reset}.
+       * operations from {@code firstOpen} on, with the candidate lists {@code lists} of its ranks.
+       * Those before firstOpen are left out by marking them applied. Each search starts with {@link
+       * #reset}.
        */
-      Walk(int index, int end, int firstOpen) {
+      Walk(int index, int end, int firstOpen, Lists lists) {
         this.index = index;
         this.end = end;
         this.firstOpen = firstOpen;
+        base = lists.base();
+        candStart = lists.start();
+        cand = lists.cand();
         appliedOfClass = new int[firstOfClass.length];
         leftOut = new boolean[firstOfClass.length];
         for (int c = 0; c < leftOut.length; c++) {
@@ -1193,8 +1334,8 @@ final class Linearizability {
             aborted = true;
             return FAILED;
           }
-          int at = candStart[prefix] + pos;
-          if (at < candStart[prefix + 1]) {
+          int at = candStart[prefix - base] + pos;
+          if (at < candStart[prefix - base + 1]) {
             int r = cand[at];
             if (r != prefix && inWindow(r)) {
               pos++;
@@ -1280,7 +1421,7 @@ final class Linearizability {
           } else {
             int o = framePos[depth];
             flip(o);
-            pos = candStart[prefix + 1] - candStart[prefix];
+            pos = candStart[prefix - base + 1] - candStart[prefix - base];
             needs();
             nextOpen = o + 1;
           }
@@ -1340,7 +1481,7 @@ final class Linearizability {
         failing.size = 0;
         blocked.size = 0;
         observed.clear();
-        for (int at = candStart[prefix]; at < candStart[prefix + 1]; at++) {
+        for (int at = candStart[prefix - base]; at < candStart[prefix - base + 1]; at++) {
           int r = cand[at];
           if (r != prefix && inWindow(r)) {
             continue;
@@ -1623,23 +1764,27 @@ final class Linearizability {
      * The search of one stretch, or of the whole history, done by the cheapest means that give the
      * same answer as one {@link Walk} over it.
      *
-     * <p>Most steps of a search are first moves: the first candidate that fits is placed and the
-     * search goes on, and nothing ever comes back to the configuration it left. A walk still pays
-     * for coming back: it pushes a frame, looks the configuration up, keeps a visit record when
-     * there are unanswered operations, and holds the states in an array. So the stretch is first
-     * walked forward by {@link #forward}, which makes exactly the moves a walk would make first,
-     * but keeps only one state and the window as a mask, and never applies an unanswered operation.
-     * Where no candidate fits, that walk would backtrack, or try the unanswered operations. There a
-     * walk takes over, from the last pin passed, which every linearization goes through, and hands
-     * back to the forward pass once it places a pin past the point where that got stuck.
+     * <p>Most steps of a search are first moves: a candidate that fits is placed and the search
+     * goes on, and nothing ever comes back to the configuration it left. A walk still pays for
+     * coming back: it pushes a frame, looks the configuration up, keeps a visit record when there
+     * are unanswered operations, and holds the states in an array. So the stretch is first walked
+     * forward by {@link #forward}, which keeps only one state and the window as a mask, never
+     * applies an unanswered operation, and picks the moves most likely to be right. Where no
+     * candidate fits, a walk takes over, from the last pin passed, which every linearization goes
+     * through, and hands back to the forward pass once it places a pin past the point where that
+     * got stuck.
      *
-     * <p>This gives the walk's answer. Below a pin, every way on from it starts from the same
-     * configuration, so a search from it is the search below it. If the walk below it passes, so
-     * does the stretch. If it fails and nothing was applied at the pin, the stretch fails too, and
-     * the deepest prefix reached is the same, since every search reaches the pin and a visit of it
-     * with nothing applied can reach whatever another visit can (see pins()). If something was
-     * applied there, the failure may be due to that, so one walk searches again from the last pin
-     * passed with nothing applied, without handing back, and its answer is the stretch's.
+     * <p>This gives the walk's answer, whatever moves the pass made: they are valid moves, so if
+     * the pass reaches the end, the stretch passes, and the walk searches every order from the pin
+     * it starts at. Nor does the report change: the deepest prefix of a failing search is the
+     * deepest that any order of moves from the last pin reaches, and the walk tries them all. Below
+     * a pin, every way on from it starts from the same configuration, so a search from it is the
+     * search below it. If the walk below it passes, so does the stretch. If it fails and nothing
+     * was applied at the pin, the stretch fails too, and the deepest prefix reached is the same,
+     * since every search reaches the pin and a visit of it with nothing applied can reach whatever
+     * another visit can (see pins()). If something was applied there, the failure may be due to
+     * that, so one walk searches again from the last pin passed with nothing applied, without
+     * handing back, and its answer is the stretch's.
      */
     final class Stretch {
       private final int index;
@@ -1648,6 +1793,7 @@ final class Linearizability {
       private final int end;
       private final long budget;
       private final int firstOpen;
+      private final Range range;
       private long steps;
       private Walk walk; // made when first needed, then reused
       private Walk last; // the walk the search ended in, or that left what is applied; or null
@@ -1655,17 +1801,17 @@ final class Linearizability {
       boolean aborted;
 
       // Where the forward pass stopped: the prefix it could not get past, and the last pin it
-      // placed, with the state that pin left, or -1.
+      // placed, or -1; afterPin() gives the state that pin left.
       private int stuck;
       private int lastPin;
-      private State afterLastPin;
 
       /**
        * As {@link Walk#Walk}, from ({@code from}, no window, {@code start}), within {@code budget}
        * steps.
        */
-      Stretch(int index, int from, State start, int end, long budget, int firstOpen) {
+      Stretch(int index, int from, State start, int end, long budget, int firstOpen, Range range) {
         this.index = index;
+        this.range = range;
         this.from = from;
         this.start = start;
         this.end = end;
@@ -1687,7 +1833,7 @@ final class Linearizability {
       /** Whether the stretch passed; false also if it was {@link #aborted}, as for a walk. */
       boolean run() {
         if (!forward) {
-          last = walk = new Walk(index, end, firstOpen);
+          last = walk = new Walk(index, end, firstOpen, range.lists());
           walk.reset(from, start, false, n, budget);
           boolean passed = walk.run() == PASSED;
           deepest = walk.deepest;
@@ -1708,14 +1854,14 @@ final class Linearizability {
           }
           if (lastPin >= 0) {
             prefix = lastPin + 1;
-            state = afterLastPin;
+            state = afterPin(lastPin);
             if (carry == null) {
               cleanFrom = prefix;
               cleanState = state;
             }
           }
           if (walk == null) {
-            walk = new Walk(index, end, firstOpen);
+            walk = new Walk(index, end, firstOpen, range.lists());
           }
           Walk w = walk;
           w.reset(prefix, state, carry != null, stuck, budget - steps);
@@ -1745,15 +1891,40 @@ final class Linearizability {
       }
 
       /**
-       * Makes the first moves of a walk from ({@code prefix}, no window, {@code state}) until it
-       * reaches {@link #end}, or finds no candidate that fits, or would place one so far beyond the
-       * prefix that the mask cannot hold it. Returns PASSED, HANDED_BACK when it stopped, with
-       * {@link #stuck}, {@link #lastPin} and {@link #afterLastPin} set, or FAILED if it was {@link
-       * #aborted}.
+       * Makes moves from ({@code prefix}, no window, {@code state}) until it reaches {@link #end},
+       * or finds no candidate that fits, or would place one so far beyond the prefix that the mask
+       * cannot hold it. Returns PASSED, HANDED_BACK when it stopped, with {@link #stuck} and {@link
+       * #lastPin} set, or FAILED if it was {@link #aborted}.
+       *
+       * <p>Any valid moves will do: where it gets stuck, a walk searches every order from the last
+       * pin. So it takes those most likely to be right. A read or a conflict that fits leaves the
+       * state as it is, so it can go first in any linearization that places it later, and is placed
+       * at once. Otherwise the successful write that comes first in the log goes next, since
+       * versions are log indexes (see {@link #logOrder}); if it does not fit, any write that fits.
+       * Since the order of the candidates does not matter, they are found from lo when no rank runs
+       * past more than {@link #NEAR} others (see {@link Range}).
+       *
+       * <p>The state is always one with a known version: the pass starts from no value or after a
+       * pin, and applies no unanswered operation. So it is kept as a value and a version, and the
+       * fit of each operation is a few comparisons, as in {@link Linearizability#next}, with no
+       * state made.
        */
       private int forward(int prefix, State state) {
         lastPin = -1;
+        if (!state.known()) {
+          stuck = prefix; // a walk takes it from here
+          return HANDED_BACK;
+        }
+        String now = state.value();
+        long at = state.version();
         long window = 0; // bit i: rank prefix + 1 + i is placed
+        int base = range.from;
+        int[] lo = range.lo;
+        boolean near = range.near();
+        Lists lists = near ? null : range.lists();
+        int[] nearby = new int[NEAR + 1];
+        byte get = code(History.Kind.GET);
+        byte put = code(History.Kind.PUT);
         while (prefix < end) {
           if ((++steps & 1023) == 0 && (steps > budget || stopAt.get() < index)) {
             aborted = true;
@@ -1761,33 +1932,79 @@ final class Linearizability {
             return FAILED;
           }
           int r = -1;
-          State next = null;
-          for (int at = candStart[prefix], to = candStart[prefix + 1]; at < to; at++) {
-            int c = cand[at];
+          int write = -1; // the successful write that comes first in the log
+          // The candidates: cand[from] to cand[to - 1], in no particular order.
+          int[] cand;
+          int from;
+          int to;
+          if (near) {
+            int p = prefix - base;
+            nearby[0] = prefix;
+            int k = 1;
+            nearby[k] = prefix + 1;
+            k += lo[p + 1] <= p ? 1 : 0;
+            nearby[k] = prefix + 2;
+            k += lo[p + 2] <= p ? 1 : 0;
+            nearby[k] = prefix + 3;
+            k += lo[p + 3] <= p ? 1 : 0;
+            nearby[k] = prefix + 4;
+            k += lo[p + 4] <= p ? 1 : 0;
+            cand = nearby;
+            from = 0;
+            to = k;
+          } else {
+            cand = lists.cand();
+            from = lists.start()[prefix - base];
+            to = lists.start()[prefix - base + 1];
+          }
+          for (int i = from; i < to; i++) {
+            int c = cand[i];
             int off = c - prefix - 1;
             if (off >= 0 && off < 64 && (window & (1L << off)) != 0) {
               continue;
             }
-            next =
-                Linearizability.next(
-                    state, kindOf(c), false, ok[c], expected[c], version[c], value[c]);
-            if (next != null) {
+            boolean read = kind[c] == get;
+            if (!read && ok[c]) {
+              if (write < 0 || logOrder(c, write) < 0) {
+                write = c;
+              }
+              continue;
+            }
+            // A read sees the value and its version; a conflict reports the version it found,
+            // which is not the one it expected.
+            boolean fits =
+                version[c] == at && (read ? Objects.equals(now, value[c]) : expected[c] != at);
+            if (fits) {
               r = c;
               break;
+            }
+          }
+          if (r < 0 && write >= 0 && applies(write, at)) {
+            r = write;
+          }
+          for (int i = from; i < to && r < 0; i++) { // else any write that fits
+            int c = cand[i];
+            int off = c - prefix - 1;
+            boolean placed = off >= 0 && off < 64 && (window & (1L << off)) != 0;
+            if (!placed && kind[c] != get && ok[c] && applies(c, at)) {
+              r = c;
             }
           }
           if (r < 0 || r - prefix - 1 >= 64) {
             stuck = prefix;
             return HANDED_BACK;
           }
-          state = next;
+          if (kind[r] != get && ok[r]) {
+            boolean isPut = kind[r] == put;
+            now = isPut ? value[r] : null;
+            at = isPut ? version[r] : 0; // a delete leaves no value, as State.ABSENT
+          }
           if (r == prefix) {
             int placed = Long.numberOfTrailingZeros(~window); // the ranks after it, placed before
             prefix += 1 + placed;
             window = placed >= 63 ? 0 : window >>> (placed + 1);
             if (pin[r]) {
               lastPin = r;
-              afterLastPin = state;
             }
           } else {
             window |= 1L << (r - prefix - 1);
@@ -1796,6 +2013,34 @@ final class Linearizability {
         stuck = prefix;
         return PASSED;
       }
+
+      /**
+       * Whether the successful answered write {@code w} applies to a state of known version {@code
+       * at}, as {@link Linearizability#next} decides: its condition holds, and a put writes a
+       * higher version, while a delete reports the version it removed.
+       */
+      private boolean applies(int w, long at) {
+        long e = expected[w];
+        if (e != -1 && e != at) {
+          return false;
+        }
+        long v = version[w];
+        return kind[w] == code(History.Kind.PUT) ? at == -1 || v > at : v == at;
+      }
+    }
+
+    /**
+     * The order in which two successful answered writes would come in the log: by version, and a
+     * delete, which reports the version it removed, just after the put that wrote it. Only a guess
+     * at which write to try first; any order gives the same answer.
+     */
+    private int logOrder(int a, int b) {
+      int byVersion = Long.compare(version[a], version[b]);
+      if (byVersion != 0) {
+        return byVersion;
+      }
+      return Boolean.compare(
+          kind[a] == code(History.Kind.DELETE), kind[b] == code(History.Kind.DELETE));
     }
 
     /** Empty if linearizable, else what the search could not get past. */
@@ -1829,7 +2074,9 @@ final class Linearizability {
     private int search() {
       int[] bounds = stretches();
       int k = bounds.length - 1;
-      if (k > 1) {
+      if (k <= 1) {
+        fill(0, n);
+      } else {
         Stretch[] walks = new Stretch[k];
         boolean[] passed = new boolean[k];
         boolean[] restricted = new boolean[k]; // passed without the earlier unanswered operations
@@ -1844,11 +2091,13 @@ final class Linearizability {
                   long budget =
                       i == 0 ? Long.MAX_VALUE : STEPS * (bounds[i + 1] - bounds[i] + opens);
                   int fresh = i == 0 ? 0 : firstCalledAfter(ret[bounds[i] - 1]);
-                  Stretch w = new Stretch(i, bounds[i], start, bounds[i + 1], budget, fresh);
+                  fill(bounds[i], bounds[i + 1]);
+                  Range range = new Range(bounds[i], bounds[i + 1]);
+                  Stretch w = new Stretch(i, bounds[i], start, bounds[i + 1], budget, fresh, range);
                   boolean pass = w.run();
                   restricted[i] = pass && fresh > 0;
                   if (!pass && fresh > 0 && !w.aborted) {
-                    w = new Stretch(i, bounds[i], start, bounds[i + 1], budget, 0);
+                    w = new Stretch(i, bounds[i], start, bounds[i + 1], budget, 0, range);
                     pass = w.run();
                   }
                   walks[i] = w;
@@ -1863,6 +2112,7 @@ final class Linearizability {
         for (int i = 0; i < k && joins; i++) {
           if (!passed[i]) {
             if (clean && !walks[i].aborted) {
+              stuckIn = walks[i].range;
               return walks[i].deepest;
             }
             joins = false;
@@ -1879,7 +2129,8 @@ final class Linearizability {
           return -1;
         }
       }
-      Stretch w = new Stretch(0, 0, State.ABSENT, n, Long.MAX_VALUE, 0);
+      stuckIn = all();
+      Stretch w = new Stretch(0, 0, State.ABSENT, n, Long.MAX_VALUE, 0, stuckIn);
       return w.run() ? -1 : w.deepest;
     }
 
@@ -1900,7 +2151,13 @@ final class Linearizability {
 
     /** The one state a pin leaves. */
     private State afterPin(int p) {
-      return kindOf(p) == History.Kind.DELETE ? State.ABSENT : new State(value[p], version[p]);
+      // Read from the operation: rank p is in the stretch before, which another thread copies.
+      History.Op op = (History.Op) ops[answeredAt[p]];
+      return switch (op.kind) {
+        case DELETE -> State.ABSENT;
+        case PUT -> new State(op.value, op.version);
+        case GET -> new State(op.readValue, op.version);
+      };
     }
 
     /** The first unanswered operation called after {@code t}, or {@link #opens} if none is. */
@@ -1949,12 +2206,18 @@ final class Linearizability {
      * success, the history is not linearizable, and the search stops instead of trying every
      * alternative below the pin, which could only lead back to it.
      */
-    private int pins() {
+    private int pins(boolean[] settle) {
+      // Rank p runs alone if no higher rank is called before it returns, which is a look at the
+      // earliest call above it, and no lower rank returns after it is called, which is a look at
+      // the rank below, since returns grow with rank. So pins need no candidate lists, and the
+      // lists of the stretches between them can be made in parallel.
       int count = 0;
-      for (int p = 0; p < n; p++) {
-        boolean lone = candStart[p + 1] - candStart[p] == 1 && (p == 0 || call[p] > ret[p - 1]);
-        History.Kind k = kindOf(p);
-        if (lone && (k == History.Kind.GET || ok[p])) {
+      long earliest = Long.MAX_VALUE; // the earliest call above p
+      for (int p = n - 1; p >= 0; p--) {
+        long c = call[p];
+        boolean lone = earliest >= ret[p] && (p == 0 || c > ret[p - 1]);
+        earliest = Math.min(earliest, c);
+        if (lone && settle[p]) {
           pin[p] = true;
           count++;
         }
@@ -1981,7 +2244,11 @@ final class Linearizability {
       // rank is called after that return, so it is not shown, and its call is later than the
       // return of rank deepest - 8, which bounds the earliest call shown from below.
       Ints later = new Ints();
-      for (int at = candStart[deepest]; at < candStart[deepest + 1]; at++) {
+      Lists lists = stuckIn.lists();
+      int[] candStart = lists.start();
+      int[] cand = lists.cand();
+      int p = deepest - lists.base();
+      for (int at = candStart[p]; at < candStart[p + 1]; at++) {
         if (cand[at] > deepest) {
           later.add(cand[at]);
         }

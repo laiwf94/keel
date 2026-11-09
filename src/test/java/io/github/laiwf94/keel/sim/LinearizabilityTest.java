@@ -6,6 +6,7 @@ import static org.junit.jupiter.api.Assertions.assertTimeout;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Comparator;
 import java.util.List;
@@ -373,6 +374,31 @@ class LinearizabilityTest {
         int[] want = Arrays.stream(expected, 0, size).mapToInt(Integer::intValue).toArray();
         assertEquals(Arrays.toString(want), Arrays.toString(got), "round " + round + " at " + p);
       }
+      // A range that no operation runs across, as between pins, has the same lists on its own.
+      List<Integer> cuts = new ArrayList<>(); // 0, n, and every rank called after all below return
+      long earliest = Long.MAX_VALUE;
+      for (int b = n; b >= 0; b--) {
+        if (b == 0 || b == n || earliest > ret[b - 1]) {
+          cuts.add(0, b);
+        }
+        if (b > 0) {
+          earliest = Math.min(earliest, call[b - 1]);
+        }
+      }
+      for (int t = 0; t < 20; t++) {
+        int x = rnd.nextInt(cuts.size());
+        int y = rnd.nextInt(cuts.size());
+        int from = cuts.get(Math.min(x, y));
+        int to = cuts.get(Math.max(x, y));
+        int[] start = new int[to - from + 1];
+        int[] part = Linearizability.candidates(call, ret, from, to, start);
+        for (int p = from; p < to; p++) {
+          assertEquals(
+              Arrays.toString(Arrays.copyOfRange(cand, candStart[p], candStart[p + 1])),
+              Arrays.toString(Arrays.copyOfRange(part, start[p - from], start[p - from + 1])),
+              "round " + round + ", ranks " + from + " to " + to + ", at " + p);
+        }
+      }
     }
   }
 
@@ -404,9 +430,18 @@ class LinearizabilityTest {
         idx[i] = v;
       }
       Arrays.sort(boxed, Comparator.comparingLong(v -> key[v])); // stable
+      long min = Long.MAX_VALUE;
+      long max = Long.MIN_VALUE;
+      for (int v : idx) {
+        min = Math.min(min, key[v]);
+        max = Math.max(max, key[v]);
+      }
+      // sortedBy packs the key above the index where they fit in a long, and else uses sortBy.
+      int[] packed = Linearizability.sortedBy(idx, n, key, min, max);
       Linearizability.sortBy(idx, key);
       for (int i = 0; i < n; i++) {
         assertEquals((int) boxed[i], idx[i], "round " + round + " at " + i);
+        assertEquals((int) boxed[i], packed[i], "sortedBy, round " + round + " at " + i);
       }
     }
   }
