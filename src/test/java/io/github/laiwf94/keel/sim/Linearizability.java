@@ -640,6 +640,9 @@ final class Linearizability {
   /** How far back {@link #candidates} looks without a branch; see there. */
   private static final int NEAR = 4;
 
+  /** The ranks after the prefix that the forward pass's window can hold placed. */
+  private static final int WINDOW = 64;
+
   /**
    * The operations running at the return of each of the {@code n} answered operations of a key,
    * given by {@code call} and {@code ret} in return order: the ranks running at the return of rank
@@ -708,6 +711,25 @@ final class Linearizability {
     Arrays.fill(lo, n, n + NEAR, Integer.MAX_VALUE); // past the last rank: never a candidate
     lo[n + NEAR] = farthest;
     return lo;
+  }
+
+  /**
+   * The highest candidate of each of the {@code n} ranks of a range, counted from its first, given
+   * its {@link #lows}: out[p] is the highest r with lo[r] <= p, which is p or a rank after it, and
+   * it never falls as p grows. The candidates of p are p and the ranks r after it up to out[p] with
+   * lo[r] <= p.
+   */
+  static int[] reach(int[] lo, int n) {
+    int[] out = new int[n];
+    for (int r = 0; r < n; r++) {
+      out[lo[r]] = r; // the highest so far with this lo, as r grows
+    }
+    int highest = 0;
+    for (int p = 0; p < n; p++) {
+      highest = Math.max(highest, out[p]);
+      out[p] = highest;
+    }
+    return out;
   }
 
   /** The lists of {@link #candidates(long[], long[], int, int, int[])}, given {@link #lows}. */
@@ -909,6 +931,9 @@ final class Linearizability {
     private static final int TABLE = 16;
 
     private static final int LARGE_TABLE = 1024;
+
+    /** The fewest ranks a walk makes candidate lists for at a time; see {@link Walk#cover}. */
+    private static final int LISTS = 256;
 
     /** The frames a walk's stack starts with. */
     private static final int FRAMES = 16;
@@ -1142,20 +1167,27 @@ final class Linearizability {
     /**
      * The candidates of the ranks {@code from} to {@code to - 1}, a stretch between pins or every
      * rank: {@link #lows} at once, and the lists only when a walk needs them. The forward pass has
-     * no use for the order of the lists (see {@link Stretch#forward}), and when no rank runs past
-     * more than {@link #NEAR} others it finds the candidates from lo; in most stretches it never
-     * gets stuck, and the lists are never made.
+     * no use for the order of the lists (see {@link Stretch#forward}) and finds the candidates from
+     * lo, and from {@link #reach} when some rank runs past more than {@link #NEAR} others; in most
+     * stretches it never gets stuck, and the lists are never made. A walk makes the lists of the
+     * ranks it gets to itself (see {@link Walk#cover}); these are for the report. Making them for
+     * every stretch where the pass needed them or a walk took over cost 8% of the checker's CPU
+     * time on the 100,000-operation linearizable history of the benchmark.
      */
     private final class Range {
       final int from;
       final int to;
       final int[] lo;
+      // When some rank runs past more than NEAR others: reach[p - from], the highest candidate of
+      // rank p, so that the forward pass finds the candidates of p among the ranks up to it.
+      final int[] reach;
       private Lists lists;
 
       Range(int from, int to) {
         this.from = from;
         this.to = to;
         lo = lows(call, ret, from, to);
+        reach = near() ? null : reach(lo, to - from);
       }
 
       /** Whether every candidate of rank p is p or one of the {@link #NEAR} ranks after it. */
@@ -1165,6 +1197,7 @@ final class Linearizability {
 
       Lists lists() {
         if (lists == null) {
+
           lists = Search.this.lists(from, to, lo);
         }
         return lists;
@@ -1245,26 +1278,24 @@ final class Linearizability {
       private final int index; // of the stretch
       private long budget; // of steps
       private final int firstOpen; // the unanswered operations before it are left out
-      private final int base; // the first rank of the candidate lists
-      private final int[] candStart;
-      private final int[] cand;
+      // The candidate lists of the ranks from base to listEnd - 1, made as the walk gets there.
+      private int base;
+      private int listEnd;
+      private int[] candStart;
+      private int[] cand;
       private int handBack; // the lowest pin at which run() may return HANDED_BACK
       long steps;
       boolean aborted;
 
       /**
        * A walk over the stretch {@code index}, up to {@code end}, that may apply the unanswered
-       * operations from {@code firstOpen} on, with the candidate lists {@code lists} of its ranks.
-       * Those before firstOpen are left out by marking them applied. Each search starts with {@link
-       * #reset}.
+       * operations from {@code firstOpen} on. Those before firstOpen are left out by marking them
+       * applied. Each search starts with {@link #reset}.
        */
-      Walk(int index, int end, int firstOpen, Lists lists) {
+      Walk(int index, int end, int firstOpen) {
         this.index = index;
         this.end = end;
         this.firstOpen = firstOpen;
-        base = lists.base();
-        candStart = lists.start();
-        cand = lists.cand();
         appliedOfClass = new int[firstOfClass.length];
         leftOut = new boolean[firstOfClass.length];
         for (int c = 0; c < leftOut.length; c++) {
@@ -1273,6 +1304,30 @@ final class Linearizability {
         applied = new long[(opens + 63) / 64];
         frameSeen = opens == 0 ? null : new Seen[FRAMES];
         leaveOutEarlyOpens();
+      }
+
+      /**
+       * Makes the candidate lists of the ranks from {@code from} to past {@code need}: at least
+       * {@link #LISTS} more, or twice as many as from {@code from} to need, up to the next rank
+       * after a pin or {@link #end}, which no list crosses (see {@link #candidates(long[], long[],
+       * int, int, int[])}); {@code from} is the start of the stretch or the rank after a pin.
+       *
+       * <p>A walk starts where the forward pass got stuck and mostly hands back a few dozen ranks
+       * later, so lists made for the whole stretch were mostly never read: on the 100,000-operation
+       * linearizable history of the benchmark, walks took over in 27 of 48 stretches, and now make
+       * lists for about 9,000 ranks in all instead of about 55,000.
+       */
+      private void cover(int from, int need) {
+        int to = Math.max(need + 1, from + LISTS);
+        to = Math.min(end, to + (need - from));
+        while (to < end && !pin[to - 1]) {
+          to++;
+        }
+        int[] start = new int[to - from + 1];
+        cand = candidates(call, ret, from, to, start);
+        candStart = start;
+        base = from;
+        listEnd = to;
       }
 
       private void leaveOutEarlyOpens() {
@@ -1293,6 +1348,9 @@ final class Linearizability {
         this.from = from;
         this.handBack = handBack;
         this.budget = budget;
+        if (cand == null || from < base || from >= listEnd) {
+          cover(from, from);
+        }
         prefix = from;
         deepest = from;
         window = NONE;
@@ -1357,6 +1415,9 @@ final class Linearizability {
         while (true) {
           if (prefix >= end) {
             return PASSED;
+          }
+          if (prefix >= listEnd) {
+            cover(base, prefix);
           }
           if ((++steps & 1023) == 0 && (steps > budget || stopAt.get() < index)) {
             aborted = true;
@@ -1861,7 +1922,7 @@ final class Linearizability {
       /** Whether the stretch passed; false also if it was {@link #aborted}, as for a walk. */
       boolean run() {
         if (!forward) {
-          last = walk = new Walk(index, end, firstOpen, range.lists());
+          last = walk = new Walk(index, end, firstOpen);
           walk.reset(from, start, false, n, budget);
           boolean passed = walk.run() == PASSED;
           deepest = walk.deepest;
@@ -1889,7 +1950,7 @@ final class Linearizability {
             }
           }
           if (walk == null) {
-            walk = new Walk(index, end, firstOpen, range.lists());
+            walk = new Walk(index, end, firstOpen);
           }
           Walk w = walk;
           w.reset(prefix, state, carry != null, stuck, budget - steps);
@@ -1929,8 +1990,11 @@ final class Linearizability {
        * state as it is, so it can go first in any linearization that places it later, and is placed
        * at once. Otherwise the successful write that comes first in the log goes next, since
        * versions are log indexes (see {@link #logOrder}); if it does not fit, any write that fits.
-       * Since the order of the candidates does not matter, they are found from lo when no rank runs
-       * past more than {@link #NEAR} others (see {@link Range}).
+       * Since the order of the candidates does not matter, they are found from lo, with no lists
+       * made (see {@link Range}): among the {@link #NEAR} ranks after the prefix when no rank runs
+       * past more than NEAR others, else among the ranks up to the prefix's {@link Range#reach}, as
+       * far as the window holds. A candidate beyond the window could not be placed, so leaving it
+       * out only changes which of the writes that fit is tried, never whether the pass is right.
        *
        * <p>The state is always one with a known version: the pass starts from no value or after a
        * pin, and applies no unanswered operation. So it is kept as a value and a version, and the
@@ -1949,8 +2013,8 @@ final class Linearizability {
         int base = range.from;
         int[] lo = range.lo;
         boolean near = range.near();
-        Lists lists = near ? null : range.lists();
-        int[] nearby = new int[NEAR + 1];
+        int[] reach = range.reach;
+        int[] nearby = new int[near ? NEAR + 1 : WINDOW + 1];
         byte get = code(History.Kind.GET);
         byte put = code(History.Kind.PUT);
         while (prefix < end) {
@@ -1981,9 +2045,19 @@ final class Linearizability {
             from = 0;
             to = k;
           } else {
-            cand = lists.cand();
-            from = lists.start()[prefix - base];
-            to = lists.start()[prefix - base + 1];
+            // The candidates the window can place: p, and the ranks after it up to its highest
+            // candidate, or the last the window holds, that are called before p returns.
+            int p = prefix - base;
+            int last = Math.min(reach[p], p + WINDOW);
+            nearby[0] = prefix;
+            int k = 1;
+            for (int q = p + 1; q <= last; q++) {
+              nearby[k] = base + q;
+              k += lo[q] <= p ? 1 : 0;
+            }
+            cand = nearby;
+            from = 0;
+            to = k;
           }
           for (int i = from; i < to; i++) {
             int c = cand[i];
@@ -2214,9 +2288,11 @@ final class Linearizability {
       }
       Ints bounds = new Ints();
       bounds.add(0);
-      for (int p = 0; p < n - STRETCH; p++) {
-        if (pin[p] && p + 1 - bounds.items[bounds.size - 1] >= STRETCH) {
+      // The first pin at least STRETCH ranks past the last bound; the ranks before it are skipped.
+      for (int p = STRETCH - 1; p < n - STRETCH; p++) {
+        if (pin[p]) {
           bounds.add(p + 1);
+          p += STRETCH - 1;
         }
       }
       bounds.add(n);
@@ -2243,12 +2319,12 @@ final class Linearizability {
       long earliest = Long.MAX_VALUE; // the earliest call above p
       for (int p = n - 1; p >= 0; p--) {
         long c = call[p];
-        boolean lone = earliest >= ret[p] && (p == 0 || c > ret[p - 1]);
+        // Without branches: which way they go depends on the history.
+        int isPin =
+            (earliest >= ret[p] ? 1 : 0) & (p == 0 || c > ret[p - 1] ? 1 : 0) & (settle[p] ? 1 : 0);
         earliest = Math.min(earliest, c);
-        if (lone && settle[p]) {
-          pin[p] = true;
-          count++;
-        }
+        pin[p] = isPin == 1;
+        count += isPin;
       }
       return count;
     }

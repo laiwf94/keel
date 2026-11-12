@@ -334,7 +334,8 @@ class LinearizabilityTest {
   /**
    * The candidate lists are, for each return, the operations running at it in call order, ties by
    * rank, as a direct look at every pair finds them: with a few clients, with many, and with some
-   * operations running across hundreds of returns, which the lists reach by a slower path.
+   * operations running across hundreds of returns, which the lists reach by a slower path. The
+   * reach of each rank is the highest in its list.
    */
   @Test
   void candidateListsAreTheOperationsRunningAtEachReturn() {
@@ -392,11 +393,16 @@ class LinearizabilityTest {
         int to = cuts.get(Math.max(x, y));
         int[] start = new int[to - from + 1];
         int[] part = Linearizability.candidates(call, ret, from, to, start);
+        // The forward pass finds the candidates of p among the ranks up to its reach.
+        int[] reach = Linearizability.reach(Linearizability.lows(call, ret, from, to), to - from);
         for (int p = from; p < to; p++) {
           assertEquals(
               Arrays.toString(Arrays.copyOfRange(cand, candStart[p], candStart[p + 1])),
               Arrays.toString(Arrays.copyOfRange(part, start[p - from], start[p - from + 1])),
               "round " + round + ", ranks " + from + " to " + to + ", at " + p);
+          int highest =
+              Arrays.stream(part, start[p - from], start[p - from + 1]).max().orElseThrow();
+          assertEquals(highest - from, reach[p - from], "round " + round + ", reach of " + p);
         }
       }
     }
