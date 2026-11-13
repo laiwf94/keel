@@ -18,9 +18,20 @@ import java.util.function.Supplier;
  * Times {@link Linearizability} against {@link LinearizabilityReference}, the search it replaced,
  * on generated histories of 10,000 and 100,000 operations and on histories from the simulator. Run
  * it with {@code ./gradlew linearizabilityBenchmark}, or with {@code --args=--simulator} for only
- * the simulator's histories; it prints a Markdown table. Each case is run after a warm-up and the
- * median of several runs is reported. The test JVM's 1 GiB heap applies, allocated in full from the
- * start.
+ * the simulator's histories; it prints a Markdown table. Each case is run after a warm-up and timed
+ * for at least {@link #TIMED_NANOS} and {@link Case#runs} runs; the median wall time and the mean
+ * process CPU time per history are reported. The test JVM's 1 GiB heap applies, allocated in full
+ * from the start.
+ *
+ * <p>Each checker is timed on each case in {@link #DEFAULT_JVMS} JVMs, the two checkers taking
+ * turns, or as many as {@code --jvms N} asks for. A cell gives the median of the JVMs' medians and,
+ * in brackets, the lowest and highest. Eleven runs in one JVM swung by up to a quarter from one
+ * benchmark to the next on a shared 4-core machine, which was more than the margin the checker's
+ * time budget is judged by; most of the swing is between JVMs (where the JIT puts its code, which
+ * cores the threads land on), not between runs in one, so more runs alone do not settle it. Below
+ * the table, {@link #budget} compares each 100,000-operation row with the old search's
+ * 10,000-operation row of the same shape and says whether it is within that time: only when every
+ * JVM agrees, and otherwise that the ranges overlap.
  *
  * <p>Each checker is timed on each case in a JVM of its own, started with the same options and
  * classpath. The two used to take turns in one JVM, and each was then timed in the other's wake: on
@@ -44,6 +55,14 @@ final class LinearizabilityBenchmark {
 
   /** The least time a warm-up takes, in a JVM that has run nothing else; see {@link #time}. */
   private static final long WARMUP_NANOS = 2_000_000_000L;
+
+  /** The least time the timed runs of a case take in one JVM, and the most runs they take. */
+  private static final long TIMED_NANOS = 2_000_000_000L;
+
+  private static final int MAX_RUNS = 1_000;
+
+  /** The JVMs each checker is timed in on each case, unless {@code --jvms} says otherwise. */
+  static final int DEFAULT_JVMS = 3;
 
   private static boolean fast(List<History.Op> ops) {
     return Linearizability.check(ops).isEmpty();
@@ -70,24 +89,120 @@ final class LinearizabilityBenchmark {
       int checker = Integer.parseInt(args[one + 2]);
       List<List<History.Op>> hs = c.histories().get();
       long ops = hs.stream().mapToLong(List::size).sum() / hs.size();
-      System.out.println(RESULT + ops + " " + time(c, hs, CHECKERS.get(checker)));
+      Timing t = time(c, hs, CHECKERS.get(checker));
+      System.out.println(
+          RESULT + ops + " " + (t == null ? "oom" : t.wallNanos() + " " + t.cpuNanos()));
       return;
     }
-    System.out.println("| histories | operations | answer | reference | new |");
-    System.out.println("|---|---:|---|---:|---:|");
+    int at = flags.indexOf("--jvms");
+    int jvms = at >= 0 ? Integer.parseInt(args[at + 1]) : DEFAULT_JVMS;
+    if (jvms < 1) {
+      throw new IllegalArgumentException("--jvms must be at least 1");
+    }
+    String[] childArgs = withoutJvms(args);
+    System.out.printf(
+        "Median wall time and mean process CPU time per history over at least %d s of timed runs"
+            + " in each JVM; %d JVMs per checker, median [lowest, highest].%n%n",
+        TIMED_NANOS / 1_000_000_000L, jvms);
+    System.out.println(
+        "| histories | operations | answer | reference | reference CPU | new | new CPU |");
+    System.out.println("|---|---:|---|---:|---:|---:|---:|");
+    List<Spread[]> rows = new ArrayList<>();
     for (int i = 0; i < cases.size(); i++) {
       Case c = cases.get(i);
-      String[] times = new String[2];
+      long[][][] t = new long[2][2][jvms];
+      boolean[] oom = new boolean[2];
       long ops = 0;
-      for (int k = 0; k < 2; k++) {
-        String[] result = inChild(args, i, k).split(" ", 2);
-        ops = Long.parseLong(result[0]);
-        times[k] = result[1];
+      for (int j = 0; j < jvms; j++) {
+        for (int k = 0; k < 2; k++) {
+          if (oom[k]) {
+            continue;
+          }
+          String[] result = inChild(childArgs, i, k).split(" ", 3);
+          ops = Long.parseLong(result[0]);
+          if (result[1].equals("oom")) {
+            oom[k] = true;
+          } else {
+            t[k][0][j] = Long.parseLong(result[1]);
+            t[k][1][j] = Long.parseLong(result[2]);
+          }
+        }
       }
+      Spread[] row = new Spread[4];
+      for (int k = 0; k < 2; k++) {
+        for (int m = 0; m < 2; m++) {
+          row[2 * k + m] = oom[k] ? null : Spread.of(t[k][m]);
+        }
+      }
+      rows.add(row);
       System.out.printf(
-          "| %s | %,d | %s | %s | %s |%n",
-          c.name(), ops, c.linearizable() ? "linearizable" : "one stale read", times[0], times[1]);
+          "| %s | %,d | %s | %s | %s | %s | %s |%n",
+          c.name(),
+          ops,
+          c.linearizable() ? "linearizable" : "one stale read",
+          cell(row[0]),
+          cell(row[1]),
+          cell(row[2]),
+          cell(row[3]));
     }
+    if (!flags.contains("--simulator")) {
+      System.out.println();
+      // Rows 3 and 4 are rows 0 and 1 with ten times the operations.
+      System.out.println("- linearizable: " + budget(rows.get(3)[2], rows.get(0)[0]));
+      System.out.println("- one stale read: " + budget(rows.get(4)[2], rows.get(1)[0]));
+    }
+  }
+
+  private static String[] withoutJvms(String[] args) {
+    List<String> out = new ArrayList<>(Arrays.asList(args));
+    int at = out.indexOf("--jvms");
+    if (at >= 0) {
+      out.subList(at, Math.min(at + 2, out.size())).clear();
+    }
+    return out.toArray(new String[0]);
+  }
+
+  /** The median, lowest and highest of a checker's per-JVM medians on one case, in nanoseconds. */
+  record Spread(long median, long low, long high) {
+    static Spread of(long[] values) {
+      long[] v = values.clone();
+      Arrays.sort(v);
+      return new Spread(v[v.length / 2], v[0], v[v.length - 1]);
+    }
+  }
+
+  private static String cell(Spread s) {
+    if (s == null) {
+      return "out of memory";
+    }
+    if (s.low() == s.high()) {
+      return ms(s.median());
+    }
+    return ms(s.median()) + " [" + ms(s.low()) + ", " + ms(s.high()) + "]";
+  }
+
+  static String ms(long nanos) {
+    double ms = nanos / 1e6;
+    return ms < 10 ? String.format("%.2f ms", ms) : String.format("%,.0f ms", ms);
+  }
+
+  /**
+   * Whether the new checker's wall time on a 100,000-operation row, {@code longer}, is within the
+   * old search's on the 10,000-operation row of the same shape, {@code budget}: within if the
+   * slowest JVM of the one was no slower than the fastest of the other, over if the fastest was
+   * slower than the slowest, and otherwise not settled.
+   */
+  static String budget(Spread longer, Spread budget) {
+    String ratio = String.format("%.2fx the budget", (double) longer.median() / budget.median());
+    String times =
+        "new at 100,000 " + ms(longer.median()) + ", old at 10,000 " + ms(budget.median());
+    if (longer.high() <= budget.low()) {
+      return "within the budget (" + times + ", " + ratio + ", every JVM)";
+    }
+    if (longer.low() > budget.high()) {
+      return "over the budget (" + times + ", " + ratio + ", every JVM)";
+    }
+    return "not settled, the ranges overlap (" + times + ", " + ratio + ")";
   }
 
   /**
@@ -189,41 +304,63 @@ final class LinearizabilityBenchmark {
         25);
   }
 
+  /** A checker's median wall time and mean process CPU time per history in one JVM. */
+  record Timing(long wallNanos, long cpuNanos) {}
+
   /**
-   * Median wall time per history for {@code checker}, after the warm-up, or why it could not
-   * finish.
+   * Median wall and mean process CPU time per history for {@code checker}, after the warm-up, or
+   * null if it ran out of memory. The timed runs last at least {@link #TIMED_NANOS} and {@link
+   * Case#runs} runs, and at most {@link #MAX_RUNS} runs.
    *
    * <p>The warm-up also lasts at least {@link #WARMUP_NANOS}. Taking turns, each case was warmed by
    * the cases before it; in a JVM of its own, three rounds of a few milliseconds each passed with
    * no compilation before the compiler had got to the hot loops, and the old search's
    * 10,000-operation stale read read 9.4 ms against 3.6 to 4.4 ms after a long warm-up.
+   *
+   * <p>CPU time is the whole process's, so it includes the checker's worker threads, and also the
+   * collector's and, if it wakes, the compiler's. It is read once around all the timed runs, not
+   * around each: on Linux the JDK counts it in clock ticks of 10 ms, longer than most runs.
    */
-  private static String time(
+  private static Timing time(
       Case c, List<List<History.Op>> hs, Predicate<List<History.Op>> checker) {
     CompilationMXBean jit = ManagementFactory.getCompilationMXBean();
-    long[] runs = new long[c.runs()];
+    com.sun.management.OperatingSystemMXBean os =
+        (com.sun.management.OperatingSystemMXBean) ManagementFactory.getOperatingSystemMXBean();
+    long[] wall = new long[MAX_RUNS];
     boolean warming = true;
     int warmups = 0;
     int r = 0;
     long began = System.nanoTime();
-    while (r < c.runs()) {
+    long timedFrom = 0;
+    long cpuFrom = 0;
+    while (r < MAX_RUNS
+        && (warming || r < c.runs() || System.nanoTime() - timedFrom < TIMED_NANOS)) {
       long compiling = jit.getTotalCompilationTime();
       long start = System.nanoTime();
       if (!finishes(checker, c, hs)) {
-        return "out of memory";
+        return null;
       }
+      long end = System.nanoTime();
       if (warming) {
         warmups++;
         boolean settled = jit.getTotalCompilationTime() == compiling;
-        boolean longEnough = System.nanoTime() - began >= WARMUP_NANOS;
+        boolean longEnough = end - began >= WARMUP_NANOS;
         warming = !longEnough || (!(warmups >= MIN_WARMUP && settled) && warmups < MAX_WARMUP);
+        timedFrom = System.nanoTime();
+        cpuFrom = os.getProcessCpuTime();
       } else {
-        runs[r++] = (System.nanoTime() - start) / hs.size();
+        wall[r] = (end - start) / hs.size();
+        r++;
       }
     }
-    Arrays.sort(runs);
-    double ms = runs[runs.length / 2] / 1e6;
-    return ms < 10 ? String.format("%.2f ms", ms) : String.format("%,.0f ms", ms);
+    long cpu = (os.getProcessCpuTime() - cpuFrom) / ((long) r * hs.size());
+    return new Timing(median(wall, r), cpu);
+  }
+
+  static long median(long[] values, int n) {
+    long[] v = Arrays.copyOf(values, n);
+    Arrays.sort(v);
+    return v[n / 2];
   }
 
   /**
