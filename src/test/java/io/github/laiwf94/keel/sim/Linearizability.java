@@ -10,6 +10,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.ForkJoinTask;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.IntStream;
 import java.util.stream.Stream;
@@ -581,60 +582,35 @@ final class Linearizability {
   }
 
   /**
-   * The first {@code n} of {@code idx} sorted by {@code key[idx[i]]}, keeping equal keys in their
-   * order, given the least and greatest of those keys. Where the range of the keys and the indexes
-   * fit in one long together, each is packed into one, the key above the index, and the longs are
-   * sorted by a least significant digit radix sort over the key's bits. That reads each key once
-   * instead of once per pass through an index, and the index below breaks ties by input order.
-   * Otherwise it falls back to {@link #sortBy}.
+   * The first {@code n} of {@code from} sorted, where each holds a key above {@code low} bits of
+   * index and the keys, less the least of them, {@code base >>> low}, have {@code bits} bits: a
+   * least significant digit radix sort over those bits, in as few passes of at most 13 bits as it
+   * takes. Returns the array that holds the result, from or a new one.
    */
-  static int[] sortedBy(int[] idx, int n, long[] key, long min, long max) {
-    int low = 32 - Integer.numberOfLeadingZeros(Math.max(1, key.length - 1)); // bits of an index
-    int bits = n == 0 ? 0 : 64 - Long.numberOfLeadingZeros(max - min); // the range, as unsigned
-    if (low + bits > 63) {
-      int[] out = Arrays.copyOf(idx, n);
-      sortBy(out, key);
-      return out;
-    }
-    long[] from = new long[n];
-    boolean sorted = true;
-    long prev = Long.MIN_VALUE;
-    for (int i = 0; i < n; i++) {
-      long v = ((key[idx[i]] - min) << low) | idx[i];
-      from[i] = v;
-      sorted &= prev <= v;
-      prev = v;
-    }
-    if (!sorted) {
-      int passes = (bits + 12) / 13;
-      int digit = (bits + passes - 1) / passes;
-      int radix = 1 << digit;
-      long[] to = new long[n];
-      int[] count = new int[radix + 1];
-      for (int p = 0; p < passes; p++) {
-        int shift = low + p * digit;
-        Arrays.fill(count, 0);
-        for (int i = 0; i < n; i++) {
-          count[(int) ((from[i] >>> shift) & (radix - 1)) + 1]++;
-        }
-        for (int d = 0; d < radix; d++) {
-          count[d + 1] += count[d];
-        }
-        for (int i = 0; i < n; i++) {
-          long v = from[i];
-          to[count[(int) ((v >>> shift) & (radix - 1))]++] = v;
-        }
-        long[] t = from;
-        from = to;
-        to = t;
+  static long[] sortPacked(long[] from, int n, int low, int bits, long base) {
+    int passes = (bits + 12) / 13;
+    int digit = passes == 0 ? 0 : (bits + passes - 1) / passes;
+    int radix = 1 << digit;
+    long[] to = new long[n];
+    int[] count = new int[radix + 1];
+    for (int p = 0; p < passes; p++) {
+      int shift = low + p * digit;
+      Arrays.fill(count, 0);
+      for (int i = 0; i < n; i++) {
+        count[(int) (((from[i] - base) >>> shift) & (radix - 1)) + 1]++;
       }
+      for (int d = 0; d < radix; d++) {
+        count[d + 1] += count[d];
+      }
+      for (int i = 0; i < n; i++) {
+        long v = from[i];
+        to[count[(int) (((v - base) >>> shift) & (radix - 1))]++] = v;
+      }
+      long[] t = from;
+      from = to;
+      to = t;
     }
-    int[] out = new int[n];
-    int mask = (1 << low) - 1;
-    for (int i = 0; i < n; i++) {
-      out[i] = (int) from[i] & mask;
-    }
-    return out;
+    return from;
   }
 
   /** How far back {@link #candidates} looks without a branch; see there. */
@@ -856,6 +832,106 @@ final class Linearizability {
     }
   }
 
+  /** The fields of a key's operations by position, which {@link Search} reads them into. */
+  private static final class Columns {
+    final long[] calls;
+    final byte[] flags;
+    final long[] expecteds;
+    final long[] versions;
+    final String[] values;
+    // The answered ones' return times above their positions, in input order: those of each
+    // piece read from where it starts, then joined.
+    final long[] packed;
+
+    Columns(int m) {
+      calls = new long[m];
+      flags = new byte[m];
+      expecteds = new long[m];
+      versions = new long[m];
+      values = new String[m];
+      packed = new long[m];
+    }
+
+    /** Reads the operations at positions {@code from} to {@code to - 1} from lo of mine. */
+    Piece read(Object[] ops, int[] mine, int lo, int low, int from, int to) {
+      Piece p = new Piece(from);
+      int answers = from;
+      boolean inOrder = true;
+      long previous = Long.MIN_VALUE;
+      long firstReturn = Long.MAX_VALUE;
+      long lastReturn = Long.MIN_VALUE;
+      for (int j = from; j < to; j++) {
+        History.Op op = (History.Op) ops[mine[lo + j]];
+        long t = op.ret;
+        History.Kind k = op.kind;
+        boolean read = k == History.Kind.GET;
+        calls[j] = op.call;
+        boolean applied = op.ok;
+        flags[j] =
+            (byte) (code(k) | (applied ? Search.OK : 0) | (read || applied ? Search.SETTLES : 0));
+        expecteds[j] = op.expected;
+        versions[j] = op.version;
+        // Both read first, so that the choice can be made without a branch.
+        String readValue = op.readValue;
+        String written = op.value;
+        values[j] = read ? readValue : written;
+        if (t != History.OPEN) {
+          firstReturn = Math.min(firstReturn, t);
+          lastReturn = Math.max(lastReturn, t);
+          long v = (t << low) | j;
+          packed[answers++] = v;
+          inOrder &= previous <= v;
+          previous = v;
+        } else if (!read) {
+          p.writes.add(j);
+        }
+      }
+      p.answers = answers - from;
+      p.inOrder = inOrder;
+      p.firstReturn = firstReturn;
+      p.lastReturn = lastReturn;
+      return p;
+    }
+  }
+
+  /** What {@link Columns#read} found in a piece of a key's operations. */
+  private static final class Piece {
+    final int from; // where its packed longs start
+    final Ints writes = new Ints(); // unanswered, by position
+    int answers;
+    boolean inOrder;
+    long firstReturn;
+    long lastReturn;
+
+    Piece(int from) {
+      this.from = from;
+    }
+
+    /**
+     * This piece and the {@code next}, with the next's packed longs moved down after this one's.
+     */
+    Piece join(Piece next, long[] packed) {
+      Piece p = new Piece(from);
+      System.arraycopy(packed, next.from, packed, from + answers, next.answers);
+      p.inOrder =
+          inOrder
+              && next.inOrder
+              && (answers == 0
+                  || next.answers == 0
+                  || packed[from + answers - 1] <= packed[from + answers]);
+      p.answers = answers + next.answers;
+      p.firstReturn = Math.min(firstReturn, next.firstReturn);
+      p.lastReturn = Math.max(lastReturn, next.lastReturn);
+      for (int i = 0; i < writes.size; i++) {
+        p.writes.add(writes.items[i]);
+      }
+      for (int i = 0; i < next.writes.size; i++) {
+        p.writes.add(next.writes.items[i]);
+      }
+      return p;
+    }
+  }
+
   /**
    * The search over one key's history.
    *
@@ -886,12 +962,15 @@ final class Linearizability {
     private final Object[] ops; // every operation of the history, for the report
     private final boolean parallel; // whether the history is long enough to split
     private final boolean forward; // whether stretches start with a forward pass, see Stretch
-    private final int[] answeredAt; // the input position of each answered operation, by rank
     // The position from the key's first operation of each answered one, by rank, and the fields of
     // every operation of the key by that position, which fill() copies in rank order.
-    private final int[] byRet;
-    private final byte[] kinds;
-    private final boolean[] oks;
+    // In the low bits of byRet, the position of each answered operation by rank, and above them
+    // its return time, unless that does not fit; see the setup.
+    private final long[] byRet;
+    private final int low;
+    private final int[] positions; // the input positions of the key's operations, from lo
+    private final int lo;
+    private final byte[] flags; // the kind's code, OK and SETTLES
     private final long[] expecteds;
     private final long[] versions;
     private final String[] values;
@@ -927,6 +1006,12 @@ final class Linearizability {
     private final boolean[] pin;
     private final int pins;
 
+    // The bits of flags: the kind's code, whether the operation succeeded, and whether it leaves
+    // one state whatever it is applied to (a read, or a write that applied).
+    private static final int KIND = 3;
+    private static final int OK = 4;
+    private static final int SETTLES = 8;
+
     /** The slots a walk's table starts with, and the most it keeps when it starts again. */
     private static final int TABLE = 16;
 
@@ -937,6 +1022,9 @@ final class Linearizability {
 
     /** The frames a walk's stack starts with. */
     private static final int FRAMES = 16;
+
+    /** The fewest operations in each piece of a key read in pieces at once; see the setup. */
+    private static final int PIECE = 4096;
 
     /** The fewest ranks in a stretch searched on its own; see {@link #search}. */
     private static final int STRETCH = 2048;
@@ -960,51 +1048,63 @@ final class Linearizability {
       ops = f.ops;
       parallel = f.parallel;
       int[] mine = f.members;
-      // Positions from lo, with their return and call times, so that the sorts read small arrays,
-      // and the other fields, so that no operation is read again (see fill()).
+      positions = mine;
+      this.lo = lo;
+      // Positions from lo: the call times and other fields, so that no operation is read again
+      // (see fill()), and each answered one's return time packed above its position, which is
+      // what the sort by return sorts, so that no array of return times by position is needed.
       int m = hi - lo;
-      long[] rets = new long[m];
-      long[] calls = new long[m];
-      boolean[] settles = new boolean[m]; // a read or a write that applied: one state after it
-      byte[] kinds = new byte[m];
-      boolean[] oks = new boolean[m];
-      long[] expecteds = new long[m];
-      long[] versions = new long[m];
-      String[] values = new String[m];
-      int[] done = new int[m];
-      String[] reads = new String[m]; // the values answered reads returned, null aside
-      int readCount = 0;
-      Ints writes = new Ints(); // unanswered
-      long firstReturn = Long.MAX_VALUE;
-      long lastReturn = Long.MIN_VALUE;
-      int answers = 0;
-      for (int j = 0; j < m; j++) {
-        History.Op op = (History.Op) ops[mine[lo + j]];
-        long t = op.ret;
-        History.Kind k = op.kind;
-        boolean read = k == History.Kind.GET;
-        rets[j] = t;
-        calls[j] = op.call;
-        boolean applied = op.ok;
-        settles[j] = read || applied;
-        kinds[j] = code(k);
-        oks[j] = applied;
-        expecteds[j] = op.expected;
-        versions[j] = op.version;
-        values[j] = read ? op.readValue : op.value;
-        if (t != History.OPEN) {
-          firstReturn = Math.min(firstReturn, t);
-          lastReturn = Math.max(lastReturn, t);
-          done[answers++] = j;
-          if (read && op.readValue != null) {
-            reads[readCount++] = op.readValue;
-          }
-        } else if (!read) {
-          writes.add(j);
+      int below = 32 - Integer.numberOfLeadingZeros(Math.max(1, m - 1));
+      low = below;
+      Columns cols = new Columns(m);
+      // A long key is read in two halves at once, so that a thread with no key of its own to set
+      // up, when there are fewer keys than threads, shares the reading.
+      Piece piece;
+      if (parallel && m >= 2 * PIECE) {
+        int mid = m / 2;
+        ForkJoinTask<Piece> second =
+            ForkJoinTask.adapt(() -> cols.read(ops, mine, lo, below, mid, m)).fork();
+        Piece first = cols.read(ops, mine, lo, below, 0, mid);
+        piece = first.join(second.join(), cols.packed);
+      } else {
+        piece = cols.read(ops, mine, lo, below, 0, m);
+      }
+      long[] calls = cols.calls;
+      byte[] flags = cols.flags;
+      long[] expecteds = cols.expecteds;
+      long[] versions = cols.versions;
+      String[] values = cols.values;
+      long[] packed = cols.packed;
+      boolean inOrder = piece.inOrder;
+      Ints writes = piece.writes;
+      long firstReturn = piece.firstReturn;
+      long lastReturn = piece.lastReturn;
+      int answers = piece.answers;
+      n = answers;
+      ret = new long[n];
+      // The positions by rank, and the return times: from the packed longs once they are sorted,
+      // unless some return time does not fit above a position.
+      if (n > 0 && (firstReturn < 0 || lastReturn >= 1L << (63 - low))) {
+        int[] done = new int[n];
+        long[] rets = new long[m];
+        for (int a = 0; a < n; a++) {
+          int j = (int) packed[a] & ((1 << low) - 1);
+          done[a] = j;
+          rets[j] = ((History.Op) ops[mine[lo + j]]).ret;
+        }
+        sortBy(done, rets);
+        byRet = new long[n];
+        for (int r = 0; r < n; r++) {
+          byRet[r] = done[r];
+          ret[r] = rets[done[r]];
+        }
+      } else {
+        int bits = n == 0 ? 0 : 64 - Long.numberOfLeadingZeros(lastReturn - firstReturn);
+        byRet = inOrder ? packed : sortPacked(packed, n, low, bits, firstReturn << low);
+        for (int r = 0; r < n; r++) {
+          ret[r] = byRet[r] >>> low;
         }
       }
-      n = answers;
-      int[] byRet = sortedBy(done, n, rets, firstReturn, lastReturn);
       Ints pending = new Ints();
       for (int k = 0; k < writes.size; k++) {
         if (calls[writes.items[k]] < lastReturn) {
@@ -1026,21 +1126,16 @@ final class Linearizability {
       version = new long[slots];
       value = new String[slots];
       call = new long[slots];
-      ret = new long[n];
-      answeredAt = new int[n];
       boolean[] settle = new boolean[n];
-      this.byRet = byRet;
-      this.kinds = kinds;
-      this.oks = oks;
+      this.flags = flags;
       this.expecteds = expecteds;
       this.versions = versions;
       this.values = values;
+      int mask = (1 << low) - 1;
       for (int r = 0; r < n; r++) {
-        int j = byRet[r];
-        answeredAt[r] = mine[lo + j];
+        int j = (int) byRet[r] & mask;
         call[r] = calls[j];
-        ret[r] = rets[j];
-        settle[r] = settles[j];
+        settle[r] = (flags[j] & SETTLES) != 0;
       }
       // The other fields of the answered operations are copied into rank order by the stretches
       // that search them, in parallel (see fill()); the unanswered writes are copied below.
@@ -1059,8 +1154,12 @@ final class Linearizability {
       }
       Arrays.sort(openHashes);
       Set<String> read = new HashSet<>();
-      for (int q = 0; q < readCount && openHashes.length > 0; q++) {
-        String v = reads[q];
+      for (int q = 0; q < n && openHashes.length > 0; q++) {
+        int j = (int) byRet[q] & mask;
+        String v = values[j];
+        if ((flags[j] & KIND) != code(History.Kind.GET) || v == null) {
+          continue;
+        }
         long h = (long) v.hashCode() << 32;
         int at = Arrays.binarySearch(openHashes, h);
         for (int i = at < 0 ? -at - 1 : at;
@@ -1139,9 +1238,10 @@ final class Linearizability {
      */
     private void fill(int from, int to) {
       for (int r = from; r < to; r++) {
-        int j = byRet[r];
-        kind[r] = kinds[j];
-        ok[r] = oks[j];
+        int j = (int) byRet[r] & ((1 << low) - 1);
+        byte f = flags[j];
+        kind[r] = (byte) (f & KIND);
+        ok[r] = (f & OK) != 0;
         expected[r] = expecteds[j];
         version[r] = versions[j];
         value[r] = values[j];
@@ -2182,11 +2282,18 @@ final class Linearizability {
         Stretch[] walks = new Stretch[k];
         boolean[] passed = new boolean[k];
         boolean[] restricted = new boolean[k]; // passed without the earlier unanswered operations
+        boolean[] skipped = new boolean[k];
         stopAt.set(Integer.MAX_VALUE);
         IntStream.range(0, k)
             .parallel()
             .forEach(
                 i -> {
+                  if (stopAt.get() < i) {
+                    // A stretch before it failed, so it is moot: the answer is that stretch's,
+                    // or else the single search's, which fills it below.
+                    skipped[i] = true;
+                    return;
+                  }
                   State start = i == 0 ? State.ABSENT : afterPin(bounds[i] - 1);
                   // The first stretch is the start of the single search, so its work is never
                   // wasted; the others give up if their search grows far beyond a pass.
@@ -2230,6 +2337,11 @@ final class Linearizability {
         if (joins) {
           return -1;
         }
+        for (int i = 0; i < k; i++) {
+          if (skipped[i]) {
+            fill(bounds[i], bounds[i + 1]);
+          }
+        }
       }
       stuckIn = all();
       Stretch w = new Stretch(0, 0, State.ABSENT, n, Long.MAX_VALUE, 0, stuckIn);
@@ -2251,10 +2363,15 @@ final class Linearizability {
       return lo;
     }
 
+    /** The input position of the answered operation of rank r. */
+    private int answeredAt(int r) {
+      return positions[lo + ((int) byRet[r] & ((1 << low) - 1))];
+    }
+
     /** The one state a pin leaves. */
     private State afterPin(int p) {
       // Read from the operation: rank p is in the stretch before, which another thread copies.
-      History.Op op = (History.Op) ops[answeredAt[p]];
+      History.Op op = (History.Op) ops[answeredAt(p)];
       return switch (op.kind) {
         case DELETE -> State.ABSENT;
         case PUT -> new State(op.value, op.version);
@@ -2319,11 +2436,13 @@ final class Linearizability {
       long earliest = Long.MAX_VALUE; // the earliest call above p
       for (int p = n - 1; p >= 0; p--) {
         long c = call[p];
-        // Without branches: which way they go depends on the history.
-        int isPin =
-            (earliest >= ret[p] ? 1 : 0) & (p == 0 || c > ret[p - 1] ? 1 : 0) & (settle[p] ? 1 : 0);
+        // Without branches: which way they go depends on the history, and a quarter of the ranks
+        // of a generated history are pins. Times are not negative, so the differences cannot
+        // overflow, and their sign bits give the comparisons.
+        long before = p == 0 ? c - 1 : ret[p - 1];
+        int isPin = (int) ((~(earliest - ret[p]) & (before - c)) >>> 63) & (settle[p] ? 1 : 0);
         earliest = Math.min(earliest, c);
-        pin[p] = isPin == 1;
+        pin[p] = isPin != 0;
         count += isPin;
       }
       return count;
@@ -2337,7 +2456,7 @@ final class Linearizability {
      * return.
      */
     private String report(String key, int deepest) {
-      History.Op stuck = (History.Op) ops[answeredAt[deepest]];
+      History.Op stuck = (History.Op) ops[answeredAt(deepest)];
       StringBuilder sb =
           new StringBuilder("not linearizable on key ")
               .append(key)
@@ -2367,10 +2486,10 @@ final class Linearizability {
       }
       List<History.Op> shown = new ArrayList<>();
       for (int r = firstReturnAfter(from - 1); r <= deepest; r++) {
-        shown.add((History.Op) ops[answeredAt[r]]);
+        shown.add((History.Op) ops[answeredAt(r)]);
       }
       for (int i = 0; i < later.size; i++) {
-        shown.add((History.Op) ops[answeredAt[later.items[i]]]);
+        shown.add((History.Op) ops[answeredAt(later.items[i])]);
       }
       for (History.Op o : openAsCalled) {
         if (o.call <= stuck.ret) {

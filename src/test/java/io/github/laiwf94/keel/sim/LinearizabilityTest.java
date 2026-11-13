@@ -332,6 +332,59 @@ class LinearizabilityTest {
   }
 
   /**
+   * The sort by return packs each return time above the operation's position in a long, and falls
+   * back to sorting positions by time where a time does not fit. Moving every time by the same
+   * amount must not change the answer or the report, apart from the times it shows: by 2^40, which
+   * still fits above the positions of a long history, and by 2^58, which fits above none. The long
+   * histories are also read in two halves at once.
+   */
+  @Test
+  void largeTimesCheckTheSameWay() {
+    for (long shift : new long[] {1L << 40, 1L << 58}) {
+      for (long seed = 0; seed < 2_000; seed++) {
+        List<History.Op> ops = randomHistory(seed);
+        assertEquals(
+            withoutTimes(Linearizability.check(ops)),
+            withoutTimes(Linearizability.check(shifted(ops, shift))),
+            "seed " + seed + ", shift " + shift);
+      }
+      for (long seed = 0; seed < 4; seed++) {
+        List<History.Op> ops =
+            HistoryGenerator.linearizable(
+                seed, new HistoryGenerator.Shape(20_000, 4, 2, seed % 2 == 0 ? 0 : 0.002));
+        assertEquals(Optional.empty(), Linearizability.check(shifted(ops, shift)), "seed " + seed);
+        HistoryGenerator.staleRead(ops, seed);
+        Optional<String> violation = Linearizability.check(ops);
+        assertTrue(violation.isPresent(), "seed " + seed);
+        assertEquals(
+            withoutTimes(violation),
+            withoutTimes(Linearizability.check(shifted(ops, shift))),
+            "seed " + seed + ", shift " + shift);
+      }
+    }
+  }
+
+  /** A copy of {@code ops} with every call and return time moved {@code by} later. */
+  private static List<History.Op> shifted(List<History.Op> ops, long by) {
+    List<History.Op> out = new ArrayList<>(ops.size());
+    for (History.Op o : ops) {
+      History.Op c =
+          new History.Op(o.id, o.client, o.kind, o.key, o.value, o.expected, o.call + by);
+      c.ret = o.ret == History.OPEN ? History.OPEN : o.ret + by;
+      c.ok = o.ok;
+      c.version = o.version;
+      c.readValue = o.readValue;
+      out.add(c);
+    }
+    return out;
+  }
+
+  /** A report with the times of the operations it shows left out. */
+  private static Optional<String> withoutTimes(Optional<String> report) {
+    return report.map(r -> r.replaceAll("\\[\\d+,(\\d+|inf)\\]", "[]"));
+  }
+
+  /**
    * The candidate lists are, for each return, the operations running at it in call order, ties by
    * rank, as a direct look at every pair finds them: with a few clients, with many, and with some
    * operations running across hundreds of returns, which the lists reach by a slower path. The
@@ -409,7 +462,8 @@ class LinearizabilityTest {
   }
 
   /**
-   * sortBy is a stable sort, on sorted, nearly sorted and scrambled input, with and without ties.
+   * sortBy and sortPacked are stable sorts, on sorted, nearly sorted and scrambled input, with and
+   * without ties.
    */
   @Test
   void sortByIsAStableSort() {
@@ -442,12 +496,26 @@ class LinearizabilityTest {
         min = Math.min(min, key[v]);
         max = Math.max(max, key[v]);
       }
-      // sortedBy packs the key above the index where they fit in a long, and else uses sortBy.
-      int[] packed = Linearizability.sortedBy(idx, n, key, min, max);
+      // sortPacked sorts each key packed above its position, where they fit in a long, as a key's
+      // setup packs return times above positions.
+      int low = 32 - Integer.numberOfLeadingZeros(Math.max(1, n - 1));
+      boolean fits = n == 0 || max < 1L << (63 - low);
+      long[] packed = new long[n];
+      for (int i = 0; i < n && fits; i++) {
+        packed[i] = (key[idx[i]] << low) | i;
+      }
+      int bits = n == 0 ? 0 : 64 - Long.numberOfLeadingZeros(max - min);
+      long[] sorted = fits ? Linearizability.sortPacked(packed, n, low, bits, min << low) : packed;
+      int[] unsorted = idx.clone();
       Linearizability.sortBy(idx, key);
       for (int i = 0; i < n; i++) {
         assertEquals((int) boxed[i], idx[i], "round " + round + " at " + i);
-        assertEquals((int) boxed[i], packed[i], "sortedBy, round " + round + " at " + i);
+        if (fits) {
+          assertEquals(
+              (int) boxed[i],
+              unsorted[(int) sorted[i] & ((1 << low) - 1)],
+              "sortPacked, round " + round + " at " + i);
+        }
       }
     }
   }
