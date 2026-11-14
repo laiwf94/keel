@@ -53,14 +53,15 @@ import java.util.stream.Stream;
  * Search.Stretch}). Its moves need not be the search's: it places a read or a conflict that fits at
  * once, since that leaves the state as it is, and otherwise the write that comes first in the log,
  * and so gets stuck about once in 2,500 operations instead of once in 25. Each operation of a key
- * is read once, into arrays by its position in the input, and each stretch copies its own ranks
- * from there into arrays in the order the search reads them, in parallel; the operations it may try
- * at each point are found for every return by looking back a few ranks, the cache and the stack are
- * arrays, and a set of states is a small sorted array, so that a step is a few array reads and
- * allocates at most the state it produces. A state's hash is computed only once a search caches it,
- * and unanswered writes are compared by numbers rather than by their values: for a long history
- * each value is a string somewhere else in memory, and reading it is usually a cache miss. For the
- * same reason a report of a violation reads only the operations it shows.
+ * is read once, into arrays by its position in the input; the forward pass reads them there through
+ * each rank's position, and only the ranks a walk searches are copied into arrays in rank order;
+ * the operations it may try at each point are found for every return by looking back a few ranks,
+ * the cache and the stack are arrays, and a set of states is a small sorted array, so that a step
+ * is a few array reads and allocates at most the state it produces. A state's hash is computed only
+ * once a search caches it, and unanswered writes are compared by numbers rather than by their
+ * values: for a long history each value is a string somewhere else in memory, and reading it is
+ * usually a cache miss. For the same reason a report of a violation reads only the operations it
+ * shows.
  *
  * <p>{@link LinearizabilityReference} keeps the search as it was before, as an oracle.
  *
@@ -992,7 +993,8 @@ final class Linearizability {
     private final boolean parallel; // whether the history is long enough to split
     private final boolean forward; // whether stretches start with a forward pass, see Stretch
     // The position from the key's first operation of each answered one, by rank, and the fields of
-    // every operation of the key by that position, which fill() copies in rank order.
+    // every operation of the key by that position, which the forward pass reads and fill() copies
+    // in rank order for a walk.
     // In the low bits of byRet, the position of each answered operation by rank, and above them
     // its return time, unless that does not fit; see the setup.
     private final long[] byRet;
@@ -1007,7 +1009,8 @@ final class Linearizability {
 
     // Every operation the search may linearize, by slot: the answered ones by rank, then the
     // unanswered writes by call. value is what a put wrote or a read returned, and UNREAD for an
-    // unanswered put whose value no answered read returned.
+    // unanswered put whose value no answered read returned. The fields of an answered one are
+    // copied only once a walk covers its rank (see fill()); call and ret hold those of every rank.
     private final byte[] kind; // codes, see KINDS
     private final boolean[] ok;
     private final long[] expected;
@@ -1178,8 +1181,8 @@ final class Linearizability {
         call[r] = calls[j];
         settle[r] = (flags[j] & SETTLES) != 0;
       }
-      // The other fields of the answered operations are copied into rank order by the stretches
-      // that search them, in parallel (see fill()); the unanswered writes are copied by classes().
+      // The other fields of the answered operations are copied into rank order by the walks that
+      // search them (see fill()); the unanswered writes are copied by classes().
       pin = new boolean[n];
       pins = pins(settle);
       Classes cl = forked ? classesTask.join() : classesTask.invoke();
@@ -1286,11 +1289,14 @@ final class Linearizability {
 
     /**
      * Copies the fields of the answered operations of ranks {@code from} to {@code to - 1} into the
-     * arrays the search reads, in rank order. Each stretch copies its own, in parallel. They are
-     * copied from the arrays the setup filled by position, not from the operations: the setup reads
-     * each operation anyway, and each is an object of its own, so reading it a second time, in rank
-     * order, cost 2.4 ms of the checker's 15 ms of CPU time on 100,000 operations, where copying
-     * from those arrays costs 0.9 ms.
+     * arrays a walk reads, in rank order, when the walk makes their candidate lists ({@link
+     * Walk#cover}): a walk reads only the ranks of its lists. The forward pass reads the fields by
+     * position instead, through byRet, and on most ranks no walk runs, so most are never copied;
+     * copying every rank, each stretch its own, took about 7% of the checker's CPU time on the
+     * 100,000-operation histories of the benchmark. They are copied from the arrays the setup
+     * filled by position, not from the operations: each is an object of its own, and reading it a
+     * second time, in rank order, cost 2.4 ms of the checker's 15 ms of CPU time on 100,000
+     * operations, where copying from those arrays costs 0.9 ms.
      */
     private void fill(int from, int to) {
       for (int r = from; r < to; r++) {
@@ -1479,6 +1485,9 @@ final class Linearizability {
         while (to < end && !pin[to - 1]) {
           to++;
         }
+        // The fields of these ranks too, those not copied by the last cover: a walk reads only the
+        // ranks of its lists, and no rank in them is above to (see candidates()).
+        fill(cand != null && from == base ? Math.max(from, listEnd) : from, to);
         int[] start = new int[to - from + 1];
         cand = candidates(call, ret, from, to, start);
         candStart = start;
@@ -2145,17 +2154,20 @@ final class Linearizability {
        * pin. So it takes those most likely to be right. A read or a conflict that fits leaves the
        * state as it is, so it can go first in any linearization that places it later, and is placed
        * at once. Otherwise the successful write that comes first in the log goes next, since
-       * versions are log indexes (see {@link #logOrder}); if it does not fit, any write that fits.
-       * Since the order of the candidates does not matter, they are found from lo, with no lists
-       * made (see {@link Range}): among the {@link #NEAR} ranks after the prefix when no rank runs
-       * past more than NEAR others, else among the ranks up to the prefix's {@link Range#reach}, as
-       * far as the window holds. A candidate beyond the window could not be placed, so leaving it
-       * out only changes which of the writes that fit is tried, never whether the pass is right.
+       * versions are log indexes (see {@link #logOrderAt}); if it does not fit, any write that
+       * fits. Since the order of the candidates does not matter, they are found from lo, with no
+       * lists made (see {@link Range}): among the {@link #NEAR} ranks after the prefix when no rank
+       * runs past more than NEAR others, else among the ranks up to the prefix's {@link
+       * Range#reach}, as far as the window holds. A candidate beyond the window could not be
+       * placed, so leaving it out only changes which of the writes that fit is tried, never whether
+       * the pass is right.
        *
        * <p>The state is always one with a known version: the pass starts from no value or after a
        * pin, and applies no unanswered operation. So it is kept as a value and a version, and the
        * fit of each operation is a few comparisons, as in {@link Linearizability#next}, with no
-       * state made.
+       * state made. The fields of a candidate are read by its position, through byRet, from the
+       * arrays the setup filled, so that no stretch copies its ranks' fields into rank order unless
+       * a walk takes over (see {@link #fill}).
        */
       private int forward(int prefix, State state) {
         lastPin = -1;
@@ -2173,6 +2185,7 @@ final class Linearizability {
         int[] nearby = new int[near ? NEAR + 1 : WINDOW + 1];
         byte get = code(History.Kind.GET);
         byte put = code(History.Kind.PUT);
+        int mask = (1 << low) - 1;
         while (prefix < end) {
           if ((++steps & 1023) == 0 && (steps > budget || stopAt.get() < index)) {
             aborted = true;
@@ -2215,36 +2228,41 @@ final class Linearizability {
             from = 0;
             to = k;
           }
+          int writeAt = -1; // its position
           for (int i = from; i < to; i++) {
             int c = cand[i];
             int off = c - prefix - 1;
             if (off >= 0 && off < 64 && (window & (1L << off)) != 0) {
               continue;
             }
-            boolean read = kind[c] == get;
-            if (!read && ok[c]) {
-              if (write < 0 || logOrder(c, write) < 0) {
+            int j = (int) byRet[c] & mask;
+            int f = flags[j];
+            boolean read = (f & KIND) == get;
+            if (!read && (f & OK) != 0) {
+              if (write < 0 || logOrderAt(j, writeAt) < 0) {
                 write = c;
+                writeAt = j;
               }
               continue;
             }
             // A read sees the value and its version; a conflict reports the version it found,
             // which is not the one it expected.
             boolean fits =
-                version[c] == at && (read ? Objects.equals(now, value[c]) : expected[c] != at);
+                versions[j] == at && (read ? Objects.equals(now, values[j]) : expecteds[j] != at);
             if (fits) {
               r = c;
               break;
             }
           }
-          if (r < 0 && write >= 0 && applies(write, at)) {
+          if (r < 0 && write >= 0 && applies(writeAt, at)) {
             r = write;
           }
           for (int i = from; i < to && r < 0; i++) { // else any write that fits
             int c = cand[i];
             int off = c - prefix - 1;
             boolean placed = off >= 0 && off < 64 && (window & (1L << off)) != 0;
-            if (!placed && kind[c] != get && ok[c] && applies(c, at)) {
+            int j = (int) byRet[c] & mask;
+            if (!placed && (flags[j] & KIND) != get && (flags[j] & OK) != 0 && applies(j, at)) {
               r = c;
             }
           }
@@ -2252,10 +2270,12 @@ final class Linearizability {
             stuck = prefix;
             return HANDED_BACK;
           }
-          if (kind[r] != get && ok[r]) {
-            boolean isPut = kind[r] == put;
-            now = isPut ? value[r] : null;
-            at = isPut ? version[r] : 0; // a delete leaves no value, as State.ABSENT
+          int rj = (int) byRet[r] & mask;
+          int rf = flags[rj];
+          if ((rf & KIND) != get && (rf & OK) != 0) {
+            boolean isPut = (rf & KIND) == put;
+            now = isPut ? values[rj] : null;
+            at = isPut ? versions[rj] : 0; // a delete leaves no value, as State.ABSENT
           }
           if (r == prefix) {
             int placed = Long.numberOfTrailingZeros(~window); // the ranks after it, placed before
@@ -2273,32 +2293,34 @@ final class Linearizability {
       }
 
       /**
-       * Whether the successful answered write {@code w} applies to a state of known version {@code
-       * at}, as {@link Linearizability#next} decides: its condition holds, and a put writes a
-       * higher version, while a delete reports the version it removed.
+       * Whether the successful answered write at position {@code j} applies to a state of known
+       * version {@code at}, as {@link Linearizability#next} decides: its condition holds, and a put
+       * writes a higher version, while a delete reports the version it removed.
        */
-      private boolean applies(int w, long at) {
-        long e = expected[w];
+      private boolean applies(int j, long at) {
+        long e = expecteds[j];
         if (e != -1 && e != at) {
           return false;
         }
-        long v = version[w];
-        return kind[w] == code(History.Kind.PUT) ? at == -1 || v > at : v == at;
+        long v = versions[j];
+        return (flags[j] & KIND) == code(History.Kind.PUT) ? at == -1 || v > at : v == at;
       }
     }
 
     /**
      * The order in which two successful answered writes would come in the log: by version, and a
      * delete, which reports the version it removed, just after the put that wrote it. Only a guess
-     * at which write to try first; any order gives the same answer.
+     * at which write to try first; any order gives the same answer. The writes are given by
+     * position.
      */
-    private int logOrder(int a, int b) {
-      int byVersion = Long.compare(version[a], version[b]);
+    private int logOrderAt(int a, int b) {
+      int byVersion = Long.compare(versions[a], versions[b]);
       if (byVersion != 0) {
         return byVersion;
       }
       return Boolean.compare(
-          kind[a] == code(History.Kind.DELETE), kind[b] == code(History.Kind.DELETE));
+          (flags[a] & KIND) == code(History.Kind.DELETE),
+          (flags[b] & KIND) == code(History.Kind.DELETE));
     }
 
     /** Empty if linearizable, else what the search could not get past. */
@@ -2332,13 +2354,10 @@ final class Linearizability {
     private int search() {
       int[] bounds = stretches();
       int k = bounds.length - 1;
-      if (k <= 1) {
-        fill(0, n);
-      } else {
+      if (k > 1) {
         Stretch[] walks = new Stretch[k];
         boolean[] passed = new boolean[k];
         boolean[] restricted = new boolean[k]; // passed without the earlier unanswered operations
-        boolean[] skipped = new boolean[k];
         stopAt.set(Integer.MAX_VALUE);
         IntStream.range(0, k)
             .parallel()
@@ -2346,8 +2365,7 @@ final class Linearizability {
                 i -> {
                   if (stopAt.get() < i) {
                     // A stretch before it failed, so it is moot: the answer is that stretch's,
-                    // or else the single search's, which fills it below.
-                    skipped[i] = true;
+                    // or else the single search's.
                     return;
                   }
                   State start = i == 0 ? State.ABSENT : afterPin(bounds[i] - 1);
@@ -2356,7 +2374,6 @@ final class Linearizability {
                   long budget =
                       i == 0 ? Long.MAX_VALUE : STEPS * (bounds[i + 1] - bounds[i] + opens);
                   int fresh = i == 0 ? 0 : firstCalledAfter(ret[bounds[i] - 1]);
-                  fill(bounds[i], bounds[i + 1]);
                   Range range = new Range(bounds[i], bounds[i + 1]);
                   Stretch w = new Stretch(i, bounds[i], start, bounds[i + 1], budget, fresh, range);
                   boolean pass = w.run();
@@ -2392,11 +2409,6 @@ final class Linearizability {
         }
         if (joins) {
           return -1;
-        }
-        for (int i = 0; i < k; i++) {
-          if (skipped[i]) {
-            fill(bounds[i], bounds[i + 1]);
-          }
         }
       }
       stuckIn = all();

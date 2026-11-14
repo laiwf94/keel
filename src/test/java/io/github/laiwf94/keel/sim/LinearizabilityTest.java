@@ -332,6 +332,40 @@ class LinearizabilityTest {
   }
 
   /**
+   * The forward pass reads each candidate's fields by position, and a stretch's fields are copied
+   * into rank order only as far as a walk makes candidate lists, a little at a time. An answered
+   * operation whose version, outcome or read value is wrong, anywhere in a long history, makes a
+   * walk take over in its stretch, after walks in the stretches before it took over where the pass
+   * got stuck; with unanswered writes, the single search may then take over across all of them.
+   * Whichever ranks the walks reach, the answer and the report must be those of walks alone, which
+   * copy every rank they search.
+   */
+  @Test
+  void walksThatTakeOverHereAndThereGiveTheReportsOfWalksAlone() {
+    int violations = 0;
+    for (long seed = 0; seed < 24; seed++) {
+      double openRate = seed % 3 == 0 ? 0 : seed % 3 == 1 ? 0.0005 : 0.002;
+      List<History.Op> ops =
+          HistoryGenerator.linearizable(
+              seed, new HistoryGenerator.Shape(20_000, 3 + (int) (seed % 3), 2, openRate));
+      SplittableRandom rnd = new SplittableRandom(seed);
+      History.Op op = ops.get(rnd.nextInt(ops.size()));
+      while (op.ret == History.OPEN || (op.kind != History.Kind.GET && seed % 3 == 2)) {
+        op = ops.get(rnd.nextInt(ops.size()));
+      }
+      switch ((int) (seed % 3)) {
+        case 0 -> op.version += 1;
+        case 1 -> op.ok = !op.ok;
+        default -> op.readValue = op.readValue == null ? "absent" : null;
+      }
+      Optional<String> walks = Linearizability.check(ops, false);
+      assertEquals(walks, Linearizability.check(ops, true), "seed " + seed);
+      violations += walks.isPresent() ? 1 : 0;
+    }
+    assertTrue(violations >= 16, "violations: " + violations);
+  }
+
+  /**
    * The sort by return packs each return time above the operation's position in a long, and falls
    * back to sorting positions by time where a time does not fit. Moving every time by the same
    * amount must not change the answer or the report, apart from the times it shows: by 2^40, which
