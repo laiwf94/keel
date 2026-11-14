@@ -868,7 +868,11 @@ final class Linearizability {
         calls[j] = op.call;
         boolean applied = op.ok;
         flags[j] =
-            (byte) (code(k) | (applied ? Search.OK : 0) | (read || applied ? Search.SETTLES : 0));
+            (byte)
+                (code(k)
+                    | (applied ? Search.OK : 0)
+                    | (read || applied ? Search.SETTLES : 0)
+                    | (t != History.OPEN ? Search.ANSWERED : 0));
         expecteds[j] = op.expected;
         versions[j] = op.version;
         // Both read first, so that the choice can be made without a branch.
@@ -929,6 +933,31 @@ final class Linearizability {
         p.writes.add(next.writes.items[i]);
       }
       return p;
+    }
+  }
+
+  /** What {@link Search#classes} works out; see the fields of the same names in Search. */
+  private static final class Classes {
+    final int[] classOf;
+    final int[] firstOfClass;
+    final int[][] members;
+    final boolean[] alone;
+    final boolean[] loose;
+    final int[] effectOf;
+
+    Classes(
+        int[] classOf,
+        int[] firstOfClass,
+        int[][] members,
+        boolean[] alone,
+        boolean[] loose,
+        int[] effectOf) {
+      this.classOf = classOf;
+      this.firstOfClass = firstOfClass;
+      this.members = members;
+      this.alone = alone;
+      this.loose = loose;
+      this.effectOf = effectOf;
     }
   }
 
@@ -1011,6 +1040,7 @@ final class Linearizability {
     private static final int KIND = 3;
     private static final int OK = 4;
     private static final int SETTLES = 8;
+    private static final int ANSWERED = 16;
 
     /** The slots a walk's table starts with, and the most it keeps when it starts again. */
     private static final int TABLE = 16;
@@ -1082,6 +1112,38 @@ final class Linearizability {
       int answers = piece.answers;
       n = answers;
       ret = new long[n];
+      Ints pending = new Ints();
+      for (int k = 0; k < writes.size; k++) {
+        if (calls[writes.items[k]] < lastReturn) {
+          pending.add(writes.items[k]);
+        }
+      }
+      int[] byCall = Arrays.copyOf(pending.items, pending.size);
+      sortBy(byCall, calls);
+      opens = byCall.length;
+      openAsCalled = new History.Op[opens];
+      for (int o = 0; o < opens; o++) {
+        openAsCalled[o] = (History.Op) ops[mine[lo + byCall[o]]];
+      }
+
+      int slots = n + opens;
+      kind = new byte[slots];
+      ok = new boolean[slots];
+      expected = new long[slots];
+      version = new long[slots];
+      value = new String[slots];
+      call = new long[slots];
+      // Which unanswered writes are interchangeable depends on whether an answered read returned
+      // the value of each unanswered put, which reads the string of every read's value, each
+      // somewhere else in memory on a long history: about 0.8 ms of a 33,000-operation key with
+      // 0.2% unanswered. Nothing before the searches needs to know, so a task of its own works it
+      // out while this one sorts by return and finds the pins. Joining it only when the first walk
+      // needs it was slower: walks in several stretches then waited on it.
+      ForkJoinTask<Classes> classesTask = ForkJoinTask.adapt(() -> classes(flags, values, m));
+      boolean forked = parallel && opens > 0;
+      if (forked) {
+        classesTask.fork();
+      }
       // The positions by rank, and the return times: from the packed longs once they are sorted,
       // unless some return time does not fit above a position.
       if (n > 0 && (firstReturn < 0 || lastReturn >= 1L << (63 - low))) {
@@ -1105,27 +1167,6 @@ final class Linearizability {
           ret[r] = byRet[r] >>> low;
         }
       }
-      Ints pending = new Ints();
-      for (int k = 0; k < writes.size; k++) {
-        if (calls[writes.items[k]] < lastReturn) {
-          pending.add(writes.items[k]);
-        }
-      }
-      int[] byCall = Arrays.copyOf(pending.items, pending.size);
-      sortBy(byCall, calls);
-      opens = byCall.length;
-      openAsCalled = new History.Op[opens];
-      for (int o = 0; o < opens; o++) {
-        openAsCalled[o] = (History.Op) ops[mine[lo + byCall[o]]];
-      }
-
-      int slots = n + opens;
-      kind = new byte[slots];
-      ok = new boolean[slots];
-      expected = new long[slots];
-      version = new long[slots];
-      value = new String[slots];
-      call = new long[slots];
       boolean[] settle = new boolean[n];
       this.flags = flags;
       this.expecteds = expecteds;
@@ -1138,9 +1179,27 @@ final class Linearizability {
         settle[r] = (flags[j] & SETTLES) != 0;
       }
       // The other fields of the answered operations are copied into rank order by the stretches
-      // that search them, in parallel (see fill()); the unanswered writes are copied below.
-      // The values of unanswered puts that an answered read returned. A read's value is compared
-      // with theirs only if its hash is one of theirs, found in a sorted array.
+      // that search them, in parallel (see fill()); the unanswered writes are copied by classes().
+      pin = new boolean[n];
+      pins = pins(settle);
+      Classes cl = forked ? classesTask.join() : classesTask.invoke();
+      classOf = cl.classOf;
+      firstOfClass = cl.firstOfClass;
+      alone = cl.alone;
+      loose = cl.loose;
+      members = cl.members;
+      effectOf = cl.effectOf;
+      classWords = (firstOfClass.length + 63) / 64;
+    }
+
+    /**
+     * The classes of interchangeable unanswered writes, and what each does to the value; see the
+     * class comment. Also copies the unanswered writes into their slots. A put whose value an
+     * answered read returned is a class of its own; to find those, the value of every answered read
+     * is compared with theirs, by position ({@code flags} and {@code values} of the key's {@code m}
+     * operations), and only if its hash is one of theirs, found in a sorted array.
+     */
+    private Classes classes(byte[] flags, String[] values, int m) {
       Ints openPuts = new Ints();
       for (int o = 0; o < opens; o++) {
         if (openAsCalled[o].kind == History.Kind.PUT && openAsCalled[o].value != null) {
@@ -1154,10 +1213,10 @@ final class Linearizability {
       }
       Arrays.sort(openHashes);
       Set<String> read = new HashSet<>();
-      for (int q = 0; q < n && openHashes.length > 0; q++) {
-        int j = (int) byRet[q] & mask;
+      int answeredRead = ANSWERED | code(History.Kind.GET);
+      for (int j = 0; j < m && openHashes.length > 0; j++) {
         String v = values[j];
-        if ((flags[j] & KIND) != code(History.Kind.GET) || v == null) {
+        if ((flags[j] & (ANSWERED | KIND)) != answeredRead || v == null) {
           continue;
         }
         long h = (long) v.hashCode() << 32;
@@ -1172,7 +1231,7 @@ final class Linearizability {
         }
       }
 
-      classOf = new int[opens];
+      int[] classOf = new int[opens];
       Map<List<Object>, Integer> classes = new HashMap<>();
       List<Integer> firsts = new ArrayList<>();
       for (int i = 0; i < opens; i++) {
@@ -1195,9 +1254,9 @@ final class Linearizability {
                   return firsts.size() - 1;
                 });
       }
-      firstOfClass = firsts.stream().mapToInt(Integer::intValue).toArray();
-      alone = new boolean[firstOfClass.length];
-      loose = new boolean[firstOfClass.length];
+      int[] firstOfClass = firsts.stream().mapToInt(Integer::intValue).toArray();
+      boolean[] alone = new boolean[firstOfClass.length];
+      boolean[] loose = new boolean[firstOfClass.length];
       for (int c = 0; c < alone.length; c++) {
         int s = n + firstOfClass[c];
         alone[c] = kindOf(s) == History.Kind.PUT && !UNREAD.equals(value[s]);
@@ -1207,7 +1266,7 @@ final class Linearizability {
       for (int c : classOf) {
         sizes[c]++;
       }
-      members = new int[firstOfClass.length][];
+      int[][] members = new int[firstOfClass.length][];
       for (int c = 0; c < members.length; c++) {
         members[c] = new int[sizes[c]];
         sizes[c] = 0;
@@ -1215,17 +1274,14 @@ final class Linearizability {
       for (int o = 0; o < opens; o++) {
         members[classOf[o]][sizes[classOf[o]]++] = o;
       }
-      effectOf = new int[opens];
+      int[] effectOf = new int[opens];
       Map<List<Object>, Integer> effects = new HashMap<>();
       for (int o = 0; o < opens; o++) {
         int s = n + o;
         effectOf[o] =
             effects.computeIfAbsent(Arrays.asList(kindOf(s), value[s]), k -> effects.size());
       }
-      classWords = (firstOfClass.length + 63) / 64;
-
-      pin = new boolean[n];
-      pins = pins(settle);
+      return new Classes(classOf, firstOfClass, members, alone, loose, effectOf);
     }
 
     /**
