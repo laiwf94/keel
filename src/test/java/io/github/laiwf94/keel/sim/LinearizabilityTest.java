@@ -422,11 +422,13 @@ class LinearizabilityTest {
    * The candidate lists are, for each return, the operations running at it in call order, ties by
    * rank, as a direct look at every pair finds them: with a few clients, with many, and with some
    * operations running across hundreds of returns, which the lists reach by a slower path. The
-   * reach of each rank is the highest in its list.
+   * reach of each rank is the highest in its list, and a range is near, as the forward pass takes
+   * it, exactly when no list reaches past NEAR ranks after its own.
    */
   @Test
   void candidateListsAreTheOperationsRunningAtEachReturn() {
     SplittableRandom rnd = new SplittableRandom(11);
+    int[] nears = new int[2]; // ranges where some list reaches past NEAR, and where none does
     for (int round = 0; round < 300; round++) {
       int n = 1 + rnd.nextInt(round % 10 == 0 ? 8 : 600);
       int clients = 1 + rnd.nextInt(round % 3 == 0 ? 40 : 6);
@@ -482,6 +484,7 @@ class LinearizabilityTest {
         int[] part = Linearizability.candidates(call, ret, from, to, start);
         // The forward pass finds the candidates of p among the ranks up to its reach.
         int[] reach = Linearizability.reach(Linearizability.lows(call, ret, from, to), to - from);
+        boolean near = true;
         for (int p = from; p < to; p++) {
           assertEquals(
               Arrays.toString(Arrays.copyOfRange(cand, candStart[p], candStart[p + 1])),
@@ -490,9 +493,17 @@ class LinearizabilityTest {
           int highest =
               Arrays.stream(part, start[p - from], start[p - from + 1]).max().orElseThrow();
           assertEquals(highest - from, reach[p - from], "round " + round + ", reach of " + p);
+          near &= highest <= p + Linearizability.NEAR;
         }
+        // Without lists, near() tells whether every list holds only ranks up to NEAR past its own.
+        assertEquals(
+            near,
+            Linearizability.near(call, ret, from, to),
+            "round " + round + ", ranks " + from + " to " + to);
+        nears[near ? 1 : 0]++;
       }
     }
+    assertTrue(nears[0] > 100 && nears[1] > 100, Arrays.toString(nears));
   }
 
   /**

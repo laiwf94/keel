@@ -12,9 +12,21 @@ final class History {
   static final long OPEN = Long.MAX_VALUE;
 
   enum Kind {
-    PUT,
-    DELETE,
-    GET
+    PUT(1),
+    DELETE(2),
+    GET(0);
+
+    /**
+     * The number {@link Linearizability} stores for this kind. A field rather than a switch: the
+     * checker codes the kind of every operation of a history, the kinds come in no predictable
+     * order, and the branches of a switch on them cost a third of the time it took to read a key's
+     * operations.
+     */
+    final byte code;
+
+    Kind(int code) {
+      this.code = (byte) code;
+    }
   }
 
   /** Version that matches any version; used when an open write's version is unknown. */

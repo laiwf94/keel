@@ -53,15 +53,14 @@ import java.util.stream.Stream;
  * Search.Stretch}). Its moves need not be the search's: it places a read or a conflict that fits at
  * once, since that leaves the state as it is, and otherwise the write that comes first in the log,
  * and so gets stuck about once in 2,500 operations instead of once in 25. Each operation of a key
- * is read once, into arrays by its position in the input; the forward pass reads them there through
- * each rank's position, and only the ranks a walk searches are copied into arrays in rank order;
- * the operations it may try at each point are found for every return by looking back a few ranks,
- * the cache and the stack are arrays, and a set of states is a small sorted array, so that a step
- * is a few array reads and allocates at most the state it produces. A state's hash is computed only
- * once a search caches it, and unanswered writes are compared by numbers rather than by their
- * values: for a long history each value is a string somewhere else in memory, and reading it is
- * usually a cache miss. For the same reason a report of a violation reads only the operations it
- * shows.
+ * is read once, into arrays by its position in the input, and both the forward pass and the walks
+ * read them there through each rank's position; the operations it may try at each point are found
+ * for every return by looking back a few ranks, the cache and the stack are arrays, and a set of
+ * states is a small sorted array, so that a step is a few array reads and allocates at most the
+ * state it produces. A state's hash is computed only once a search caches it, and unanswered writes
+ * are compared by numbers rather than by their values: for a long history each value is a string
+ * somewhere else in memory, and reading it is usually a cache miss. For the same reason a report of
+ * a violation reads only the operations it shows.
  *
  * <p>{@link LinearizabilityReference} keeps the search as it was before, as an oracle.
  *
@@ -507,11 +506,7 @@ final class Linearizability {
   };
 
   private static byte code(History.Kind kind) {
-    return switch (kind) {
-      case GET -> 0;
-      case PUT -> 1;
-      case DELETE -> 2;
-    };
+    return kind.code;
   }
 
   private static final int[] NONE = new int[0];
@@ -615,7 +610,7 @@ final class Linearizability {
   }
 
   /** How far back {@link #candidates} looks without a branch; see there. */
-  private static final int NEAR = 4;
+  static final int NEAR = 4;
 
   /** The ranks after the prefix that the forward pass's window can hold placed. */
   private static final int WINDOW = 64;
@@ -688,6 +683,21 @@ final class Linearizability {
     Arrays.fill(lo, n, n + NEAR, Integer.MAX_VALUE); // past the last rank: never a candidate
     lo[n + NEAR] = farthest;
     return lo;
+  }
+
+  /**
+   * Whether no rank of {@code from} to {@code to - 1} runs past more than {@link #NEAR} others,
+   * with the same conditions as {@link #lows}: whether its most is at most NEAR, which is whether
+   * every rank r from {@code from + NEAR + 1} on is called after rank r - NEAR - 1 returns, since
+   * returns grow with rank. Then the candidates of rank p are p and those of the NEAR ranks after
+   * it that are called before p returns.
+   */
+  static boolean near(long[] call, long[] ret, int from, int to) {
+    boolean near = true;
+    for (int r = from + NEAR + 1; r < to; r++) {
+      near &= ret[r - NEAR - 1] <= call[r];
+    }
+    return near;
   }
 
   /**
@@ -993,8 +1003,7 @@ final class Linearizability {
     private final boolean parallel; // whether the history is long enough to split
     private final boolean forward; // whether stretches start with a forward pass, see Stretch
     // The position from the key's first operation of each answered one, by rank, and the fields of
-    // every operation of the key by that position, which the forward pass reads and fill() copies
-    // in rank order for a walk.
+    // every operation of the key by that position, which the searches read through it.
     // In the low bits of byRet, the position of each answered operation by rank, and above them
     // its return time, unless that does not fit; see the setup.
     private final long[] byRet;
@@ -1008,14 +1017,13 @@ final class Linearizability {
     private final History.Op[] openAsCalled; // by call, for the report
 
     // Every operation the search may linearize, by slot: the answered ones by rank, then the
-    // unanswered writes by call. value is what a put wrote or a read returned, and UNREAD for an
-    // unanswered put whose value no answered read returned. The fields of an answered one are
-    // copied only once a walk covers its rank (see fill()); call and ret hold those of every rank.
-    private final byte[] kind; // codes, see KINDS
-    private final boolean[] ok;
-    private final long[] expected;
-    private final long[] version;
-    private final String[] value;
+    // unanswered writes by call. call and ret hold the times of every rank; the other fields of an
+    // answered one are read by its position (see at()), and those of unanswered write o, in slot
+    // n + o, are openKind[o], openExpected[o] and openValue[o]: what it wrote, or UNREAD for a put
+    // whose value no answered read returned.
+    private final byte[] openKind; // codes, see KINDS
+    private final long[] openExpected;
+    private final String[] openValue;
     private final long[] call;
     private final long[] ret; // of the answered ones
 
@@ -1130,11 +1138,9 @@ final class Linearizability {
       }
 
       int slots = n + opens;
-      kind = new byte[slots];
-      ok = new boolean[slots];
-      expected = new long[slots];
-      version = new long[slots];
-      value = new String[slots];
+      openKind = new byte[opens];
+      openExpected = new long[opens];
+      openValue = new String[opens];
       call = new long[slots];
       // Which unanswered writes are interchangeable depends on whether an answered read returned
       // the value of each unanswered put, which reads the string of every read's value, each
@@ -1181,8 +1187,8 @@ final class Linearizability {
         call[r] = calls[j];
         settle[r] = (flags[j] & SETTLES) != 0;
       }
-      // The other fields of the answered operations are copied into rank order by the walks that
-      // search them (see fill()); the unanswered writes are copied by classes().
+      // The other fields of the answered operations are read by position; the unanswered writes
+      // are copied by classes().
       pin = new boolean[n];
       pins = pins(settle);
       Classes cl = forked ? classesTask.join() : classesTask.invoke();
@@ -1240,11 +1246,10 @@ final class Linearizability {
       for (int i = 0; i < opens; i++) {
         History.Op o = openAsCalled[i];
         boolean unread = o.kind == History.Kind.PUT && !read.contains(o.value);
-        int s = n + i;
-        kind[s] = code(o.kind);
-        expected[s] = o.expected;
-        value[s] = unread ? UNREAD : o.value;
-        call[s] = o.call;
+        openKind[i] = code(o.kind);
+        openExpected[i] = o.expected;
+        openValue[i] = unread ? UNREAD : o.value;
+        call[n + i] = o.call;
         // Deletes and unread puts with the same condition are interchangeable; others are not.
         List<Object> cls =
             unread || o.kind == History.Kind.DELETE ? List.of(o.kind, o.expected) : List.of(i);
@@ -1261,9 +1266,9 @@ final class Linearizability {
       boolean[] alone = new boolean[firstOfClass.length];
       boolean[] loose = new boolean[firstOfClass.length];
       for (int c = 0; c < alone.length; c++) {
-        int s = n + firstOfClass[c];
-        alone[c] = kindOf(s) == History.Kind.PUT && !UNREAD.equals(value[s]);
-        loose[c] = !alone[c] && expected[s] == -1;
+        int o = firstOfClass[c];
+        alone[c] = KINDS[openKind[o]] == History.Kind.PUT && !UNREAD.equals(openValue[o]);
+        loose[c] = !alone[c] && openExpected[o] == -1;
       }
       int[] sizes = new int[firstOfClass.length];
       for (int c : classOf) {
@@ -1280,34 +1285,21 @@ final class Linearizability {
       int[] effectOf = new int[opens];
       Map<List<Object>, Integer> effects = new HashMap<>();
       for (int o = 0; o < opens; o++) {
-        int s = n + o;
         effectOf[o] =
-            effects.computeIfAbsent(Arrays.asList(kindOf(s), value[s]), k -> effects.size());
+            effects.computeIfAbsent(
+                Arrays.asList(KINDS[openKind[o]], openValue[o]), k -> effects.size());
       }
       return new Classes(classOf, firstOfClass, members, alone, loose, effectOf);
     }
 
     /**
-     * Copies the fields of the answered operations of ranks {@code from} to {@code to - 1} into the
-     * arrays a walk reads, in rank order, when the walk makes their candidate lists ({@link
-     * Walk#cover}): a walk reads only the ranks of its lists. The forward pass reads the fields by
-     * position instead, through byRet, and on most ranks no walk runs, so most are never copied;
-     * copying every rank, each stretch its own, took about 7% of the checker's CPU time on the
-     * 100,000-operation histories of the benchmark. They are copied from the arrays the setup
-     * filled by position, not from the operations: each is an object of its own, and reading it a
-     * second time, in rank order, cost 2.4 ms of the checker's 15 ms of CPU time on 100,000
-     * operations, where copying from those arrays costs 0.9 ms.
+     * The position of the answered operation of rank {@code r} among the key's operations, where
+     * its fields are: a search reads them there rather than from copies in rank order. On most
+     * ranks no walk runs, and copying the ranks a walk searches still allocated those arrays for
+     * every rank, about 30 bytes per operation that were mostly never written.
      */
-    private void fill(int from, int to) {
-      for (int r = from; r < to; r++) {
-        int j = (int) byRet[r] & ((1 << low) - 1);
-        byte f = flags[j];
-        kind[r] = (byte) (f & KIND);
-        ok[r] = (f & OK) != 0;
-        expected[r] = expecteds[j];
-        version[r] = versions[j];
-        value[r] = values[j];
-      }
+    private int at(int r) {
+      return (int) byRet[r] & ((1 << low) - 1);
     }
 
     /**
@@ -1328,18 +1320,23 @@ final class Linearizability {
 
     /**
      * The candidates of the ranks {@code from} to {@code to - 1}, a stretch between pins or every
-     * rank: {@link #lows} at once, and the lists only when a walk needs them. The forward pass has
-     * no use for the order of the lists (see {@link Stretch#forward}) and finds the candidates from
-     * lo, and from {@link #reach} when some rank runs past more than {@link #NEAR} others; in most
+     * rank, found only as far as they are needed. The forward pass has no use for the order of the
+     * lists (see {@link Stretch#forward}). When no rank runs past more than {@link #NEAR} others,
+     * as in about three stretches in four of the benchmark's histories, it finds the candidates of
+     * rank p among the NEAR ranks after it by their call times, and nothing is made for the stretch
+     * beyond one look at each rank that tells it is so ({@link #near(long[], long[], int, int)});
+     * otherwise it finds them from {@link #lows} and {@link #reach}, made at once. In most
      * stretches it never gets stuck, and the lists are never made. A walk makes the lists of the
      * ranks it gets to itself (see {@link Walk#cover}); these are for the report. Making them for
      * every stretch where the pass needed them or a walk took over cost 8% of the checker's CPU
-     * time on the 100,000-operation linearizable history of the benchmark.
+     * time on the 100,000-operation linearizable history of the benchmark, and making lows for
+     * every stretch about 4%.
      */
     private final class Range {
       final int from;
       final int to;
-      final int[] lo;
+      final boolean near; // every candidate of rank p is p or one of the NEAR ranks after it
+      private int[] lo; // made when first needed if near
       // When some rank runs past more than NEAR others: reach[p - from], the highest candidate of
       // rank p, so that the forward pass finds the candidates of p among the ranks up to it.
       final int[] reach;
@@ -1348,31 +1345,40 @@ final class Linearizability {
       Range(int from, int to) {
         this.from = from;
         this.to = to;
-        lo = lows(call, ret, from, to);
-        reach = near() ? null : reach(lo, to - from);
+        near = near(call, ret, from, to);
+        lo = near ? null : lows(call, ret, from, to);
+        reach = near ? null : reach(lo, to - from);
       }
 
-      /** Whether every candidate of rank p is p or one of the {@link #NEAR} ranks after it. */
-      boolean near() {
-        return lo[to - from + NEAR] <= NEAR;
+      int[] lo() {
+        if (lo == null) {
+          lo = lows(call, ret, from, to);
+        }
+        return lo;
       }
 
       Lists lists() {
         if (lists == null) {
-
-          lists = Search.this.lists(from, to, lo);
+          lists = Search.this.lists(from, to, lo());
         }
         return lists;
       }
     }
 
     private State[] stepAll(State[] from, int s) {
+      if (s < n) {
+        int j = at(s);
+        int f = flags[j];
+        return Linearizability.stepAll(
+            from, KINDS[f & KIND], false, (f & OK) != 0, expecteds[j], versions[j], values[j]);
+      }
+      int o = s - n;
       return Linearizability.stepAll(
-          from, KINDS[kind[s]], s >= n, ok[s], expected[s], version[s], value[s]);
+          from, KINDS[openKind[o]], true, false, openExpected[o], 0, openValue[o]);
     }
 
     private History.Kind kindOf(int s) {
-      return KINDS[kind[s]];
+      return KINDS[s < n ? flags[at(s)] & KIND : openKind[s - n]];
     }
 
     private static boolean couldMatch(State[] states, long expected) {
@@ -1485,9 +1491,6 @@ final class Linearizability {
         while (to < end && !pin[to - 1]) {
           to++;
         }
-        // The fields of these ranks too, those not copied by the last cover: a walk reads only the
-        // ranks of its lists, and no rank in them is above to (see candidates()).
-        fill(cand != null && from == base ? Math.max(from, listEnd) : from, to);
         int[] start = new int[to - from + 1];
         cand = candidates(call, ret, from, to, start);
         candStart = start;
@@ -1743,14 +1746,14 @@ final class Linearizability {
           State[] after = stepAll(states, r);
           if (after.length == 0) {
             failing.add(r);
-          } else if (kindOf(r) == History.Kind.GET || !ok[r]) {
+          } else if (kindOf(r) == History.Kind.GET || (flags[at(r)] & OK) == 0) {
             observed.add(after);
           }
         }
         long limit = ret[prefix];
         for (int o = firstOpen; o < opens && call[n + o] < limit; o++) {
           int s = n + o;
-          if (!isApplied(o) && expected[s] != -1 && !couldMatch(states, expected[s])) {
+          if (!isApplied(o) && openExpected[o] != -1 && !couldMatch(states, openExpected[o])) {
             blocked.add(s);
           }
         }
@@ -1785,10 +1788,11 @@ final class Linearizability {
        * Repeating this moves w to a point that passes this test, or out of the linearization.
        */
       private boolean helps(int w, State[] after) {
-        if (expected[w] != -1 && couldMatch(states, expected[w])) {
+        long e = openExpected[w - n];
+        if (e != -1 && couldMatch(states, e)) {
           // A read or a conflict may pin the version so that w no longer matches after it.
           for (State[] o : observed) {
-            if (!couldMatch(o, expected[w])) {
+            if (!couldMatch(o, e)) {
               return true;
             }
           }
@@ -1802,7 +1806,7 @@ final class Linearizability {
           int c = blocked.items[i];
           // If c has the same effect as w, applying c after w changes nothing w did not.
           boolean same = effectOf[c - n] == effectOf[w - n];
-          if (!same && couldMatch(after, expected[c])) {
+          if (!same && couldMatch(after, openExpected[c - n])) {
             return true;
           }
         }
@@ -2166,8 +2170,7 @@ final class Linearizability {
        * pin, and applies no unanswered operation. So it is kept as a value and a version, and the
        * fit of each operation is a few comparisons, as in {@link Linearizability#next}, with no
        * state made. The fields of a candidate are read by its position, through byRet, from the
-       * arrays the setup filled, so that no stretch copies its ranks' fields into rank order unless
-       * a walk takes over (see {@link #fill}).
+       * arrays the setup filled (see {@link #at}).
        */
       private int forward(int prefix, State state) {
         lastPin = -1;
@@ -2179,8 +2182,8 @@ final class Linearizability {
         long at = state.version();
         long window = 0; // bit i: rank prefix + 1 + i is placed
         int base = range.from;
-        int[] lo = range.lo;
-        boolean near = range.near();
+        boolean near = range.near;
+        int[] lo = near ? null : range.lo();
         int[] reach = range.reach;
         int[] nearby = new int[near ? NEAR + 1 : WINDOW + 1];
         byte get = code(History.Kind.GET);
@@ -2199,17 +2202,25 @@ final class Linearizability {
           int from;
           int to;
           if (near) {
-            int p = prefix - base;
+            // Rank q runs at the return of p if it is called before it.
+            long until = ret[prefix];
             nearby[0] = prefix;
             int k = 1;
-            nearby[k] = prefix + 1;
-            k += lo[p + 1] <= p ? 1 : 0;
-            nearby[k] = prefix + 2;
-            k += lo[p + 2] <= p ? 1 : 0;
-            nearby[k] = prefix + 3;
-            k += lo[p + 3] <= p ? 1 : 0;
-            nearby[k] = prefix + 4;
-            k += lo[p + 4] <= p ? 1 : 0;
+            if (prefix + NEAR < end) {
+              nearby[k] = prefix + 1;
+              k += call[prefix + 1] < until ? 1 : 0;
+              nearby[k] = prefix + 2;
+              k += call[prefix + 2] < until ? 1 : 0;
+              nearby[k] = prefix + 3;
+              k += call[prefix + 3] < until ? 1 : 0;
+              nearby[k] = prefix + 4;
+              k += call[prefix + 4] < until ? 1 : 0;
+            } else {
+              for (int q = prefix + 1; q < end; q++) { // past end are no ranks of the stretch
+                nearby[k] = q;
+                k += call[q] < until ? 1 : 0;
+              }
+            }
             cand = nearby;
             from = 0;
             to = k;
