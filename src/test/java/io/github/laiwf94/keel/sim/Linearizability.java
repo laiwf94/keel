@@ -1,5 +1,7 @@
 package io.github.laiwf94.keel.sim;
 
+import java.lang.ref.SoftReference;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Comparator;
@@ -584,10 +586,17 @@ final class Linearizability {
    * takes. Returns the array that holds the result, from or a new one.
    */
   static long[] sortPacked(long[] from, int n, int low, int bits, long base) {
+    return sortPacked(from, n, low, bits, base, new long[n]);
+  }
+
+  /**
+   * As {@link #sortPacked(long[], int, int, int, long)}, through {@code to}, of at least {@code n}
+   * longs, which may hold anything; returns from or to.
+   */
+  static long[] sortPacked(long[] from, int n, int low, int bits, long base, long[] to) {
     int passes = (bits + 12) / 13;
     int digit = passes == 0 ? 0 : (bits + passes - 1) / passes;
     int radix = 1 << digit;
-    long[] to = new long[n];
     int[] count = new int[radix + 1];
     for (int p = 0; p < passes; p++) {
       int shift = low + p * digit;
@@ -843,8 +852,25 @@ final class Linearizability {
     }
   }
 
-  /** The fields of a key's operations by position, which {@link Search} reads them into. */
+  /**
+   * The fields of a key's operations by position, which {@link Search} reads them into, and the
+   * other arrays of a key's setup with one entry per operation at most. Each array has at least as
+   * many entries as the key has operations, and only those are written and read.
+   *
+   * <p>They are kept from one check to the next ({@link #take}, {@link #release}). Allocating them
+   * fresh, every array zeroed before the setup writes every entry anyway, took 0.17 ms of each
+   * key's setup of 33,000 operations, on its critical path, three keys at once: about 6% of the
+   * check of a 100,000-operation history. Up to {@link #KEPT} sets are kept, through soft
+   * references, so that a heap that needs the space gets it back, and none for keys of fewer than
+   * {@link #KEEP_FROM} operations, which allocate little.
+   */
   private static final class Columns {
+    static final int KEPT = 16;
+    static final int KEEP_FROM = 4096;
+
+    /** The sets kept, the most recently released last. */
+    private static final ArrayDeque<SoftReference<Columns>> kept = new ArrayDeque<>();
+
     final long[] calls;
     final byte[] flags;
     final long[] expecteds;
@@ -853,14 +879,60 @@ final class Linearizability {
     // The answered ones' return times above their positions, in input order: those of each
     // piece read from where it starts, then joined.
     final long[] packed;
+    final long[] scratch; // for the sort by return
+    final long[] call; // Search.call
+    final long[] ret; // Search.ret
+    final boolean[] settle;
+    final boolean[] pin; // Search.pin
 
-    Columns(int m) {
-      calls = new long[m];
-      flags = new byte[m];
-      expecteds = new long[m];
-      versions = new long[m];
-      values = new String[m];
-      packed = new long[m];
+    private Columns(int size) {
+      calls = new long[size];
+      flags = new byte[size];
+      expecteds = new long[size];
+      versions = new long[size];
+      values = new String[size];
+      packed = new long[size];
+      scratch = new long[size];
+      call = new long[size];
+      ret = new long[size];
+      settle = new boolean[size];
+      pin = new boolean[size];
+    }
+
+    /** Arrays for a key of {@code m} operations: a kept set if one fits, else new ones. */
+    static Columns take(int m) {
+      if (m < KEEP_FROM) {
+        return new Columns(m);
+      }
+      synchronized (kept) {
+        for (var it = kept.descendingIterator(); it.hasNext(); ) {
+          Columns c = it.next().get();
+          // Not much larger than needed: a set twice the size would keep it from a longer key.
+          if (c != null && c.calls.length >= m && c.calls.length <= 2 * m) {
+            it.remove();
+            return c;
+          }
+        }
+      }
+      return new Columns(m + m / 16); // room for a key a little longer next time
+    }
+
+    /**
+     * Keeps these arrays for a later key, once the search that used them is over, without the
+     * values they refer to, so that they keep no history alive.
+     */
+    void release() {
+      if (calls.length < KEEP_FROM) {
+        return;
+      }
+      Arrays.fill(values, null);
+      synchronized (kept) {
+        kept.removeIf(r -> r.get() == null);
+        if (kept.size() == KEPT) {
+          kept.removeFirst();
+        }
+        kept.addLast(new SoftReference<>(this));
+      }
     }
 
     /** Reads the operations at positions {@code from} to {@code to - 1} from lo of mine. */
@@ -1044,6 +1116,7 @@ final class Linearizability {
     private final int classWords; // longs in a bit set of classes
     // pin[p]: every linearization reaches one configuration right after rank p, see pins().
     private final boolean[] pin;
+    private final Columns cols; // the arrays above that come from a Columns, see verdict()
     private final int pins;
 
     // The bits of flags: the kind's code, whether the operation succeeded, and whether it leaves
@@ -1097,7 +1170,8 @@ final class Linearizability {
       int m = hi - lo;
       int below = 32 - Integer.numberOfLeadingZeros(Math.max(1, m - 1));
       low = below;
-      Columns cols = new Columns(m);
+      Columns cols = Columns.take(m);
+      this.cols = cols;
       // A long key is read in two halves at once, so that a thread with no key of its own to set
       // up, when there are fewer keys than threads, shares the reading.
       Piece piece;
@@ -1122,7 +1196,7 @@ final class Linearizability {
       long lastReturn = piece.lastReturn;
       int answers = piece.answers;
       n = answers;
-      ret = new long[n];
+      ret = cols.ret;
       Ints pending = new Ints();
       for (int k = 0; k < writes.size; k++) {
         if (calls[writes.items[k]] < lastReturn) {
@@ -1137,11 +1211,10 @@ final class Linearizability {
         openAsCalled[o] = (History.Op) ops[mine[lo + byCall[o]]];
       }
 
-      int slots = n + opens;
       openKind = new byte[opens];
       openExpected = new long[opens];
       openValue = new String[opens];
-      call = new long[slots];
+      call = cols.call; // n + opens slots, no more than the m operations
       // Which unanswered writes are interchangeable depends on whether an answered read returned
       // the value of each unanswered put, which reads the string of every read's value, each
       // somewhere else in memory on a long history: about 0.8 ms of a 33,000-operation key with
@@ -1171,12 +1244,13 @@ final class Linearizability {
         }
       } else {
         int bits = n == 0 ? 0 : 64 - Long.numberOfLeadingZeros(lastReturn - firstReturn);
-        byRet = inOrder ? packed : sortPacked(packed, n, low, bits, firstReturn << low);
+        byRet =
+            inOrder ? packed : sortPacked(packed, n, low, bits, firstReturn << low, cols.scratch);
         for (int r = 0; r < n; r++) {
           ret[r] = byRet[r] >>> low;
         }
       }
-      boolean[] settle = new boolean[n];
+      boolean[] settle = cols.settle;
       this.flags = flags;
       this.expecteds = expecteds;
       this.versions = versions;
@@ -1189,7 +1263,7 @@ final class Linearizability {
       }
       // The other fields of the answered operations are read by position; the unanswered writes
       // are copied by classes().
-      pin = new boolean[n];
+      pin = cols.pin;
       pins = pins(settle);
       Classes cl = forked ? classesTask.join() : classesTask.invoke();
       classOf = cl.classOf;
@@ -2337,7 +2411,9 @@ final class Linearizability {
     /** Empty if linearizable, else what the search could not get past. */
     Optional<String> verdict(String key) {
       int stuck = search();
-      return stuck < 0 ? Optional.empty() : Optional.of(report(key, stuck));
+      Optional<String> out = stuck < 0 ? Optional.empty() : Optional.of(report(key, stuck));
+      cols.release(); // nothing reads them from here on
+      return out;
     }
 
     /**

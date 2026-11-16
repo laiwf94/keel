@@ -12,6 +12,9 @@ import java.util.Comparator;
 import java.util.List;
 import java.util.Optional;
 import java.util.SplittableRandom;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import org.junit.jupiter.api.Test;
 
 class LinearizabilityTest {
@@ -395,6 +398,52 @@ class LinearizabilityTest {
             withoutTimes(Linearizability.check(shifted(ops, shift))),
             "seed " + seed + ", shift " + shift);
       }
+    }
+  }
+
+  /**
+   * A key of at least 4,096 operations is set up in arrays kept from an earlier key, which still
+   * hold that key's fields, beyond the new key's operations and within them until they are written.
+   * Long histories checked one after another in either order, and from four threads at once, with
+   * keys longer and shorter than the ones before them, with and without unanswered writes and with
+   * times too large to pack, must check the same way every time.
+   */
+  @Test
+  void arraysKeptFromEarlierKeysCheckTheSameWay() throws Exception {
+    List<List<History.Op>> histories = new ArrayList<>();
+    for (int i = 0; i < 8; i++) {
+      // Keys of about 3,000 operations, which are not kept, to 15,000.
+      List<History.Op> ops =
+          HistoryGenerator.linearizable(
+              i, new HistoryGenerator.Shape(6_000 + 3_500 * i, 3 + i % 3, 2, i % 2 * 0.0005));
+      if (i % 3 != 0) {
+        HistoryGenerator.staleRead(ops, i);
+      }
+      histories.add(i == 5 ? shifted(ops, 1L << 58) : ops);
+    }
+    List<Optional<String>> first = new ArrayList<>();
+    for (int i = 0; i < histories.size(); i++) {
+      Optional<String> verdict = Linearizability.check(histories.get(i));
+      assertEquals(i % 3 != 0, verdict.isPresent(), "history " + i);
+      first.add(verdict);
+    }
+    for (int i = histories.size() - 1; i >= 0; i--) {
+      assertEquals(first.get(i), Linearizability.check(histories.get(i)), "history " + i);
+    }
+    ExecutorService threads = Executors.newFixedThreadPool(4);
+    try {
+      List<Future<Optional<String>>> verdicts = new ArrayList<>();
+      for (int round = 0; round < 4; round++) {
+        for (List<History.Op> ops : histories) {
+          verdicts.add(threads.submit(() -> Linearizability.check(ops)));
+        }
+      }
+      for (int v = 0; v < verdicts.size(); v++) {
+        int i = v % histories.size();
+        assertEquals(first.get(i), verdicts.get(v).get(), "history " + i + ", check " + v);
+      }
+    } finally {
+      threads.shutdownNow();
     }
   }
 
