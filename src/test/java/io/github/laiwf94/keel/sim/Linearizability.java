@@ -597,19 +597,35 @@ final class Linearizability {
     int passes = (bits + 12) / 13;
     int digit = passes == 0 ? 0 : (bits + passes - 1) / passes;
     int radix = 1 << digit;
-    int[] count = new int[radix + 1];
+    int mask = radix - 1;
+    // Every pass's counts in one read of the input, since they do not depend on the order: at
+    // count[p * (radix + 1) + d + 1] the longs whose digit p is d.
+    int stride = radix + 1;
+    int[] count = new int[passes * stride];
+    if (passes == 2) { // the common case: one loop with no inner one
+      int high = low + digit;
+      for (int i = 0; i < n; i++) {
+        long k = from[i] - base;
+        count[(int) ((k >>> low) & mask) + 1]++;
+        count[stride + (int) ((k >>> high) & mask) + 1]++;
+      }
+    } else {
+      for (int i = 0; i < n; i++) {
+        long k = from[i] - base;
+        for (int p = 0; p < passes; p++) {
+          count[p * stride + (int) ((k >>> (low + p * digit)) & mask) + 1]++;
+        }
+      }
+    }
     for (int p = 0; p < passes; p++) {
       int shift = low + p * digit;
-      Arrays.fill(count, 0);
-      for (int i = 0; i < n; i++) {
-        count[(int) (((from[i] - base) >>> shift) & (radix - 1)) + 1]++;
-      }
+      int at = p * stride;
       for (int d = 0; d < radix; d++) {
-        count[d + 1] += count[d];
+        count[at + d + 1] += count[at + d];
       }
       for (int i = 0; i < n; i++) {
         long v = from[i];
-        to[count[(int) (((v - base) >>> shift) & (radix - 1))]++] = v;
+        to[count[at + (int) (((v - base) >>> shift) & mask)]++] = v;
       }
       long[] t = from;
       from = to;
@@ -882,7 +898,7 @@ final class Linearizability {
     final long[] scratch; // for the sort by return
     final long[] call; // Search.call
     final long[] ret; // Search.ret
-    final boolean[] settle;
+    final byte[] rankFlags; // Search.rankFlags
     final boolean[] pin; // Search.pin
 
     private Columns(int size) {
@@ -895,7 +911,7 @@ final class Linearizability {
       scratch = new long[size];
       call = new long[size];
       ret = new long[size];
-      settle = new boolean[size];
+      rankFlags = new byte[size];
       pin = new boolean[size];
     }
 
@@ -1083,6 +1099,7 @@ final class Linearizability {
     private final int[] positions; // the input positions of the key's operations, from lo
     private final int lo;
     private final byte[] flags; // the kind's code, OK and SETTLES
+    private final byte[] rankFlags; // flags by rank, of the answered ones
     private final long[] expecteds;
     private final long[] versions;
     private final String[] values;
@@ -1228,7 +1245,8 @@ final class Linearizability {
       }
       // The positions by rank, and the return times: from the packed longs once they are sorted,
       // unless some return time does not fit above a position.
-      if (n > 0 && (firstReturn < 0 || lastReturn >= 1L << (63 - low))) {
+      boolean fits = n == 0 || (firstReturn >= 0 && lastReturn < 1L << (63 - low));
+      if (!fits) {
         int[] done = new int[n];
         long[] rets = new long[m];
         for (int a = 0; a < n; a++) {
@@ -1246,25 +1264,29 @@ final class Linearizability {
         int bits = n == 0 ? 0 : 64 - Long.numberOfLeadingZeros(lastReturn - firstReturn);
         byRet =
             inOrder ? packed : sortPacked(packed, n, low, bits, firstReturn << low, cols.scratch);
-        for (int r = 0; r < n; r++) {
-          ret[r] = byRet[r] >>> low;
-        }
       }
-      boolean[] settle = cols.settle;
+      byte[] rankFlags = cols.rankFlags;
+      this.rankFlags = rankFlags;
       this.flags = flags;
       this.expecteds = expecteds;
       this.versions = versions;
       this.values = values;
       int mask = (1 << low) - 1;
-      for (int r = 0; r < n; r++) {
-        int j = (int) byRet[r] & mask;
-        call[r] = calls[j];
-        settle[r] = (flags[j] & SETTLES) != 0;
-      }
       // The other fields of the answered operations are read by position; the unanswered writes
       // are copied by classes().
       pin = cols.pin;
-      pins = pins(settle);
+      if (fits) {
+        // The times and flags by rank and the pins in one pass, from the highest rank down as
+        // pins() goes, reading the return time of the rank below from its packed long.
+        pins = pinsPacked(byRet, calls, flags);
+      } else {
+        for (int r = 0; r < n; r++) {
+          int j = (int) byRet[r] & mask;
+          call[r] = calls[j];
+          rankFlags[r] = flags[j];
+        }
+        pins = pins();
+      }
       Classes cl = forked ? classesTask.join() : classesTask.invoke();
       classOf = cl.classOf;
       firstOfClass = cl.firstOfClass;
@@ -1452,7 +1474,7 @@ final class Linearizability {
     }
 
     private History.Kind kindOf(int s) {
-      return KINDS[s < n ? flags[at(s)] & KIND : openKind[s - n]];
+      return KINDS[s < n ? rankFlags[s] & KIND : openKind[s - n]];
     }
 
     private static boolean couldMatch(State[] states, long expected) {
@@ -1820,7 +1842,7 @@ final class Linearizability {
           State[] after = stepAll(states, r);
           if (after.length == 0) {
             failing.add(r);
-          } else if (kindOf(r) == History.Kind.GET || (flags[at(r)] & OK) == 0) {
+          } else if (kindOf(r) == History.Kind.GET || (rankFlags[r] & OK) == 0) {
             observed.add(after);
           }
         }
@@ -2320,9 +2342,9 @@ final class Linearizability {
             if (off >= 0 && off < 64 && (window & (1L << off)) != 0) {
               continue;
             }
-            int j = (int) byRet[c] & mask;
-            int f = flags[j];
+            int f = rankFlags[c];
             boolean read = (f & KIND) == get;
+            int j = (int) byRet[c] & mask;
             if (!read && (f & OK) != 0) {
               if (write < 0 || logOrderAt(j, writeAt) < 0) {
                 write = c;
@@ -2346,8 +2368,11 @@ final class Linearizability {
             int c = cand[i];
             int off = c - prefix - 1;
             boolean placed = off >= 0 && off < 64 && (window & (1L << off)) != 0;
-            int j = (int) byRet[c] & mask;
-            if (!placed && (flags[j] & KIND) != get && (flags[j] & OK) != 0 && applies(j, at)) {
+            int f = rankFlags[c];
+            if (!placed
+                && (f & KIND) != get
+                && (f & OK) != 0
+                && applies((int) byRet[c] & mask, at)) {
               r = c;
             }
           }
@@ -2355,9 +2380,9 @@ final class Linearizability {
             stuck = prefix;
             return HANDED_BACK;
           }
-          int rj = (int) byRet[r] & mask;
-          int rf = flags[rj];
+          int rf = rankFlags[r];
           if ((rf & KIND) != get && (rf & OK) != 0) {
+            int rj = (int) byRet[r] & mask;
             boolean isPut = (rf & KIND) == put;
             now = isPut ? values[rj] : null;
             at = isPut ? versions[rj] : 0; // a delete leaves no value, as State.ABSENT
@@ -2582,7 +2607,7 @@ final class Linearizability {
      * success, the history is not linearizable, and the search stops instead of trying every
      * alternative below the pin, which could only lead back to it.
      */
-    private int pins(boolean[] settle) {
+    private int pins() {
       // Rank p runs alone if no higher rank is called before it returns, which is a look at the
       // earliest call above it, and no lower rank returns after it is called, which is a look at
       // the rank below, since returns grow with rank. So pins need no candidate lists, and the
@@ -2595,7 +2620,36 @@ final class Linearizability {
         // of a generated history are pins. Times are not negative, so the differences cannot
         // overflow, and their sign bits give the comparisons.
         long before = p == 0 ? c - 1 : ret[p - 1];
-        int isPin = (int) ((~(earliest - ret[p]) & (before - c)) >>> 63) & (settle[p] ? 1 : 0);
+        int isPin =
+            (int) ((~(earliest - ret[p]) & (before - c)) >>> 63) & ((rankFlags[p] & SETTLES) >>> 3);
+        earliest = Math.min(earliest, c);
+        pin[p] = isPin != 0;
+        count += isPin;
+      }
+      return count;
+    }
+
+    /**
+     * As the fill of call, ret and rankFlags from the sorted packed longs {@code byRet} and the
+     * fields by position, then {@link #pins}, in one pass from the highest rank down: the return
+     * time of the rank below, which a pin's test needs before that rank is reached, is read from
+     * its packed long.
+     */
+    private int pinsPacked(long[] byRet, long[] calls, byte[] flags) {
+      int mask = (1 << low) - 1;
+      int count = 0;
+      long earliest = Long.MAX_VALUE; // the earliest call above p
+      for (int p = n - 1; p >= 0; p--) {
+        long v = byRet[p];
+        int j = (int) v & mask;
+        long c = calls[j];
+        long r = v >>> low;
+        byte f = flags[j];
+        call[p] = c;
+        ret[p] = r;
+        rankFlags[p] = f;
+        long before = p == 0 ? c - 1 : byRet[p - 1] >>> low;
+        int isPin = (int) ((~(earliest - r) & (before - c)) >>> 63) & ((f & SETTLES) >>> 3);
         earliest = Math.min(earliest, c);
         pin[p] = isPin != 0;
         count += isPin;
