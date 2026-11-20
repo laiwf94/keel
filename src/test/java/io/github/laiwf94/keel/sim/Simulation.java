@@ -6,6 +6,7 @@ import io.github.laiwf94.keel.raft.HardState;
 import io.github.laiwf94.keel.raft.MemStorage;
 import io.github.laiwf94.keel.raft.Member;
 import io.github.laiwf94.keel.raft.Message;
+import io.github.laiwf94.keel.raft.NotLeaderException;
 import io.github.laiwf94.keel.raft.RaftNode;
 import io.github.laiwf94.keel.raft.RaftOptions;
 import io.github.laiwf94.keel.raft.ReadMode;
@@ -50,20 +51,59 @@ final class Simulation {
       double maxDrift,
       boolean oneWayPartitions,
       boolean diskFaults,
+      boolean transfers,
       RaftOptions raft) {
     /**
      * Every fault on. {@code oneWayPartitions} adds a second fault schedule that cuts links in one
      * direction only; {@code diskFaults} gives every node a disk with its own latency, stall and
-     * fsync-failure rates. Both only act while {@code faults} is on.
+     * fsync-failure rates; {@code transfers} adds a third schedule of leadership transfers and
+     * graceful shutdowns, each followed by a restart. All three only act while {@code faults} is
+     * on.
      */
     static Options defaults() {
       return new Options(
-          5, 6_000, 10, 1, 15, 0.02, 0.02, true, 400, 40, 0.03, true, true, RaftOptions.DEFAULTS);
+          5,
+          6_000,
+          10,
+          1,
+          15,
+          0.02,
+          0.02,
+          true,
+          400,
+          40,
+          0.03,
+          true,
+          true,
+          true,
+          RaftOptions.DEFAULTS);
     }
 
-    /** Only the faults the simulator had before one-way partitions and disk faults. */
+    /**
+     * Only the faults the simulator had before one-way partitions, disk faults, leadership
+     * transfers and graceful shutdowns.
+     */
     Options withClassicFaults() {
-      return withOneWayPartitions(false).withDiskFaults(false);
+      return withOneWayPartitions(false).withDiskFaults(false).withTransfers(false);
+    }
+
+    Options withTransfers(boolean on) {
+      return new Options(
+          nodes,
+          durationMs,
+          tickMs,
+          minDelayMs,
+          maxDelayMs,
+          dropRate,
+          duplicateRate,
+          faults,
+          meanFaultGapMs,
+          snapshotEvery,
+          maxDrift,
+          oneWayPartitions,
+          diskFaults,
+          on,
+          raft);
     }
 
     Options withOneWayPartitions(boolean on) {
@@ -81,6 +121,7 @@ final class Simulation {
           maxDrift,
           on,
           diskFaults,
+          transfers,
           raft);
     }
 
@@ -99,6 +140,7 @@ final class Simulation {
           maxDrift,
           oneWayPartitions,
           on,
+          transfers,
           raft);
     }
 
@@ -117,6 +159,7 @@ final class Simulation {
           maxDrift,
           oneWayPartitions,
           diskFaults,
+          transfers,
           raft);
     }
 
@@ -135,6 +178,7 @@ final class Simulation {
           maxDrift,
           oneWayPartitions,
           diskFaults,
+          transfers,
           raft);
     }
 
@@ -154,6 +198,7 @@ final class Simulation {
           drift,
           oneWayPartitions,
           diskFaults,
+          transfers,
           raft);
     }
 
@@ -173,6 +218,7 @@ final class Simulation {
           maxDrift,
           oneWayPartitions,
           diskFaults,
+          transfers,
           raft);
     }
 
@@ -191,6 +237,7 @@ final class Simulation {
           maxDrift,
           oneWayPartitions,
           diskFaults,
+          transfers,
           raft);
     }
   }
@@ -280,6 +327,12 @@ final class Simulation {
    */
   final Random faultRnd;
 
+  /**
+   * The random source for leadership transfers and graceful shutdowns, separate from the others for
+   * the same reason as {@link #faultRnd}: with them off, a seed replays the run it did before.
+   */
+  final Random transferRnd;
+
   final Options opts;
 
   /** Which faults may happen; see {@link Plan}. */
@@ -310,6 +363,7 @@ final class Simulation {
     this.seed = seed;
     this.rnd = new Random(seed);
     this.faultRnd = new Random(faultSeed(seed));
+    this.transferRnd = new Random(transferSeed(seed));
     this.opts = opts;
     this.machines = machines;
     List<Member> ms = new ArrayList<>();
@@ -328,6 +382,10 @@ final class Simulation {
 
   static long faultSeed(long seed) {
     return Long.rotateLeft(seed, 32) ^ 0x9E3779B97F4A7C15L;
+  }
+
+  static long transferSeed(long seed) {
+    return Long.rotateLeft(seed, 17) ^ 0xD1B54A32D192ED03L;
   }
 
   private DiskProfile newDisk() {
@@ -752,7 +810,185 @@ final class Simulation {
         schedule(
             opts.meanFaultGapMs() / 2 + faultRnd.nextInt(opts.meanFaultGapMs()), this::oneWayFault);
       }
+      if (opts.transfers()) {
+        schedule(nextTransferGap(), this::transferFault);
+      }
     }
+  }
+
+  private long nextTransferGap() {
+    return (long) opts.meanFaultGapMs() / 2 + transferRnd.nextInt(opts.meanFaultGapMs());
+  }
+
+  /**
+   * The schedule of planned maintenance, which runs beside {@link #fault()}: the leader hands over
+   * to a voter picked at random, which may be down, cut off or behind, or to the voter best placed
+   * to take over; or a node, often the leader, shuts down gracefully as the server does on SIGTERM
+   * and comes back up between 100 ms and 1 s later, as in a rolling restart.
+   */
+  private void transferFault() {
+    if (now >= opts.durationMs()) {
+      return;
+    }
+    schedule(nextTransferGap(), this::transferFault);
+    int choice = transferRnd.nextInt(4);
+    int pick = transferRnd.nextInt(1 << 16);
+    long downMs = 100L + transferRnd.nextInt(901);
+    Optional<SimNode> leader = leader();
+    switch (choice) {
+      case 0 ->
+          leader.ifPresent(
+              l -> {
+                List<String> others = new ArrayList<>(l.replica.node().config().voterIds());
+                others.remove(l.id);
+                if (!others.isEmpty()) {
+                  transferLeadership(l.id, others.get(pick % others.size()));
+                }
+              });
+      case 1 ->
+          leader.ifPresent(
+              l ->
+                  l.replica
+                      .node()
+                      .bestTransferTarget()
+                      .ifPresent(t -> transferLeadership(l.id, t)));
+      case 2 -> leader.ifPresent(l -> shutDownGracefully(l.id, downMs));
+      default -> {
+        List<String> up = nodes.values().stream().filter(n -> n.up).map(n -> n.id).toList();
+        if (!up.isEmpty()) {
+          shutDownGracefully(up.get(pick % up.size()), downMs);
+        }
+      }
+    }
+  }
+
+  long transfersStarted;
+  long transfersCompleted;
+  long gracefulShutdowns;
+
+  /** Graceful shutdowns of a leader that had a voter to hand over to, and those that did. */
+  long leaderShutdowns;
+
+  long handoffs;
+
+  /**
+   * Asks the leader {@code from} to hand leadership to {@code to}, if the plan allows it, and
+   * counts the transfer as completed if {@code to} leads in a later term before the transfer would
+   * have given up.
+   */
+  void transferLeadership(String from, String to) {
+    if (!plan.fault(now, "transfer leadership from " + from + " to " + to)) {
+      return;
+    }
+    startTransfer(nodes.get(from), to);
+  }
+
+  private void startTransfer(SimNode n, String to) {
+    if (!n.up) {
+      return;
+    }
+    if (n.busy(now)) {
+      int inc = n.incarnation;
+      schedule(
+          n.busyUntil - now,
+          () -> {
+            if (n.incarnation == inc) {
+              startTransfer(n, to);
+            }
+          });
+      return;
+    }
+    catchUp(n);
+    RaftNode node = n.replica.node();
+    long term = node.term();
+    try {
+      node.transferLeadership(to);
+    } catch (NotLeaderException | IllegalArgumentException e) {
+      return;
+    }
+    transfersStarted++;
+    faultLog.add(now + " transfer leadership from " + n.id + " to " + to);
+    afterStep(n);
+    watchTransfer(to, term, now + 2L * opts.raft().electionTicks() * opts.tickMs());
+  }
+
+  private void watchTransfer(String to, long term, long deadline) {
+    SimNode t = nodes.get(to);
+    if (t.up && t.replica.node().role() == RaftNode.Role.LEADER && t.replica.node().term() > term) {
+      transfersCompleted++;
+      faultLog.add(now + " " + to + " took over in term " + t.replica.node().term());
+      return;
+    }
+    if (now < deadline) {
+      schedule(opts.tickMs(), () -> watchTransfer(to, term, deadline));
+    }
+  }
+
+  /**
+   * Stops {@code id} as {@code KeelServer.close()} does, if the plan allows it: a leader first
+   * hands over to the voter best placed to take over and waits until another node is known to lead,
+   * the transfer gives up, or the server's handoff timeout passes; then the node stops with
+   * everything it wrote on disk. It restarts {@code downMs} later if the plan allows that too.
+   */
+  void shutDownGracefully(String id, long downMs) {
+    SimNode n = nodes.get(id);
+    if (!n.up || !plan.fault(now, "graceful shutdown of " + id)) {
+      return;
+    }
+    gracefulShutdowns++;
+    faultLog.add(now + " graceful shutdown of " + id);
+    long handoffMs = 4L * opts.raft().electionTicks() * opts.tickMs();
+    handOffThenStop(n, n.incarnation, -1, now + handoffMs, downMs);
+  }
+
+  /**
+   * One round of a graceful shutdown. {@code term} is the term in which this node started handing
+   * over, or -1 before it has.
+   */
+  private void handOffThenStop(SimNode n, int inc, long term, long deadline, long downMs) {
+    if (!n.up || n.incarnation != inc) {
+      return;
+    }
+    if (n.busy(now)) {
+      schedule(n.busyUntil - now, () -> handOffThenStop(n, inc, term, deadline, downMs));
+      return;
+    }
+    catchUp(n);
+    RaftNode node = n.replica.node();
+    boolean leads = node.role() == RaftNode.Role.LEADER;
+    if (term < 0 && leads) {
+      Optional<String> to = node.bestTransferTarget();
+      if (to.isPresent()) {
+        long t = node.term();
+        leaderShutdowns++;
+        node.transferLeadership(to.get());
+        faultLog.add(now + " " + n.id + " hands over to " + to.get() + " before stopping");
+        afterStep(n);
+        schedule(opts.tickMs(), () -> handOffThenStop(n, inc, t, deadline, downMs));
+        return;
+      }
+    } else if (term >= 0) {
+      boolean stillLeads = leads && node.term() == term;
+      if (!stillLeads && node.leader().isPresent()) {
+        handoffs++;
+        faultLog.add(now + " " + n.id + " handed over to " + node.leader().get());
+      } else if (!(stillLeads && node.transferee().isEmpty()) && now < deadline) {
+        schedule(opts.tickMs(), () -> handOffThenStop(n, inc, term, deadline, downMs));
+        return;
+      }
+    }
+    // A clean stop: every write the node made is on disk.
+    stop(n.id, n.storage.unsyncedWrites());
+    faultLog.add(now + " stopped " + n.id);
+    schedule(
+        downMs,
+        () -> {
+          if (!retired.contains(n.id)
+              && !n.up
+              && plan.fault(now, "restart " + n.id + " after a graceful shutdown")) {
+            restart(n.id);
+          }
+        });
   }
 
   /**

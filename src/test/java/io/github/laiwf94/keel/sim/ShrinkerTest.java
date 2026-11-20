@@ -248,6 +248,12 @@ class ShrinkerTest {
    * A real bug: a replica that ignores client sessions applies a retried write twice. The
    * linearizability checker catches it under faults; the shrinker reduces the run to the few faults
    * and client operations that still show it.
+   *
+   * <p>It runs without leadership transfers and graceful shutdowns, which have a random source of
+   * their own, so seed 0 replays the run this was written against. With them on, the first seeds
+   * that fail are 2 and 3, and their client steps do not shrink to a minimal set within this replay
+   * budget; neither do seeds 2 to 4 without them. Shrinking a failure that the new faults cause is
+   * {@link #aFailureCausedByAGracefulShutdownShrinksToIt}.
    */
   @Test
   void aDuplicatedRetryShrinksToAFewFaultsAndOperations() {
@@ -257,7 +263,7 @@ class ShrinkerTest {
                 Linearizability.check(
                         KvSimulationTest.run(
                                 seed,
-                                Simulation.Options.defaults(),
+                                Simulation.Options.defaults().withTransfers(false),
                                 KvSimulationTest.ForgetfulSessions::new)
                             .history()
                             .ops)
@@ -275,6 +281,46 @@ class ShrinkerTest {
     assertEquals(
         Shrinker.signature(r.failure()),
         Shrinker.signature(replay(body, seed, r.faults(), r.steps()).orElseThrow()));
+  }
+
+  /** Fails as soon as a leader hands over while it shuts down gracefully. */
+  static void aLeaderHandsOverAsItStops(long seed) {
+    Simulation.Options opts = Simulation.Options.defaults();
+    Simulation sim = new Simulation(seed, opts, ListMachine::new);
+    sim.startAll();
+    sim.runUntil(opts.durationMs());
+    if (sim.handoffs > 0) {
+      throw new AssertionError(sim.handoffs + " leaders handed over as they stopped");
+    }
+  }
+
+  /**
+   * Leadership transfers and graceful shutdowns are faults like the others: the shrinker keeps the
+   * graceful shutdown that causes the failure and removes the rest.
+   */
+  @Test
+  void aFailureCausedByAGracefulShutdownShrinksToIt() {
+    LongConsumer body = ShrinkerTest::aLeaderHandsOverAsItStops;
+    long seed = firstFailingSeed(body, 200);
+    Shrinker.Result r = Shrinker.shrink("ShrinkerTest.handoff", body, seed, 2_000);
+    System.out.println(r.report());
+    assertTrue(r.minimal(), r.report());
+    assertTrue(r.originalFaults() > 10, r.report());
+    assertTrue(r.faults().cardinality() <= 3, r.report());
+    assertTrue(
+        r.schedule().stream().anyMatch(l -> l.matches("f\\d+ at \\d+ ms: graceful shutdown of .*")),
+        r.report());
+    assertEquals(
+        Shrinker.signature(r.failure()),
+        Shrinker.signature(replay(body, seed, r.faults(), r.steps()).orElseThrow()));
+    r.faults().stream()
+        .forEach(
+            f -> {
+              BitSet fewer = (BitSet) r.faults().clone();
+              fewer.clear(f);
+              assertTrue(
+                  replay(body, seed, fewer, r.steps()).isEmpty(), "still fails without f" + f);
+            });
   }
 
   @Test
