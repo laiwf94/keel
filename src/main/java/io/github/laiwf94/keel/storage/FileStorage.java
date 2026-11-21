@@ -13,6 +13,7 @@ import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
 import java.nio.channels.FileLock;
 import java.nio.channels.OverlappingFileLockException;
+import java.nio.file.DirectoryStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
@@ -20,7 +21,6 @@ import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
-import java.util.zip.CRC32C;
 
 /**
  * Durable storage in one directory.
@@ -29,41 +29,53 @@ import java.util.zip.CRC32C;
  *   <li>{@code state} holds the term and vote. It is replaced atomically: write a temporary file,
  *       fsync it, rename it over the old one, fsync the directory.
  *   <li>{@code snapshot} holds the latest snapshot, replaced the same way.
- *   <li>{@code log} is append-only. Each record is {@code [length][crc32c][payload]}. Appends are
- *       buffered by the OS until {@link #sync()}, which calls fdatasync. Truncating a conflicting
- *       suffix truncates the file. After a snapshot the log is rewritten to hold only later
- *       entries.
+ *   <li>{@code wal} holds the log as fixed-size segment files; see {@link SegmentedLog}. Appends
+ *       are buffered by the OS until {@link #sync()}, which calls fdatasync. Truncating a
+ *       conflicting suffix deletes the later segments and cuts the one holding the first entry to
+ *       drop. After a snapshot the log is rewritten into {@code wal.new} to hold only later
+ *       entries, and the two directories are swapped by renames.
  * </ul>
  *
- * <p>On startup a record that fails its length or CRC check is a torn final write if nothing valid
- * follows it, and the file is cut there; that data was never synced, so no peer was told about it.
- * If a valid record does follow, the damage is in the middle of the log and startup fails rather
- * than silently dropping entries the node may have acknowledged.
+ * <p>On startup a record that fails its length or CRC check is a torn final write if it is in the
+ * last segment and nothing valid follows it, and the segment is cut there; that data was never
+ * synced, so no peer was told about it. Anywhere else the damage is in data the node may have
+ * acknowledged, and startup fails rather than silently dropping entries.
+ *
+ * <p>A directory written before the log was segmented has a single {@code log} file of the same
+ * records; it is read with the same rules and moved into segments on first open.
  */
 public final class FileStorage implements Storage, AutoCloseable {
-  private static final int HEADER = 8;
-  // index, term, type and the data length prefix
-  private static final int ENTRY_FIXED = 8 + 8 + 1 + 4;
-  private static final int MAX_RECORD = Codec.MAX_ENTRY_BYTES + 64;
+  private static final int HEADER = SegmentedLog.RECORD_HEADER;
   private static final int MAX_STATE = 1024;
 
   private final Path dir;
-  private final Path logPath;
+  private final Path wal;
+  private final Path walNew;
+  private final Path walOld;
+  private final long segmentBytes;
   private final FileChannel lockChannel;
   private final FileLock lock;
-  private FileChannel log;
-  private long fileFirstIndex;
-  private final List<Long> offsets = new ArrayList<>();
+  private SegmentedLog log;
   private HardState pendingState;
-  private boolean logDirty;
   private long fsyncs;
   private long tornBytesDropped;
   private State loaded;
 
   /** Opens (creating if needed) the storage directory and recovers its contents. */
   public FileStorage(Path dir) {
+    this(dir, SegmentedLog.DEFAULT_SEGMENT_BYTES);
+  }
+
+  /**
+   * Opens the storage directory with log segments of {@code segmentBytes}. The size applies to
+   * segments started from now on; existing segments are read whatever their size.
+   */
+  public FileStorage(Path dir, long segmentBytes) {
     this.dir = dir;
-    this.logPath = dir.resolve("log");
+    this.wal = dir.resolve("wal");
+    this.walNew = dir.resolve("wal.new");
+    this.walOld = dir.resolve("wal.old");
+    this.segmentBytes = segmentBytes;
     FileChannel lc = null;
     FileLock fl = null;
     try {
@@ -111,18 +123,11 @@ public final class FileStorage implements Storage, AutoCloseable {
     HardState hs = readState();
     Optional<Snapshot> snapshot = readSnapshot();
     long snapIndex = snapshot.map(s -> s.meta().index()).orElse(0L);
+    finishRewrite();
+    migrateLegacyLog();
     List<Entry> entries = new ArrayList<>();
-    List<Long> recordOffsets = new ArrayList<>();
-    long validEnd = scanLog(entries, recordOffsets);
-
-    log =
-        FileChannel.open(
-            logPath, StandardOpenOption.CREATE, StandardOpenOption.READ, StandardOpenOption.WRITE);
-    if (validEnd < log.size()) {
-      tornBytesDropped = log.size() - validEnd;
-      log.truncate(validEnd);
-      log.force(true);
-    }
+    log = SegmentedLog.open(wal, segmentBytes, entries);
+    tornBytesDropped += log.tornBytesDropped();
 
     // Keep only entries after the snapshot. If the log does not hold the snapshot's last entry
     // with the same term, its entries conflict with the snapshot (we crashed between installing a
@@ -144,125 +149,70 @@ public final class FileStorage implements Storage, AutoCloseable {
       }
     }
     if (kept.size() != entries.size()) {
-      fileFirstIndex = snapIndex + 1;
-      rewriteLog(kept);
-    } else {
-      offsets.addAll(recordOffsets);
-      fileFirstIndex = entries.isEmpty() ? snapIndex + 1 : entries.get(0).index();
+      rewriteLog(snapIndex + 1, kept);
+    } else if (entries.isEmpty()) {
+      log.startAt(snapIndex + 1);
     }
     loaded = new State(hs, snapshot, kept);
   }
 
-  /** Reads every valid record; returns the offset where valid data ends. */
-  private long scanLog(List<Entry> out, List<Long> recordOffsets) throws IOException {
-    if (!Files.exists(logPath)) {
-      return 0;
+  /**
+   * Completes or abandons a log rewrite a crash interrupted. {@code wal.new} is renamed into place
+   * only once it is complete and only after {@code wal} was renamed away, so {@code wal.new}
+   * without {@code wal} is complete, and {@code wal.new} beside {@code wal} is not.
+   */
+  private void finishRewrite() throws IOException {
+    if (!Files.exists(wal) && Files.isDirectory(walNew)) {
+      Files.move(walNew, wal, StandardCopyOption.ATOMIC_MOVE);
+      syncDirectory();
+      fsyncs++;
     }
-    try (FileChannel ch = FileChannel.open(logPath, StandardOpenOption.READ)) {
-      long size = ch.size();
-      long pos = 0;
-      while (pos < size) {
-        Optional<Entry> e = readRecord(ch, pos, size);
-        if (e.isEmpty()) {
-          long next = nextRecordAfterDamage(ch, pos, size);
-          if (next >= 0) {
-            throw new StorageException(
-                "log record at byte "
-                    + pos
-                    + " is corrupt but a valid record follows at byte "
-                    + next
-                    + "; refusing to drop acknowledged entries");
-          }
-          return pos;
-        }
-        Entry entry = e.get();
-        if (!out.isEmpty()) {
-          Entry prev = out.get(out.size() - 1);
-          if (entry.index() != prev.index() + 1 || entry.term() < prev.term()) {
-            throw new StorageException(
-                "log record at byte " + pos + " (" + entry + ") does not follow " + prev);
-          }
-        }
-        out.add(entry);
-        recordOffsets.add(pos);
-        pos += HEADER + ENTRY_FIXED + entry.data().length;
+    boolean removed = deleteTree(walNew);
+    removed |= deleteTree(walOld);
+    if (removed) {
+      syncDirectory();
+      fsyncs++;
+    }
+  }
+
+  /** Moves a single-file {@code log} from before segments into {@code wal}. */
+  private void migrateLegacyLog() throws IOException {
+    Path legacy = dir.resolve("log");
+    if (!Files.isRegularFile(legacy)) {
+      return;
+    }
+    if (!Files.exists(wal)) {
+      List<Entry> entries = new ArrayList<>();
+      try (FileChannel ch = FileChannel.open(legacy, StandardOpenOption.READ)) {
+        long end = SegmentedLog.readLegacy(ch, legacy, entries);
+        tornBytesDropped += ch.size() - end;
       }
-      return pos;
+      long first = entries.isEmpty() ? 1 : entries.get(0).index();
+      try (SegmentedLog moved = SegmentedLog.create(walNew, segmentBytes, first, entries)) {
+        fsyncs += moved.fsyncs();
+      }
+      Files.move(walNew, wal, StandardCopyOption.ATOMIC_MOVE);
+      syncDirectory();
+      fsyncs++;
     }
+    // wal exists, so a migration before a crash completed.
+    Files.delete(legacy);
+    syncDirectory();
+    fsyncs++;
   }
 
-  /** Reads one record at {@code pos}, or empty if it is short or fails its checks. */
-  private static Optional<Entry> readRecord(FileChannel ch, long pos, long size)
-      throws IOException {
-    if (size - pos < HEADER) {
-      return Optional.empty();
+  /** Deletes a directory of segment files, if it exists; returns whether it did. */
+  private static boolean deleteTree(Path d) throws IOException {
+    if (!Files.isDirectory(d)) {
+      return false;
     }
-    ByteBuffer header = ByteBuffer.allocate(HEADER);
-    readFully(ch, header, pos);
-    int len = header.getInt(0);
-    int crc = header.getInt(4);
-    if (len < ENTRY_FIXED || len > MAX_RECORD || len > size - pos - HEADER) {
-      return Optional.empty();
-    }
-    ByteBuffer body = ByteBuffer.allocate(len);
-    readFully(ch, body, pos + HEADER);
-    byte[] payload = body.array();
-    if (crc32c(payload) != crc) {
-      return Optional.empty();
-    }
-    try {
-      ByteReader r = new ByteReader(payload);
-      Entry e = Codec.readEntry(r);
-      r.expectEnd();
-      return Optional.of(e);
-    } catch (CodecException ex) {
-      return Optional.empty();
-    }
-  }
-
-  /** If the damaged record's length is plausible and a valid record follows it, returns that. */
-  private static long nextRecordAfterDamage(FileChannel ch, long pos, long size)
-      throws IOException {
-    if (size - pos < HEADER) {
-      return -1;
-    }
-    ByteBuffer header = ByteBuffer.allocate(4);
-    readFully(ch, header, pos);
-    int len = header.getInt(0);
-    if (len < ENTRY_FIXED || len > MAX_RECORD) {
-      return -1;
-    }
-    long next = pos + HEADER + len;
-    return next < size && readRecord(ch, next, size).isPresent() ? next : -1;
-  }
-
-  private static void readFully(FileChannel ch, ByteBuffer buf, long pos) throws IOException {
-    while (buf.hasRemaining()) {
-      int n = ch.read(buf, pos + buf.position());
-      if (n < 0) {
-        throw new IOException("unexpected end of file");
+    try (DirectoryStream<Path> files = Files.newDirectoryStream(d)) {
+      for (Path f : files) {
+        Files.delete(f);
       }
     }
-  }
-
-  private static int crc32c(byte[] b) {
-    CRC32C c = new CRC32C();
-    c.update(b);
-    return (int) c.getValue();
-  }
-
-  private static byte[] record(byte[] payload) {
-    return new ByteWriter(HEADER + payload.length)
-        .writeInt(payload.length)
-        .writeInt(crc32c(payload))
-        .writeRaw(payload)
-        .toByteArray();
-  }
-
-  private static byte[] entryRecord(Entry e) {
-    ByteWriter w = new ByteWriter(e.data().length + 32);
-    Codec.writeEntry(w, e);
-    return record(w.toByteArray());
+    Files.delete(d);
+    return true;
   }
 
   private HardState readState() throws IOException {
@@ -312,7 +262,7 @@ public final class FileStorage implements Storage, AutoCloseable {
     }
     byte[] payload = new byte[len];
     b.get(payload);
-    if (crc32c(payload) != crc) {
+    if (SegmentedLog.crc32c(payload, 0, payload.length) != crc) {
       throw new StorageException(p + " fails its checksum");
     }
     return payload;
@@ -326,7 +276,7 @@ public final class FileStorage implements Storage, AutoCloseable {
             StandardOpenOption.CREATE,
             StandardOpenOption.WRITE,
             StandardOpenOption.TRUNCATE_EXISTING)) {
-      ByteBuffer b = ByteBuffer.wrap(record(payload));
+      ByteBuffer b = ByteBuffer.wrap(SegmentedLog.record(payload));
       while (b.hasRemaining()) {
         ch.write(b);
       }
@@ -343,40 +293,23 @@ public final class FileStorage implements Storage, AutoCloseable {
     }
   }
 
-  private void rewriteLog(List<Entry> entries) throws IOException {
-    Path tmp = dir.resolve("log.tmp");
-    List<Long> newOffsets = new ArrayList<>();
-    try (FileChannel ch =
-        FileChannel.open(
-            tmp,
-            StandardOpenOption.CREATE,
-            StandardOpenOption.WRITE,
-            StandardOpenOption.TRUNCATE_EXISTING)) {
-      long pos = 0;
-      for (Entry e : entries) {
-        byte[] rec = entryRecord(e);
-        newOffsets.add(pos);
-        ByteBuffer b = ByteBuffer.wrap(rec);
-        while (b.hasRemaining()) {
-          ch.write(b);
-        }
-        pos += rec.length;
-      }
-      ch.force(true);
-    }
-    if (log != null) {
-      log.close();
-    }
-    Files.move(tmp, logPath, StandardCopyOption.ATOMIC_MOVE);
+  /**
+   * Replaces the log with {@code entries}, which start at {@code first}: they are written to a new
+   * directory, made durable, and swapped in with two renames and a directory fsync.
+   */
+  private void rewriteLog(long first, List<Entry> entries) throws IOException {
+    deleteTree(walNew);
+    SegmentedLog fresh = SegmentedLog.create(walNew, segmentBytes, first, entries);
+    log.close();
+    fsyncs += log.fsyncs();
+    log = fresh;
+    Files.move(wal, walOld, StandardCopyOption.ATOMIC_MOVE);
+    Files.move(walNew, wal, StandardCopyOption.ATOMIC_MOVE);
+    fresh.movedTo(wal);
     syncDirectory();
-    fsyncs += 2;
-    log = FileChannel.open(logPath, StandardOpenOption.READ, StandardOpenOption.WRITE);
-    offsets.clear();
-    offsets.addAll(newOffsets);
-    if (!entries.isEmpty()) {
-      fileFirstIndex = entries.get(0).index();
-    }
-    logDirty = false;
+    fsyncs++;
+    // Recovery deletes wal.old if a crash leaves it, so this needs no fsync of its own.
+    deleteTree(walOld);
   }
 
   @Override
@@ -396,35 +329,8 @@ public final class FileStorage implements Storage, AutoCloseable {
 
   @Override
   public void append(List<Entry> entries) {
-    if (entries.isEmpty()) {
-      return;
-    }
     try {
-      long first = entries.get(0).index();
-      long lastInFile = fileFirstIndex + offsets.size() - 1;
-      if (first <= lastInFile) {
-        int keep = (int) (first - fileFirstIndex);
-        if (keep < 0) {
-          throw new IllegalStateException("cannot overwrite compacted entry " + first);
-        }
-        log.truncate(offsets.get(keep));
-        offsets.subList(keep, offsets.size()).clear();
-      } else if (first != lastInFile + 1) {
-        throw new IllegalStateException("gap before entry " + first + " (last " + lastInFile + ")");
-      }
-      if (offsets.isEmpty()) {
-        fileFirstIndex = first;
-      }
-      long pos = log.size();
-      for (Entry e : entries) {
-        byte[] rec = entryRecord(e);
-        offsets.add(pos);
-        ByteBuffer b = ByteBuffer.wrap(rec);
-        while (b.hasRemaining()) {
-          pos += log.write(b, pos);
-        }
-      }
-      logDirty = true;
+      log.append(entries);
     } catch (IOException e) {
       throw new StorageException("append failed: " + e.getMessage(), e);
     }
@@ -436,8 +342,7 @@ public final class FileStorage implements Storage, AutoCloseable {
       ByteWriter w = new ByteWriter(snapshot.data().length + 256);
       Codec.writeSnapshot(w, snapshot);
       replaceAtomically("snapshot", w.toByteArray());
-      fileFirstIndex = snapshot.meta().index() + 1;
-      rewriteLog(remaining);
+      rewriteLog(snapshot.meta().index() + 1, remaining);
     } catch (IOException e) {
       throw new StorageException("snapshot failed: " + e.getMessage(), e);
     }
@@ -452,19 +357,20 @@ public final class FileStorage implements Storage, AutoCloseable {
         replaceAtomically("state", w.toByteArray());
         pendingState = null;
       }
-      if (logDirty) {
-        log.force(false);
-        fsyncs++;
-        logDirty = false;
-      }
+      log.sync();
     } catch (IOException e) {
       throw new StorageException("sync failed: " + e.getMessage(), e);
     }
   }
 
+  /** Number of log segment files, for metrics and tests. */
+  public int segmentCount() {
+    return log.segmentCount();
+  }
+
   /** Number of fsync calls made so far, for metrics. */
   public long fsyncs() {
-    return fsyncs;
+    return fsyncs + log.fsyncs();
   }
 
   /** Bytes cut from a torn log tail during recovery. */

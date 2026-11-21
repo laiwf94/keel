@@ -18,7 +18,7 @@ The code is split so that the hard part, the Raft algorithm, can be tested witho
 
 The simulator calls `Replica` directly from one thread with a virtual clock. The server wraps it in `NodeLoop`, a single platform thread that owns the replica. HTTP handlers and the peer transport never touch Raft state; they put tasks on the loop's bounded queue and wait on futures. Because one thread owns everything, there are no locks around Raft state, and a burst of requests that arrive together costs one fsync and one AppendEntries message per follower.
 
-Around the loop sit `FileStorage` (the disk format), `PeerTransport` (authenticated TCP between nodes), `HttpApi` (the client API on the JDK HTTP server and virtual threads), and `KvMachine` (the key-value state machine with client sessions).
+Around the loop sit `FileStorage` (the disk format, with the log in `SegmentedLog`), `PeerTransport` (authenticated TCP between nodes), `HttpApi` (the client API on the JDK HTTP server and virtual threads), and `KvMachine` (the key-value state machine with client sessions).
 
 ## Choosing a leader
 
@@ -50,17 +50,19 @@ A leader writes its own new entries to disk in parallel with its followers (thes
 
 ## On disk
 
-Each node has a directory with three files and a lock file.
+Each node has a directory with two files, a log directory and a lock file.
 
 `state` holds the current term and vote. It is replaced atomically: write `state.tmp`, fsync it, rename it over `state`, fsync the directory. The rename is what makes the replacement atomic on POSIX file systems, and the directory fsync is what makes the rename itself durable; Pillai et al. show how often applications get this sequence wrong.
 
-`log` is append-only. Each record is a length, a CRC32C of the payload, and the payload (index, term, type, data). Appends go to the OS page cache and one `FileChannel.force(false)` per loop round makes them durable; that is `fdatasync` on Linux and a full cache flush on macOS. When a follower must drop a conflicting suffix, the file is truncated at the first record to drop; the node keeps the byte offset of every record in memory for that.
+`wal` holds the log as segment files (`SegmentedLog`), each named after the index of its first entry, such as `00000000000000000001.seg`. A segment starts with a 20-byte header: a magic number, a format version, the first index again and a CRC32C of those 16 bytes. Records follow, each a length, a CRC32C of the payload, and the payload (index, term, type, data). A segment takes records until the next would take it past the segment size, 64 MiB by default; then the next segment starts, so a segment holds at least one record and one larger than the segment size gets a segment of its own. Appends go to the OS page cache and one `FileChannel.force(false)` per loop round makes them durable; that is `fdatasync` on Linux and a full cache flush on macOS. Starting a segment forces the one before it if it holds unsynced records, then creates the new file, writes and forces its header, and fsyncs the directory: three fsyncs once per 64 MiB, so that every segment but the last is complete on disk before anything is written after it. The node keeps, for each segment, the byte offset of every record in an `int` array, four bytes an entry, instead of a boxed offset per entry. When a follower must drop a conflicting suffix, the segments after the one holding the first entry to drop are deleted from the last one back, with a directory fsync after each deletion, so a crash leaves a prefix of the old log, and then that segment is truncated at the record.
 
-`snapshot` holds the latest snapshot, replaced the same way as `state`. After a snapshot, the log is rewritten into a temporary file holding only the later entries and renamed into place.
+`snapshot` holds the latest snapshot, replaced the same way as `state`. After a snapshot, the log is rewritten into `wal.new`, holding only the later entries, which is made durable and then swapped in: `wal` is renamed to `wal.old`, `wal.new` to `wal`, the directory is fsynced and `wal.old` deleted. Recovery finishes or abandons a swap a crash interrupted: `wal.new` without `wal` is complete, since it is renamed only after `wal` was renamed away, and is renamed into place; `wal.new` beside `wal` is incomplete and deleted, as is any `wal.old`.
 
-Recovery reads the log until the first record that fails its length or CRC check. If nothing valid follows, that record was a torn final write. Its bytes were never synced, so no peer was told about them, and the file is cut there. If a valid record does follow, the damage is in the middle of the log, which a torn write cannot cause. The node refuses to start rather than silently drop entries it may have acknowledged; the operator can wipe it and let it rejoin through a snapshot. A CRC alone cannot tell these two cases apart, which is why recovery looks past the bad record. The tests cut the last record at every byte offset and flip a byte in the middle of the log.
+Recovery reads the segments in order. A record that fails its length or CRC check is a torn final write if it is in the last segment and nothing valid follows it. Its bytes were never synced, so no peer was told about them, and the segment is cut there. A last segment whose header is short or wrong, with no valid record after it, is a segment whose creation a crash interrupted, and is deleted. If a valid record follows the damage, or the damage is in any segment but the last, or the segments do not follow each other without a gap, the damage is in data the node may have acknowledged, which a torn write cannot cause. The node refuses to start rather than silently drop entries; the operator can wipe it and let it rejoin through a snapshot. A CRC alone cannot tell these cases apart, which is why recovery looks past the bad record and why a segment is forced before the next one starts. The tests cut the log at every byte from the last record of one segment to the end of the next, cut the last record at every byte, and flip bytes in records and headers on both sides of a segment boundary.
 
-A crash between writing a snapshot received from the leader and rewriting the log can leave a log that conflicts with the snapshot. Recovery applies the same rule as InstallSnapshot: if the log holds the snapshot's last entry with the same term, the entries after it are kept, otherwise the log is dropped.
+A data directory from before segments has a single `log` file of the same records. On first open it is read with the rules for the last segment, written into `wal.new` and renamed to `wal`, and then the old file is deleted; if a crash leaves both, `wal` is the complete copy.
+
+A crash between writing a snapshot received from the leader and swapping in the rewritten log can leave a log that conflicts with the snapshot. Recovery applies the same rule as InstallSnapshot: if the log holds the snapshot's last entry with the same term, the entries after it are kept, otherwise the log is dropped.
 
 Any storage error stops the node. A node that cannot persist cannot keep the promises it has made to its peers, so continuing would be worse than stopping. The server halts with exit code 70.
 
@@ -185,7 +187,7 @@ A full session table evicts the least recently used session, and that client get
 
 The whole key space and the session table live in memory, and snapshots are serialized in memory. That keeps the state machine simple and fast but bounds the data set by heap size.
 
-Snapshots are sent in one message of at most 256 MiB, and the log is rewritten after each snapshot. Chunked snapshot transfer and a segmented log would remove both limits.
+Snapshots are sent in one message of at most 256 MiB, and the log is rewritten after each snapshot even though it is now in segments. Chunked snapshot transfer and compaction by deleting whole segments would remove both limits.
 
 Only the leader serves linearizable and lease reads. Followers serve only stale reads.
 
