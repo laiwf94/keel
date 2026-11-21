@@ -2,10 +2,14 @@
 # Live demo on the docker compose cluster. It checks its own results and exits non-zero if any
 # check fails.
 #
-#   1. Starts three nodes and a write load that records every acknowledged write.
-#   2. Kills the leader with SIGKILL mid-load, shows a new leader in a higher term, restarts the
-#      old one, and reads back every acknowledged write.
-#   3. Cuts the current leader off from its peers, shows that it cannot commit while the majority
+#   1. Starts three nodes.
+#   2. Under a write load, moves leadership to a chosen follower with POST /v1/leader, then stops
+#      the new leader with SIGTERM so that it hands off before it exits, and restarts it. Every
+#      write must succeed: none may fail or end with an unknown outcome, and all must read back.
+#   3. Under a second write load that records every acknowledged write, kills the leader with
+#      SIGKILL, shows a new leader in a higher term, restarts the old one, and reads back every
+#      acknowledged write.
+#   4. Cuts the current leader off from its peers, shows that it cannot commit while the majority
 #      elects a new leader and keeps serving, then heals the partition and shows the old leader
 #      catch up and drop its uncommitted write.
 set -euo pipefail
@@ -13,6 +17,7 @@ cd "$(dirname "$0")/.."
 
 jar=build/libs/keel-0.1.0.jar
 export KEEL_CLUSTER_SECRET=${KEEL_CLUSTER_SECRET:-$(openssl rand -hex 24)}
+export KEEL_ADMIN_TOKEN=${KEEL_ADMIN_TOKEN:-$(openssl rand -hex 24)}
 export KEEL_ENDPOINTS=http://localhost:8081,http://localhost:8082,http://localhost:8083
 work=$(mktemp -d)
 load_pid=""
@@ -90,6 +95,75 @@ docker compose up -d --build --wait >"$work/up.log" 2>&1 || { cat "$work/up.log"
 wait_for "a leader" 60 leader 8081 8082 8083 >/dev/null
 show
 
+# The "load done" line of a load's output: "acked unknown errors".
+load_totals() {
+  sed -nE 's/^load done: acked=([0-9]+) unknown=([0-9]+) errors=([0-9]+)$/\1 \2 \3/p' "$1"
+}
+
+ms_since() { echo $((($(date +%s%N) - $1) / 1000000)); }
+
+say "planned maintenance under load: 4 clients for 20 s, every write must succeed"
+keel load --duration 20s --clients 4 --prefix handoff --out "$work/handoff.log" \
+  >"$work/handoff.out" 2>&1 &
+load_pid=$!
+sleep 4
+
+read -r from term0 port0 < <(leader 8081 8082 8083)
+target=""
+for n in n1 n2 n3; do
+  if [[ $n != "$from" ]]; then
+    target=$n
+    break
+  fi
+done
+say "transferring leadership from $from (term $term0) to $target with POST /v1/leader"
+code=$(curl -s -o "$work/transfer.out" -w '%{http_code} %{time_total}' -m 10 -X POST \
+  -H "Authorization: Bearer $KEEL_ADMIN_TOKEN" "localhost:$port0/v1/leader?to=$target")
+read -r status secs <<<"$code"
+echo "HTTP $status in $(awk -v s="$secs" 'BEGIN { printf "%d", s * 1000 }') ms: $(cat "$work/transfer.out")"
+[[ $status == 200 ]] || fail "the transfer was not accepted"
+grep -q "\"leader\":\"$target\"" "$work/transfer.out" || fail "$target did not take over"
+read -r now term1 port1 < <(leader 8081 8082 8083) || fail "no leader after the transfer"
+[[ $now == "$target" && $term1 -gt $term0 ]] || fail "expected $target to lead after $term0, got $now in $term1"
+show
+
+sleep 3
+service=keel${target#n}
+say "stopping the leader $target (term $term1) with SIGTERM, mid-load"
+start=$(date +%s%N)
+docker compose stop -t 30 "$service" >/dev/null 2>&1
+echo "$target exited after $(ms_since "$start") ms"
+docker compose logs --no-log-prefix "$service" >"$work/$service.log" 2>&1
+grep -E '"event":"handoff(_failed)?"' "$work/$service.log" | tail -n 1 || true
+grep -q '"event":"handoff"' "$work/$service.log" || fail "$target did not hand off before it exited"
+others=()
+for p in 8081 8082 8083; do [[ $p != "$port1" ]] && others+=("$p"); done
+new_leader_after "$target" "$term1" "${others[@]}" || fail "no new leader was known when $target exited"
+read -r leader2 term2 _ < <(leader "${others[@]}")
+echo "new leader: $leader2 in term $term2, known before $target exited"
+show
+
+sleep 2
+say "restarting $target from its own disk"
+docker compose start "$service" >/dev/null 2>&1
+wait_for "$target to rejoin" 60 bash -c "curl -sf -m 2 localhost:$port1/healthz >/dev/null"
+
+wait "$load_pid"
+load_pid=""
+tail -n 2 "$work/handoff.out"
+read -r acked unknown errors < <(load_totals "$work/handoff.out") || fail "the load did not finish"
+[[ $acked -gt 100 ]] || fail "only $acked writes were acknowledged"
+[[ $unknown -eq 0 && $errors -eq 0 ]] ||
+  fail "$errors writes failed and $unknown had an unknown outcome during planned maintenance"
+echo "every write succeeded: acked=$acked unknown=0 errors=0"
+
+say "reading back all $acked writes with linearizable reads"
+keel verify --in "$work/handoff.log" | tee "$work/handoff-verify.out"
+grep -q "lost=0" "$work/handoff-verify.out" || fail "acknowledged writes were lost"
+is_follower() { read -r _ role _ _ _ _ < <(status "$1") && [[ $role == follower ]]; }
+wait_for "$target to follow" 60 is_follower "$port1"
+show
+
 say "write load: 4 clients for 25 s, every acknowledged write recorded"
 keel load --duration 25s --clients 4 --out "$work/acked.log" >"$work/load.out" 2>&1 &
 load_pid=$!
@@ -156,4 +230,4 @@ value=$(curl -s "localhost:$port3/v1/kv/demo-majority?consistency=stale")
 [[ $value == kept ]] || fail "the majority write did not reach $isolated"
 echo "on $isolated: the majority write is present (\"$value\")"
 
-say "PASS: no acknowledged write lost across a leader kill; an isolated leader could not commit"
+say "PASS: no write failed across a leadership transfer and a graceful leader restart; no acknowledged write lost across a leader kill; an isolated leader could not commit"

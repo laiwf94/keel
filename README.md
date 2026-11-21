@@ -70,7 +70,9 @@ Other endpoints are `DELETE /v1/kv/{key}`, `GET /v1/status`, `GET /v1/members`, 
 
 A write is acknowledged only after a majority of nodes has it on disk, so losing any minority of nodes loses no acknowledged write. When the leader dies, the others elect a new one within one election timeout (250 to 500 ms by default) and the client retries there. A leader cut off from the majority stops accepting writes within an election timeout and never serves a linearizable read; its uncommitted writes are discarded when the partition heals. A write whose fate is unknown, because the leader changed or the request timed out, is reported as such (503 or 504), never as a success or a failure, and retrying it under the same session is safe. A torn final write to the log is cut off on restart; corruption anywhere else stops the node rather than silently dropping data.
 
-This is what `examples/demo.sh` shows on the compose cluster:
+Planned maintenance costs no failed writes. `POST /v1/leader` moves leadership in about one round trip, and a leader stopped with SIGTERM hands off before it closes its ports, so clients follow the new leader without waiting out an election timeout and without a write ending in an unknown outcome.
+
+This is what `examples/demo.sh` shows on the compose cluster. It runs in CI on every push and fails if a write fails or has an unknown outcome during the transfer and the graceful restart, or if any acknowledged write is lost:
 
 ```
 == building the client and starting three nodes
@@ -79,46 +81,76 @@ n1   follower       1     n3      1
 n2   follower       1     n3      1      
 n3   leader         1     n3      1      
 
+== planned maintenance under load: 4 clients for 20 s, every write must succeed
+
+== transferring leadership from n3 (term 1) to n1 with POST /v1/leader
+HTTP 200 in 25 ms: {"leader":"n1","term":2,"previous":"n3"}
+node role           term  leader  applied
+n1   leader         2     n1      310    
+n2   follower       2     n1      310    
+n3   follower       2     n1      317    
+
+== stopping the leader n1 (term 2) with SIGTERM, mid-load
+n1 exited after 702 ms
+{"ts":"2026-11-21T03:01:35.875527304Z","level":"INFO","node":"n1","event":"handoff","leader":"n2","term":3,"ms":20}
+new leader: n2 in term 3, known before n1 exited
+node role           term  leader  applied
+n1   (down)
+n2   leader         3     n2      645    
+n3   follower       3     n2      645    
+
+== restarting n1 from its own disk
+t=20s acked=1673 unknown=0 errors=0
+load done: acked=1673 unknown=0 errors=0
+every write succeeded: acked=1673 unknown=0 errors=0
+
+== reading back all 1673 writes with linearizable reads
+verify: checked=1673 present=1673 lost=0
+node role           term  leader  applied
+n1   follower       3     n2      1680   
+n2   leader         3     n2      1680   
+n3   follower       3     n2      1680   
+
 == write load: 4 clients for 25 s, every acknowledged write recorded
 
-== killing the leader n3 (term 1) with SIGKILL, mid-load
-new leader: n1 in term 2 (was n3 in term 1)
+== killing the leader n2 (term 3) with SIGKILL, mid-load
+new leader: n3 in term 4 (was n2 in term 3)
 node role           term  leader  applied
-n1   leader         2     n1      478    
-n2   follower       2     n1      482    
-n3   (down)
+n1   follower       4     n3      2199   
+n2   (down)
+n3   leader         4     n3      2202   
 
-== restarting n3 from its own disk
-t=23s acked=1755 unknown=0 errors=0
-t=24s acked=1839 unknown=0 errors=0
-t=25s acked=1892 unknown=0 errors=0
-load done: acked=1892 unknown=0 errors=0
+== restarting n2 from its own disk
+t=23s acked=1935 unknown=0 errors=0
+t=24s acked=2023 unknown=0 errors=0
+t=25s acked=2095 unknown=0 errors=0
+load done: acked=2095 unknown=0 errors=0
 
-== reading back all 1892 acknowledged writes with linearizable reads
-verify: checked=1892 present=1892 lost=0
+== reading back all 2095 acknowledged writes with linearizable reads
+verify: checked=2095 present=2095 lost=0
 node role           term  leader  applied
-n1   leader         2     n1      1898   
-n2   follower       2     n1      1898   
-n3   follower       2     n1      1898   
+n1   follower       4     n3      3780   
+n2   follower       4     n3      3780   
+n3   leader         4     n3      3780   
 
-== partition: cutting the leader n1 off from its peers
-write sent to the isolated n1: HTTP 503 {"error":"leadership changed before the entry was applied; retry with the same Keel-Seq to be safe","outcome":"unknown"}
-majority leader: n2 in term 3
+== partition: cutting the leader n3 off from its peers
+write sent to the isolated n3: HTTP 503 {"error":"leadership changed before the entry was applied; retry with the same Keel-Seq to be safe","outcome":"unknown"}
+majority leader: n2 in term 5
 write through the majority: acknowledged
 node role           term  leader  applied
-n1   pre_candidate  2     -       1898   
-n2   leader         3     n2      1900   
-n3   follower       3     n2      1900   
+n1   follower       5     n2      3782   
+n2   leader         5     n2      3782   
+n3   pre_candidate  4     -       3780   
 
 == healing the partition
 node role           term  leader  applied
-n1   follower       3     n2      1900   
-n2   leader         3     n2      1900   
-n3   follower       3     n2      1900   
-on n1: the uncommitted minority write is gone (HTTP 404)
-on n1: the majority write is present ("kept")
+n1   follower       5     n2      3782   
+n2   leader         5     n2      3782   
+n3   follower       5     n2      3782   
+on n3: the uncommitted minority write is gone (HTTP 404)
+on n3: the majority write is present ("kept")
 
-== PASS: no acknowledged write lost across a leader kill; an isolated leader could not commit
+== PASS: no write failed across a leadership transfer and a graceful leader restart; no acknowledged write lost across a leader kill; an isolated leader could not commit
 ```
 
 ## How fast it is, and why
