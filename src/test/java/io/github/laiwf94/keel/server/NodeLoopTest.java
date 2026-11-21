@@ -29,6 +29,7 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
@@ -299,6 +300,76 @@ class NodeLoopTest {
     // silently.
     Outcome o = stuck.get(5, TimeUnit.SECONDS);
     assertTrue(o instanceof Outcome.Applied || o instanceof Outcome.Unknown, o.toString());
+  }
+
+  /**
+   * The target's disk stalls as it starts the election TimeoutNow asked for, so the leader gives
+   * the transfer up before the target's vote requests go out. The target still wins, and the
+   * transfer is reported as done rather than failed.
+   */
+  @Test
+  void aTargetThatStartsItsElectionLateIsReportedAsTheNewLeader() throws Exception {
+    Map<String, StallingStorage> disks = new java.util.HashMap<>();
+    for (int i = 1; i <= 3; i++) {
+      StallingStorage d = new StallingStorage();
+      disks.put("n" + i, d);
+      loop("n" + i, config(3), d, () -> {});
+    }
+    await(() -> leader() != null);
+    NodeLoop old = leader();
+    String oldId = old.status().id();
+    long term = old.status().term();
+    assertInstanceOf(Outcome.Applied.class, old.propose(put("k", "v1")).get(5, TimeUnit.SECONDS));
+    String target = oldId.equals("n1") ? "n2" : "n1";
+    await(() -> byId.get(target).status().appliedIndex() >= old.status().commitIndex());
+    // Ten election timeouts of 5 ms ticks: the leader gives the transfer up long before.
+    disks.get(target).stallMs = 500;
+    TransferOutcome o =
+        old.transferLeadership(Optional.of(target), Duration.ofSeconds(3)).get(5, TimeUnit.SECONDS);
+    assertTrue(disks.get(target).stalled.await(0, TimeUnit.SECONDS), "the target never stalled");
+    assertEquals(new TransferOutcome.Transferred(target, term + 1), o);
+    assertEquals(RaftNode.Role.LEADER, byId.get(target).status().role());
+  }
+
+  /**
+   * As above, but the old leader takes a write once it has given the transfer up, so the target's
+   * late election fails for want of an up-to-date log. Whoever leads next, the old leader never
+   * reports leadership as handed to itself.
+   */
+  @Test
+  void aTransferWhoseTargetLosesItsLateElectionIsNotReportedAsHandedToTheOldLeader()
+      throws Exception {
+    Map<String, StallingStorage> disks = new java.util.HashMap<>();
+    for (int i = 1; i <= 3; i++) {
+      StallingStorage d = new StallingStorage();
+      disks.put("n" + i, d);
+      loop("n" + i, config(3), d, () -> {});
+    }
+    await(() -> leader() != null);
+    NodeLoop old = leader();
+    String oldId = old.status().id();
+    assertInstanceOf(Outcome.Applied.class, old.propose(put("k", "v1")).get(5, TimeUnit.SECONDS));
+    String target = oldId.equals("n1") ? "n2" : "n1";
+    await(() -> byId.get(target).status().appliedIndex() >= old.status().commitIndex());
+    disks.get(target).stallMs = 500;
+    var transfer = old.transferLeadership(Optional.of(target), Duration.ofSeconds(3));
+    assertTrue(disks.get(target).stalled.await(5, TimeUnit.SECONDS));
+    // Proposals are taken again once the transfer is given up, an election timeout after
+    // TimeoutNow; the write then commits with the third node while the target is stalled.
+    Outcome w = null;
+    for (int i = 0; i < 200 && !(w instanceof Outcome.Applied); i++) {
+      w = old.propose(put("k", "v2")).get(5, TimeUnit.SECONDS);
+      if (!(w instanceof Outcome.Applied)) {
+        Thread.sleep(5);
+      }
+    }
+    assertInstanceOf(Outcome.Applied.class, w);
+    TransferOutcome o = transfer.get(5, TimeUnit.SECONDS);
+    assertTrue(
+        o instanceof TransferOutcome.Transferred t
+            ? !t.leader().equals(oldId)
+            : o instanceof TransferOutcome.Failed f && f.reason().contains("leads again"),
+        o.toString());
   }
 
   @Test

@@ -249,17 +249,28 @@ public final class NodeLoop implements AutoCloseable {
       TransferOutcome o = null;
       boolean stillLeads = node.role() == RaftNode.Role.LEADER && node.term() == w.term();
       if (!stillLeads && node.leader().isPresent()) {
-        o = new TransferOutcome.Transferred(node.leader().get(), node.term());
-      } else if (stillLeads && node.transferee().isEmpty()) {
+        // This node can lead again in a later term: the target's election failed (its log fell
+        // behind once the transfer was given up) and this node won the one after it.
+        o =
+            node.leader().get().equals(id)
+                ? new TransferOutcome.Failed(
+                    "the target did not take over; " + id + " leads again in term " + node.term())
+                : new TransferOutcome.Transferred(node.leader().get(), node.term());
+      } else if (stillLeads && node.transferee().isEmpty() && !node.sentTimeoutNow()) {
         o =
             new TransferOutcome.Failed(
-                "the target did not take over within an election timeout; " + id + " still leads");
+                "the target did not catch up within an election timeout; " + id + " still leads");
       } else if (now - w.deadlineNanos() >= 0) {
+        // Once TimeoutNow has gone out, a target slowed down by its disk or a pause can still start
+        // and win its election after this leader has given up and taken proposals again, so the
+        // outcome waits for the deadline rather than reporting a failure that may not be one.
         o =
             new TransferOutcome.Failed(
-                stillLeads
-                    ? "timed out while the target caught up; " + id + " still leads"
-                    : "timed out before a new leader was known");
+                !stillLeads
+                    ? "timed out before a new leader was known"
+                    : node.sentTimeoutNow()
+                        ? "the target did not take over; " + id + " still leads"
+                        : "timed out while the target caught up; " + id + " still leads");
       }
       if (o != null) {
         it.remove();

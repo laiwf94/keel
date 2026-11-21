@@ -270,7 +270,9 @@ class FailureTest {
       long start = System.nanoTime();
       HttpResponse<String> r = c.transfer(old, target);
       long ms = (System.nanoTime() - start) / 1_000_000;
-      assertEquals(200, r.statusCode(), r.body());
+      // On failure, print the nodes' logs: a transfer that fails only on a loaded CI machine
+      // cannot be read from its status code (#82).
+      assertEquals(200, r.statusCode(), () -> r.body() + c.logs());
       assertTrue(r.body().contains("\"leader\":\"" + target + "\""), r.body());
       assertTrue(r.body().contains("\"previous\":\"" + old + "\""), r.body());
       // One election, started by TimeoutNow: the term moves by exactly one. With 10 ms ticks the

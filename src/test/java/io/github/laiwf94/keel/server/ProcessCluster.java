@@ -91,6 +91,20 @@ final class ProcessCluster implements AutoCloseable {
     return Files.readString(logFile(id), StandardCharsets.UTF_8);
   }
 
+  /** Every node's log, each under a header, for a failure message. */
+  String logs() {
+    StringBuilder b = new StringBuilder();
+    for (String id : ports.keySet()) {
+      b.append("\n--- ").append(id).append(" ---\n");
+      try {
+        b.append(log(id));
+      } catch (IOException e) {
+        b.append("(no log: ").append(e.getMessage()).append(")\n");
+      }
+    }
+    return b.toString();
+  }
+
   URI url(String id) {
     return URI.create("http://127.0.0.1:" + ports.get(id)[1]);
   }

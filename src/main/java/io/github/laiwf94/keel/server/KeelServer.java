@@ -73,8 +73,9 @@ public final class KeelServer implements AutoCloseable {
 
   /**
    * How long a leader that is shutting down waits for another voter to take over: the transfer
-   * itself gives up after one election timeout, and the new leader announces itself with its first
-   * heartbeat, so two of the longest election timeouts is ample.
+   * gives up after at most two election timeouts (one to catch the target up, one for its
+   * election), and the new leader announces itself with its first heartbeat, so two of the longest
+   * election timeouts is ample.
    */
   static Duration handoffTimeout(RaftOptions raft, NodeLoop.Settings loop) {
     return Duration.ofMillis(4L * raft.electionTicks() * loop.tickMs());

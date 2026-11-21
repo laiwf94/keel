@@ -92,9 +92,11 @@ public final class RaftNode {
   private long seq;
   private boolean broadcastPending;
   // Leadership transfer (thesis section 3.10): the voter this leader is handing over to, and how
-  // many ticks ago it started. While set, the leader accepts no new proposals.
+  // many ticks ago the current phase started: catching the target up, then, from the first
+  // TimeoutNow, its election. While set, the leader accepts no new proposals.
   private String transferee = NONE;
   private int transferElapsed;
+  private boolean timeoutNowSent;
   // Set once this leader has sent TimeoutNow in its term. Voters grant a transfer election even
   // while they still count this leader's lease, so from then on the lease is void and lease reads
   // fall back to a ReadIndex round.
@@ -166,6 +168,15 @@ public final class RaftNode {
     return transferee.isEmpty() ? Optional.empty() : Optional.of(transferee);
   }
 
+  /**
+   * Whether this node leads and has sent {@link TimeoutNow} in its term. The target may still act
+   * on it after the transfer has been given up, so until another node is known to lead or an
+   * election timeout of the caller's has passed, a given-up transfer has not yet failed.
+   */
+  public boolean sentTimeoutNow() {
+    return role == Role.LEADER && leaseRevoked;
+  }
+
   /** Read-only view of the log, for tests and status. */
   public RaftLog log() {
     return log;
@@ -209,8 +220,9 @@ public final class RaftNode {
   }
 
   private void tickLeader() {
-    // A transfer that has not finished within an election timeout has failed (the target is
-    // down, partitioned or too slow): give up and take proposals again.
+    // A transfer whose target has not caught up within an election timeout, or has not taken over
+    // within an election timeout of the first TimeoutNow, has failed (the target is down,
+    // partitioned or too slow): give up and take proposals again.
     if (!transferee.isEmpty() && ++transferElapsed >= opts.electionTicks()) {
       abortTransfer();
     }
@@ -273,9 +285,9 @@ public final class RaftNode {
    * Hands leadership to {@code target}, a voter (thesis section 3.10). The leader stops taking
    * proposals, brings the target's log up to its own, then sends it {@link TimeoutNow} so it starts
    * an election at once; with an up-to-date log it wins in about one round trip. If the target has
-   * not taken over within an election timeout the transfer is abandoned and this node goes on
-   * leading. Asking for a new target replaces a transfer in progress; asking for the same one again
-   * changes nothing.
+   * not caught up within an election timeout, or has not taken over within an election timeout of
+   * the first TimeoutNow, the transfer is abandoned and this node goes on leading. Asking for a new
+   * target replaces a transfer in progress; asking for the same one again changes nothing.
    *
    * @throws NotLeaderException if this node is not the leader
    * @throws IllegalArgumentException if {@code target} is this node or not a voter
@@ -295,6 +307,7 @@ public final class RaftNode {
     }
     transferee = target;
     transferElapsed = 0;
+    timeoutNowSent = false;
     if (progress.get(target).match == log.lastIndex()) {
       sendTimeoutNow(target);
     } else {
@@ -339,6 +352,7 @@ public final class RaftNode {
   private void abortTransfer() {
     transferee = NONE;
     transferElapsed = 0;
+    timeoutNowSent = false;
   }
 
   /**
@@ -916,6 +930,14 @@ public final class RaftNode {
   private void sendTimeoutNow(String peer) {
     leaseRevoked = true;
     leaseExpiry = 0;
+    if (!timeoutNowSent) {
+      // The target's election gets a full election timeout of its own. Counting it from the start
+      // of the transfer let a slow catch-up use the budget up, so the leader gave up and appended
+      // new entries while the target campaigned, and the target then lost its election for want
+      // of an up-to-date log: a term with no leader instead of a handover (#82).
+      timeoutNowSent = true;
+      transferElapsed = 0;
+    }
     send(new TimeoutNow(id, peer, term));
   }
 

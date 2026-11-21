@@ -300,6 +300,84 @@ class ElectionTest {
   }
 
   @Test
+  void aTargetThatCatchesUpLateStillGetsAFullElectionTimeoutToTakeOver() {
+    TestCluster c = new TestCluster(3, 24);
+    RaftNode leader = c.awaitLeader();
+    long t = leader.term();
+    String target = otherThan(c, leader.id());
+    int election = c.opts.electionTicks();
+    c.isolated.add(target);
+    for (int i = 0; i < 20; i++) {
+      leader.propose(ReplicationTest.cmd("c" + i));
+    }
+    c.flush();
+    leader.transferLeadership(target);
+    // The catch-up takes most of the first election timeout.
+    c.ticks(election - 3);
+    assertEquals(target, leader.transferee().orElseThrow());
+    // The target catches up on the next heartbeat, but its TimeoutNow is slow to arrive (a loaded
+    // machine, a slow fsync).
+    c.isolated.remove(target);
+    int[] timeoutNows = {0};
+    c.dropIf =
+        m -> {
+          if (m instanceof TimeoutNow) {
+            timeoutNows[0]++;
+            return true;
+          }
+          return false;
+        };
+    for (int i = 0; i < c.opts.heartbeatTicks() && timeoutNows[0] == 0; i++) {
+      c.tick();
+    }
+    assertTrue(timeoutNows[0] > 0, "the caught-up target was not sent TimeoutNow");
+    assertEquals(target, leader.transferee().orElseThrow());
+    assertEquals(leader.log().lastIndex(), c.node(target).log().lastIndex());
+    // The first election timeout runs out within three ticks, but the target's election has its
+    // own: the leader still refuses proposals, so the target's log stays up to date.
+    c.ticks(election / 2);
+    assertEquals(target, leader.transferee().orElseThrow());
+    assertThrows(NotLeaderException.class, () -> leader.propose(ReplicationTest.cmd("x")));
+    // A resent TimeoutNow gets through, and the target wins the election it starts.
+    c.dropIf = m -> false;
+    for (int i = 0; i < election / 2 - 1 && c.node(target).role() != RaftNode.Role.LEADER; i++) {
+      c.tick();
+    }
+    assertEquals(RaftNode.Role.LEADER, c.node(target).role());
+    assertEquals(t + 1, c.node(target).term());
+    assertEquals(RaftNode.Role.FOLLOWER, leader.role());
+  }
+
+  @Test
+  void aTransferWhoseTimeoutNowNeverArrivesIsAbortedOneElectionTimeoutAfterTheFirst() {
+    TestCluster c = new TestCluster(3, 25);
+    RaftNode leader = c.awaitLeader();
+    long t = leader.term();
+    String target = otherThan(c, leader.id());
+    int election = c.opts.electionTicks();
+    c.isolated.add(target);
+    leader.propose(ReplicationTest.cmd("behind"));
+    c.flush();
+    leader.transferLeadership(target);
+    c.ticks(3);
+    c.isolated.remove(target);
+    c.dropIf = m -> m instanceof TimeoutNow;
+    // Catch-up and the first TimeoutNow happen within the next heartbeat.
+    int ticks = 0;
+    while (leader.log().lastIndex() != c.node(target).log().lastIndex()) {
+      c.tick();
+      ticks++;
+      assertTrue(ticks < election - 3, "the target did not catch up");
+    }
+    c.ticks(election - 1);
+    assertEquals(target, leader.transferee().orElseThrow());
+    c.tick();
+    assertTrue(leader.transferee().isEmpty());
+    assertEquals(RaftNode.Role.LEADER, leader.role());
+    assertEquals(t, leader.term());
+  }
+
+  @Test
   void transferToAnUnreachableTargetIsAbortedAfterOneElectionTimeout() {
     TestCluster c = new TestCluster(3, 23);
     RaftNode leader = c.awaitLeader();
