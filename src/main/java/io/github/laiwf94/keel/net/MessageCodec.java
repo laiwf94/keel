@@ -10,9 +10,11 @@ import io.github.laiwf94.keel.raft.Message.AppendRequest;
 import io.github.laiwf94.keel.raft.Message.AppendResponse;
 import io.github.laiwf94.keel.raft.Message.SnapshotRequest;
 import io.github.laiwf94.keel.raft.Message.SnapshotResponse;
+import io.github.laiwf94.keel.raft.Message.SnapshotResult;
 import io.github.laiwf94.keel.raft.Message.TimeoutNow;
 import io.github.laiwf94.keel.raft.Message.VoteRequest;
 import io.github.laiwf94.keel.raft.Message.VoteResponse;
+import io.github.laiwf94.keel.raft.SnapshotMeta;
 import java.util.ArrayList;
 import java.util.List;
 
@@ -64,11 +66,14 @@ public final class MessageCodec {
       case SnapshotRequest s -> {
         header(w, SNAPSHOT_REQUEST, m);
         w.writeLong(s.seq());
-        Codec.writeSnapshot(w, s.snapshot());
+        Codec.writeSnapshotMeta(w, s.meta());
+        w.writeLong(s.offset()).writeBoolean(s.done()).writeInt(s.checksum());
+        w.writeBytes(s.data());
       }
       case SnapshotResponse s -> {
         header(w, SNAPSHOT_RESPONSE, m);
-        w.writeLong(s.matchIndex()).writeLong(s.seq());
+        w.writeByte(s.result().code()).writeLong(s.snapshotIndex());
+        w.writeLong(s.nextOffset()).writeLong(s.matchIndex()).writeLong(s.seq());
       }
       case TimeoutNow t -> header(w, TIMEOUT_NOW, t);
     }
@@ -119,10 +124,21 @@ public final class MessageCodec {
                     r.readLong());
             case SNAPSHOT_REQUEST -> {
               long seq = r.readLong();
-              yield new SnapshotRequest(from, to, term, Codec.readSnapshot(r), seq);
+              SnapshotMeta meta = Codec.readSnapshotMeta(r);
+              long offset = r.readLong();
+              boolean done = r.readBoolean();
+              int checksum = r.readInt();
+              byte[] data = r.readBytes(Codec.MAX_SNAPSHOT_CHUNK_BYTES);
+              yield new SnapshotRequest(from, to, term, meta, offset, data, done, checksum, seq);
             }
-            case SNAPSHOT_RESPONSE ->
-                new SnapshotResponse(from, to, term, r.readLong(), r.readLong());
+            case SNAPSHOT_RESPONSE -> {
+              int code = r.readByte();
+              SnapshotResult result =
+                  SnapshotResult.fromCode(code)
+                      .orElseThrow(() -> new CodecException("unknown snapshot result " + code));
+              yield new SnapshotResponse(
+                  from, to, term, result, r.readLong(), r.readLong(), r.readLong(), r.readLong());
+            }
             case TIMEOUT_NOW -> new TimeoutNow(from, to, term);
             default -> throw new CodecException("unknown message type " + type);
           };

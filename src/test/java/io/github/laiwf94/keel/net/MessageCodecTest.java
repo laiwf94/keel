@@ -5,12 +5,13 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 
 import io.github.laiwf94.keel.codec.ByteWriter;
 import io.github.laiwf94.keel.codec.CodecException;
+import io.github.laiwf94.keel.raft.Codec;
 import io.github.laiwf94.keel.raft.Configuration;
 import io.github.laiwf94.keel.raft.Entry;
 import io.github.laiwf94.keel.raft.EntryType;
 import io.github.laiwf94.keel.raft.Member;
 import io.github.laiwf94.keel.raft.Message;
-import io.github.laiwf94.keel.raft.Snapshot;
+import io.github.laiwf94.keel.raft.Message.SnapshotResult;
 import io.github.laiwf94.keel.raft.SnapshotMeta;
 import java.util.Arrays;
 import java.util.List;
@@ -39,9 +40,18 @@ class MessageCodecTest {
             9),
         new Message.AppendRequest("a", "b", 3, 4, 2, List.of(), 4, 9),
         new Message.AppendResponse("b", "a", 3, false, 0, 4, 2, 1, 9),
+        Message.SnapshotRequest.of(
+            "a", "b", 3, new SnapshotMeta(7, 2, CONFIG), 0, new byte[] {5, 6, 7}, false, 4),
+        Message.SnapshotRequest.of(
+            "a", "b", 3, new SnapshotMeta(7, 2, CONFIG), 3, new byte[] {8}, true, 4),
+        Message.SnapshotRequest.of(
+            "a", "b", 3, new SnapshotMeta(7, 2, CONFIG), 4, new byte[0], true, 4),
+        // A chunk whose checksum is wrong still decodes; the receiver checks it.
         new Message.SnapshotRequest(
-            "a", "b", 3, new Snapshot(new SnapshotMeta(7, 2, CONFIG), new byte[] {5, 6, 7}), 4),
-        new Message.SnapshotResponse("b", "a", 3, 7, 4),
+            "a", "b", 3, new SnapshotMeta(7, 2, CONFIG), 0, new byte[] {1}, true, 12345, 4),
+        new Message.SnapshotResponse("b", "a", 3, SnapshotResult.ACCEPTED, 7, 3, 0, 4),
+        new Message.SnapshotResponse("b", "a", 3, SnapshotResult.REJECTED, 7, 0, 0, 4),
+        Message.SnapshotResponse.installed("b", "a", 3, 7, 9, 4),
         new Message.VoteRequest("a", "b", 4, 10, 3, false, true),
         new Message.TimeoutNow("a", "b", 3));
   }
@@ -154,5 +164,50 @@ class MessageCodecTest {
             .writeBytes(new byte[0])
             .toByteArray();
     assertThrows(CodecException.class, () -> MessageCodec.decode(badSnapshot));
+    byte[] oversizedChunk =
+        new ByteWriter()
+            .writeByte(5)
+            .writeString("a")
+            .writeString("b")
+            .writeLong(1)
+            .writeLong(0)
+            .writeLong(1)
+            .writeLong(1)
+            .writeRaw(CONFIG.encode())
+            .writeLong(0)
+            .writeBoolean(true)
+            .writeInt(0)
+            .writeInt(Codec.MAX_SNAPSHOT_CHUNK_BYTES + 1)
+            .toByteArray();
+    assertThrows(CodecException.class, () -> MessageCodec.decode(oversizedChunk));
+    byte[] emptyChunkNotLast =
+        new ByteWriter()
+            .writeByte(5)
+            .writeString("a")
+            .writeString("b")
+            .writeLong(1)
+            .writeLong(0)
+            .writeLong(1)
+            .writeLong(1)
+            .writeRaw(CONFIG.encode())
+            .writeLong(0)
+            .writeBoolean(false)
+            .writeInt(0)
+            .writeBytes(new byte[0])
+            .toByteArray();
+    assertThrows(CodecException.class, () -> MessageCodec.decode(emptyChunkNotLast));
+    byte[] unknownResult =
+        new ByteWriter()
+            .writeByte(6)
+            .writeString("b")
+            .writeString("a")
+            .writeLong(1)
+            .writeByte(3)
+            .writeLong(7)
+            .writeLong(0)
+            .writeLong(0)
+            .writeLong(0)
+            .toByteArray();
+    assertThrows(CodecException.class, () -> MessageCodec.decode(unknownResult));
   }
 }

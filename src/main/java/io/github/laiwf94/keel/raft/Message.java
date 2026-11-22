@@ -1,7 +1,10 @@
 package io.github.laiwf94.keel.raft;
 
+import java.util.Arrays;
 import java.util.List;
 import java.util.Objects;
+import java.util.Optional;
+import java.util.zip.CRC32C;
 
 /**
  * Every message Raft nodes exchange. Each carries the sender, the receiver and the sender's term.
@@ -113,21 +116,233 @@ public sealed interface Message {
     }
   }
 
-  /** InstallSnapshot, sent whole. */
-  record SnapshotRequest(String from, String to, long term, Snapshot snapshot, long seq)
-      implements Message {
-    public SnapshotRequest {
+  /**
+   * One chunk of an InstallSnapshot transfer (section 7). The leader cuts the snapshot described by
+   * {@code meta} into chunks and sends {@code data} as the bytes at {@code offset}; {@code done}
+   * marks the chunk that ends the snapshot. {@code checksum} is the CRC32C of {@code data}, checked
+   * by the follower before it keeps the bytes. Every chunk carries the whole {@code meta}, so a
+   * follower can tell chunks of different snapshots apart and resume a transfer from any offset.
+   * The data array is owned by the message and never modified; use {@link SnapshotRequest#of} to
+   * compute the checksum.
+   */
+  final class SnapshotRequest implements Message {
+    private final String from;
+    private final String to;
+    private final long term;
+    private final SnapshotMeta meta;
+    private final long offset;
+    private final byte[] data;
+    private final boolean done;
+    private final int checksum;
+    private final long seq;
+
+    public SnapshotRequest(
+        String from,
+        String to,
+        long term,
+        SnapshotMeta meta,
+        long offset,
+        byte[] data,
+        boolean done,
+        int checksum,
+        long seq) {
       check(from, to, term);
-      Objects.requireNonNull(snapshot, "snapshot");
-      nonNegative(seq);
+      Objects.requireNonNull(meta, "meta");
+      Objects.requireNonNull(data, "data");
+      nonNegative(offset, seq);
+      if (offset > Long.MAX_VALUE - data.length) {
+        throw new IllegalArgumentException("chunk ends past the largest offset");
+      }
+      if (data.length == 0 && !done) {
+        throw new IllegalArgumentException("only the last chunk may be empty");
+      }
+      this.from = from;
+      this.to = to;
+      this.term = term;
+      this.meta = meta;
+      this.offset = offset;
+      this.data = data;
+      this.done = done;
+      this.checksum = checksum;
+      this.seq = seq;
+    }
+
+    @Override
+    public String from() {
+      return from;
+    }
+
+    @Override
+    public String to() {
+      return to;
+    }
+
+    @Override
+    public long term() {
+      return term;
+    }
+
+    public SnapshotMeta meta() {
+      return meta;
+    }
+
+    public long offset() {
+      return offset;
+    }
+
+    /** The chunk's bytes. Callers must not modify the returned array. */
+    public byte[] data() {
+      return data;
+    }
+
+    public boolean done() {
+      return done;
+    }
+
+    public int checksum() {
+      return checksum;
+    }
+
+    public long seq() {
+      return seq;
+    }
+
+    /** A chunk with its checksum computed from {@code data}. */
+    public static SnapshotRequest of(
+        String from,
+        String to,
+        long term,
+        SnapshotMeta meta,
+        long offset,
+        byte[] data,
+        boolean done,
+        long seq) {
+      return new SnapshotRequest(from, to, term, meta, offset, data, done, crc32c(data), seq);
+    }
+
+    /** The CRC32C a chunk carrying {@code data} must have. */
+    public static int crc32c(byte[] data) {
+      CRC32C crc = new CRC32C();
+      crc.update(data);
+      return (int) crc.getValue();
+    }
+
+    /** Whether {@link #checksum} matches {@link #data}. */
+    public boolean intact() {
+      return crc32c(data) == checksum;
+    }
+
+    /** The offset just past this chunk. */
+    public long end() {
+      return offset + data.length;
+    }
+
+    @Override
+    public boolean equals(Object o) {
+      return o instanceof SnapshotRequest r
+          && r.from.equals(from)
+          && r.to.equals(to)
+          && r.term == term
+          && r.meta.equals(meta)
+          && r.offset == offset
+          && Arrays.equals(r.data, data)
+          && r.done == done
+          && r.checksum == checksum
+          && r.seq == seq;
+    }
+
+    @Override
+    public int hashCode() {
+      return Objects.hash(from, to, term, meta, offset, Arrays.hashCode(data), done, checksum, seq);
+    }
+
+    @Override
+    public String toString() {
+      return "SnapshotRequest[from="
+          + from
+          + ", to="
+          + to
+          + ", term="
+          + term
+          + ", snapshot="
+          + meta.index()
+          + "@"
+          + meta.term()
+          + ", offset="
+          + offset
+          + ", "
+          + data.length
+          + "B"
+          + (done ? ", done" : "")
+          + ", seq="
+          + seq
+          + "]";
     }
   }
 
-  record SnapshotResponse(String from, String to, long term, long matchIndex, long seq)
+  /**
+   * Reply to one InstallSnapshot chunk. {@code snapshotIndex} names the snapshot the chunk belonged
+   * to, so the leader can ignore replies about a transfer it no longer runs.
+   *
+   * <ul>
+   *   <li>{@link SnapshotResult#ACCEPTED}: the follower holds the first {@code nextOffset} bytes of
+   *       the snapshot. The leader may send on from there.
+   *   <li>{@link SnapshotResult#REJECTED}: the chunk did not follow the bytes the follower holds,
+   *       or failed its checksum. The leader resends from {@code nextOffset}.
+   *   <li>{@link SnapshotResult#INSTALLED}: the follower's log matches the leader's up to {@code
+   *       matchIndex}, either because it installed the snapshot or because it had already committed
+   *       past it.
+   * </ul>
+   */
+  record SnapshotResponse(
+      String from,
+      String to,
+      long term,
+      SnapshotResult result,
+      long snapshotIndex,
+      long nextOffset,
+      long matchIndex,
+      long seq)
       implements Message {
     public SnapshotResponse {
       check(from, to, term);
-      nonNegative(matchIndex, seq);
+      Objects.requireNonNull(result, "result");
+      nonNegative(snapshotIndex, nextOffset, matchIndex, seq);
+    }
+
+    /** The follower holds the snapshot or a log that covers it, matching up to {@code match}. */
+    public static SnapshotResponse installed(
+        String from, String to, long term, long snapshotIndex, long match, long seq) {
+      return new SnapshotResponse(
+          from, to, term, SnapshotResult.INSTALLED, snapshotIndex, 0, match, seq);
+    }
+  }
+
+  /** What a follower did with an InstallSnapshot chunk. */
+  enum SnapshotResult {
+    ACCEPTED(0),
+    REJECTED(1),
+    INSTALLED(2);
+
+    private final int code;
+
+    SnapshotResult(int code) {
+      this.code = code;
+    }
+
+    /** The stable number written to the wire. */
+    public int code() {
+      return code;
+    }
+
+    /** The result with this code, or empty for an unknown one. */
+    public static Optional<SnapshotResult> fromCode(int code) {
+      for (SnapshotResult r : values()) {
+        if (r.code == code) {
+          return Optional.of(r);
+        }
+      }
+      return Optional.empty();
     }
   }
 

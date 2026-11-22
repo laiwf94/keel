@@ -12,6 +12,9 @@ public final class Codec {
   /** Largest snapshot accepted from disk or the network. */
   public static final int MAX_SNAPSHOT_BYTES = 256 << 20;
 
+  /** Largest InstallSnapshot chunk accepted from the network. */
+  public static final int MAX_SNAPSHOT_CHUNK_BYTES = 8 << 20;
+
   private Codec() {}
 
   public static void writeEntry(ByteWriter w, Entry e) {
@@ -31,18 +34,26 @@ public final class Codec {
   }
 
   public static void writeSnapshot(ByteWriter w, Snapshot s) {
-    w.writeLong(s.meta().index()).writeLong(s.meta().term());
-    s.meta().config().writeTo(w);
+    writeSnapshotMeta(w, s.meta());
     w.writeBytes(s.data());
   }
 
   public static Snapshot readSnapshot(ByteReader r) {
+    SnapshotMeta meta = readSnapshotMeta(r);
+    return new Snapshot(meta, r.readBytes(MAX_SNAPSHOT_BYTES));
+  }
+
+  public static void writeSnapshotMeta(ByteWriter w, SnapshotMeta meta) {
+    w.writeLong(meta.index()).writeLong(meta.term());
+    meta.config().writeTo(w);
+  }
+
+  public static SnapshotMeta readSnapshotMeta(ByteReader r) {
     long index = r.readNonNegativeLong();
     long term = r.readNonNegativeLong();
     Configuration config = Configuration.readFrom(r);
-    byte[] data = r.readBytes(MAX_SNAPSHOT_BYTES);
     try {
-      return new Snapshot(new SnapshotMeta(index, term, config), data);
+      return new SnapshotMeta(index, term, config);
     } catch (IllegalArgumentException e) {
       throw new CodecException(e.getMessage());
     }

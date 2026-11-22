@@ -4,11 +4,13 @@ import io.github.laiwf94.keel.raft.Message.AppendRequest;
 import io.github.laiwf94.keel.raft.Message.AppendResponse;
 import io.github.laiwf94.keel.raft.Message.SnapshotRequest;
 import io.github.laiwf94.keel.raft.Message.SnapshotResponse;
+import io.github.laiwf94.keel.raft.Message.SnapshotResult;
 import io.github.laiwf94.keel.raft.Message.TimeoutNow;
 import io.github.laiwf94.keel.raft.Message.VoteRequest;
 import io.github.laiwf94.keel.raft.Message.VoteResponse;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -53,6 +55,16 @@ public final class RaftNode {
     State state = State.PROBE;
     boolean paused;
     long ackedSeq;
+    // InstallSnapshot in chunks: the snapshot this transfer sends, kept even if the leader takes a
+    // newer one meanwhile so the follower can resume it; the bytes the follower confirmed holding;
+    // the offset of the next chunk to send; whether the last chunk went out; the offset the
+    // transfer last went back to on a rejection, or -1; and ticks since the follower last
+    // confirmed progress.
+    Snapshot snapshot;
+    long snapshotAcked;
+    long snapshotSent;
+    boolean snapshotDoneSent;
+    long snapshotRewound = -1;
     int snapshotElapsed;
 
     Progress(long next) {
@@ -118,6 +130,48 @@ public final class RaftNode {
   private final List<Message> outbox = new ArrayList<>();
   private Snapshot latestSnapshot;
   private Snapshot toRestore;
+  private Inbound inbound;
+
+  /**
+   * A snapshot this follower is receiving in chunks: who sends it, in which term, and the bytes
+   * received so far, which always form a prefix of the snapshot.
+   */
+  private static final class Inbound {
+    final String leader;
+    final long term;
+    final SnapshotMeta meta;
+    byte[] buf = new byte[0];
+    int size;
+
+    Inbound(String leader, long term, SnapshotMeta meta) {
+      this.leader = leader;
+      this.term = term;
+      this.meta = meta;
+    }
+
+    boolean carries(SnapshotRequest sr) {
+      return sr.from().equals(leader) && sr.term() == term && sr.meta().equals(meta);
+    }
+
+    /** Appends the part of {@code sr} past the bytes held; false if the snapshot gets too big. */
+    boolean append(SnapshotRequest sr) {
+      int skip = (int) (size - sr.offset());
+      int add = sr.data().length - skip;
+      if (add <= 0) {
+        return true;
+      }
+      if (add > Codec.MAX_SNAPSHOT_BYTES - size) {
+        return false;
+      }
+      if (size + add > buf.length) {
+        int cap = (int) Math.min(Codec.MAX_SNAPSHOT_BYTES, Math.max(size + add, 2L * buf.length));
+        buf = Arrays.copyOf(buf, cap);
+      }
+      System.arraycopy(sr.data(), skip, buf, size, add);
+      size += add;
+      return true;
+    }
+  }
 
   public RaftNode(
       String id, Configuration initial, RaftOptions opts, Storage storage, Random random) {
@@ -249,7 +303,13 @@ public final class RaftNode {
     for (Map.Entry<String, Progress> e : progress.entrySet()) {
       Progress pr = e.getValue();
       if (pr.state == Progress.State.SNAPSHOT && ++pr.snapshotElapsed >= opts.electionTicks()) {
-        sendSnapshot(e.getKey()); // the last one was probably lost
+        // No progress for an election timeout: a chunk or its reply was probably lost. Resume
+        // from the last offset the follower confirmed.
+        pr.snapshotElapsed = 0;
+        pr.snapshotSent = pr.snapshotAcked;
+        pr.snapshotDoneSent = false;
+        pr.snapshotRewound = -1;
+        sendSnapshotChunks(e.getKey());
       }
     }
   }
@@ -541,6 +601,7 @@ public final class RaftNode {
       role = Role.PRE_CANDIDATE;
     } else {
       term++;
+      inbound = null;
       votedFor = id;
       persistHardState();
       role = Role.CANDIDATE;
@@ -873,32 +934,97 @@ public final class RaftNode {
     send(new AppendRequest(id, peer, term, prev, prevTerm, entries, commitIndex, seq));
   }
 
+  /** Starts sending the latest snapshot to a follower that needs compacted entries. */
   private void sendSnapshot(String peer) {
     Progress pr = progress.get(peer);
     pr.state = Progress.State.SNAPSHOT;
+    pr.snapshot = latestSnapshot;
+    pr.snapshotAcked = 0;
+    pr.snapshotSent = 0;
+    pr.snapshotDoneSent = false;
+    pr.snapshotRewound = -1;
     pr.snapshotElapsed = 0;
-    send(new SnapshotRequest(id, peer, term, latestSnapshot, seq));
+    sendSnapshotChunks(peer);
   }
 
-  /** InstallSnapshot (section 7), received whole. */
+  /**
+   * Sends chunks from {@code pr.snapshotSent} on while fewer than {@link
+   * RaftOptions#maxInflightSnapshotChunks()} chunks' worth of bytes are unacknowledged.
+   */
+  private void sendSnapshotChunks(String peer) {
+    Progress pr = progress.get(peer);
+    byte[] data = pr.snapshot.data();
+    long window = (long) opts.snapshotChunkBytes() * opts.maxInflightSnapshotChunks();
+    while (!pr.snapshotDoneSent && pr.snapshotSent - pr.snapshotAcked < window) {
+      int from = (int) pr.snapshotSent;
+      int to = (int) Math.min(data.length, pr.snapshotSent + opts.snapshotChunkBytes());
+      boolean done = to == data.length;
+      byte[] chunk = Arrays.copyOfRange(data, from, to);
+      send(SnapshotRequest.of(id, peer, term, pr.snapshot.meta(), from, chunk, done, seq));
+      pr.snapshotSent = to;
+      pr.snapshotDoneSent = done;
+    }
+  }
+
+  /**
+   * One InstallSnapshot chunk (section 7). Chunks are kept only in order, so the bytes held are
+   * always a prefix of the snapshot. A chunk past that prefix, which means an earlier one was lost,
+   * and a chunk that fails its checksum are rejected with the offset to resend from. A chunk the
+   * follower already holds is acknowledged again, which lets a leader that started over skip ahead.
+   * The last chunk installs the snapshot.
+   */
   private void handleSnapshot(SnapshotRequest sr) {
     if (role != Role.FOLLOWER) {
       becomeFollower(term, sr.from());
     }
     leaderId = sr.from();
     electionElapsed = 0;
-    SnapshotMeta meta = sr.snapshot().meta();
+    SnapshotMeta meta = sr.meta();
     if (meta.index() <= commitIndex) {
-      send(new SnapshotResponse(id, sr.from(), term, commitIndex, sr.seq()));
+      // Already covered: a duplicate of an installed snapshot, or one this node no longer needs.
+      if (inbound != null && inbound.meta.index() <= commitIndex) {
+        inbound = null;
+      }
+      send(SnapshotResponse.installed(id, sr.from(), term, meta.index(), commitIndex, sr.seq()));
       return;
     }
+    if (inbound == null || !inbound.carries(sr)) {
+      if (sr.offset() != 0) {
+        // The start of this snapshot never arrived, or this node restarted and lost it.
+        send(snapshotReply(sr, SnapshotResult.REJECTED, 0));
+        return;
+      }
+      inbound = new Inbound(sr.from(), sr.term(), meta);
+    }
+    if (sr.offset() > inbound.size || !sr.intact()) {
+      send(snapshotReply(sr, SnapshotResult.REJECTED, inbound.size));
+      return;
+    }
+    if (!inbound.append(sr)) {
+      // Larger than this node can hold in memory. Retrying cannot help, so the transfer stops
+      // here and the leader's retries go unanswered.
+      inbound = null;
+      return;
+    }
+    if (!sr.done() || sr.end() != inbound.size) {
+      send(snapshotReply(sr, SnapshotResult.ACCEPTED, inbound.size));
+      return;
+    }
+    byte[] data =
+        inbound.size == inbound.buf.length ? inbound.buf : Arrays.copyOf(inbound.buf, inbound.size);
+    Snapshot snapshot = new Snapshot(meta, data);
+    inbound = null;
     log.installSnapshot(meta);
-    storage.saveSnapshot(sr.snapshot(), log.entries());
-    latestSnapshot = sr.snapshot();
-    toRestore = sr.snapshot();
+    storage.saveSnapshot(snapshot, log.entries());
+    latestSnapshot = snapshot;
+    toRestore = snapshot;
     commitIndex = meta.index();
     handedOut = meta.index();
-    send(new SnapshotResponse(id, sr.from(), term, meta.index(), sr.seq()));
+    send(SnapshotResponse.installed(id, sr.from(), term, meta.index(), meta.index(), sr.seq()));
+  }
+
+  private SnapshotResponse snapshotReply(SnapshotRequest sr, SnapshotResult result, long next) {
+    return new SnapshotResponse(id, sr.from(), term, result, sr.meta().index(), next, 0, sr.seq());
   }
 
   private void handleSnapshotResponse(SnapshotResponse sr) {
@@ -911,9 +1037,16 @@ public final class RaftNode {
       pr.ackedSeq = sr.seq();
       advanceReads();
     }
+    if (sr.result() != SnapshotResult.INSTALLED) {
+      if (pr.state == Progress.State.SNAPSHOT && sr.snapshotIndex() == pr.snapshot.meta().index()) {
+        continueSnapshot(sr.from(), pr, sr);
+      }
+      return;
+    }
     pr.match = Math.max(pr.match, sr.matchIndex());
     pr.next = pr.match + 1;
     pr.state = Progress.State.PROBE;
+    pr.snapshot = null;
     pr.paused = false;
     maybeCommit();
     maybePromote();
@@ -921,6 +1054,39 @@ public final class RaftNode {
       sendAppend(sr.from(), false);
       maybeSendTimeoutNow(sr.from());
     }
+  }
+
+  /**
+   * Moves a transfer on after the follower accepted or rejected a chunk. An acceptance only ever
+   * moves the confirmed offset forward, so a late or duplicated one changes nothing. A rejection
+   * goes back to the offset the follower names, but only once for each offset until the follower
+   * confirms progress: when one chunk is lost, every chunk in the window after it is rejected with
+   * the same offset, and going back for each would resend the window once per rejection.
+   */
+  private void continueSnapshot(String peer, Progress pr, SnapshotResponse sr) {
+    long size = pr.snapshot.data().length;
+    long next = Math.min(sr.nextOffset(), size);
+    if (sr.result() == SnapshotResult.ACCEPTED) {
+      if (next <= pr.snapshotAcked) {
+        return;
+      }
+      pr.snapshotAcked = next;
+      pr.snapshotRewound = -1;
+      if (pr.snapshotSent < next) {
+        pr.snapshotSent = next;
+        pr.snapshotDoneSent = false;
+      }
+    } else {
+      if (next == pr.snapshotRewound) {
+        return;
+      }
+      pr.snapshotAcked = next;
+      pr.snapshotSent = next;
+      pr.snapshotDoneSent = false;
+      pr.snapshotRewound = next;
+    }
+    pr.snapshotElapsed = 0;
+    sendSnapshotChunks(peer);
   }
 
   /** Sends TimeoutNow once the transfer target's log has caught up with this leader's. */
@@ -948,6 +1114,7 @@ public final class RaftNode {
   private void becomeFollower(long newTerm, String leader) {
     if (newTerm > term) {
       term = newTerm;
+      inbound = null;
       votedFor = NONE;
       persistHardState();
     }

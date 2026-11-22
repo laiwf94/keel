@@ -7,6 +7,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import io.github.laiwf94.keel.raft.Message.SnapshotRequest;
 import io.github.laiwf94.keel.raft.Message.SnapshotResponse;
+import io.github.laiwf94.keel.raft.Message.SnapshotResult;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Random;
@@ -14,6 +15,11 @@ import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.jupiter.api.Test;
 
 class SnapshotTest {
+  /** A snapshot sent as one chunk. */
+  static SnapshotRequest whole(String from, String to, long term, SnapshotMeta meta, byte[] data) {
+    return SnapshotRequest.of(from, to, term, meta, 0, data, true, 0);
+  }
+
   static String follower(TestCluster c, RaftNode leader) {
     return c.nodes.keySet().stream().filter(k -> !k.equals(leader.id())).findFirst().orElseThrow();
   }
@@ -102,8 +108,9 @@ class SnapshotTest {
     long commit = fn.commitIndex();
     // A snapshot of an index the follower already committed is acknowledged without changes.
     SnapshotMeta old = new SnapshotMeta(1, fn.log().termAt(1), c.config);
-    fn.step(new SnapshotRequest(leader.id(), f, leader.term(), new Snapshot(old, new byte[0]), 0));
+    fn.step(whole(leader.id(), f, leader.term(), old, new byte[0]));
     SnapshotResponse reply = (SnapshotResponse) fn.ready().messages().get(0);
+    assertEquals(SnapshotResult.INSTALLED, reply.result());
     assertEquals(commit, reply.matchIndex());
     // A follower that holds a longer log than the snapshot keeps the entries after it.
     List<Entry> entries = new ArrayList<>();
@@ -113,7 +120,7 @@ class SnapshotTest {
     RaftNode lagging =
         new RaftNode("n1", c.config, c.opts, ReplicationTest.preloaded(entries, 1), new Random(1));
     SnapshotMeta prefix = new SnapshotMeta(3, 1, c.config);
-    lagging.step(new SnapshotRequest("n2", "n1", 1, new Snapshot(prefix, new byte[0]), 0));
+    lagging.step(whole("n2", "n1", 1, prefix, new byte[0]));
     assertEquals(5, lagging.log().lastIndex());
     assertEquals(4, lagging.log().firstIndex());
     assertEquals(3, lagging.commitIndex());
@@ -141,11 +148,11 @@ class SnapshotTest {
       n.tick();
     }
     SnapshotMeta meta = new SnapshotMeta(3, 1, three);
-    n.step(new SnapshotRequest("n2", "n1", 1, new Snapshot(meta, new byte[] {5}), 0));
+    n.step(whole("n2", "n1", 1, meta, new byte[] {5}));
     assertEquals(RaftNode.Role.FOLLOWER, n.role());
     assertEquals("n2", n.leader().orElseThrow());
     assertEquals(3, n.commitIndex());
-    n.step(new SnapshotResponse("n2", "n1", 1, 3, 0));
+    n.step(SnapshotResponse.installed("n2", "n1", 1, 3, 3, 0));
     assertEquals(RaftNode.Role.FOLLOWER, n.role());
   }
 }

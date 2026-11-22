@@ -37,6 +37,9 @@ import java.util.function.Supplier;
  * seed replays the exact same run.
  */
 final class Simulation {
+  /** Snapshot chunk size in the simulator. */
+  static final int SIM_SNAPSHOT_CHUNK_BYTES = 64;
+
   record Options(
       int nodes,
       long durationMs,
@@ -76,7 +79,10 @@ final class Simulation {
           true,
           true,
           true,
-          RaftOptions.DEFAULTS);
+          // Chunks far smaller than the snapshots the runs take, so every InstallSnapshot goes
+          // over in several chunks, each one exposed to the drops, duplicates, delays and
+          // crashes of the run.
+          RaftOptions.DEFAULTS.withSnapshotChunks(SIM_SNAPSHOT_CHUNK_BYTES, 4));
     }
 
     /**
@@ -351,6 +357,8 @@ final class Simulation {
   private long eventSeq;
   private long trace = 0xcbf29ce484222325L;
   long delivered;
+  // InstallSnapshot chunks delivered, and of those the last chunks of a snapshot.
+  long snapshotChunksDelivered;
   long snapshotsDelivered;
   final List<String> faultLog = new ArrayList<>();
 
@@ -596,8 +604,11 @@ final class Simulation {
     }
     catchUp(n);
     delivered++;
-    if (m instanceof Message.SnapshotRequest) {
-      snapshotsDelivered++;
+    if (m instanceof Message.SnapshotRequest sr) {
+      snapshotChunksDelivered++;
+      if (sr.done()) {
+        snapshotsDelivered++;
+      }
     }
     mix(now);
     mix(m.hashCode());

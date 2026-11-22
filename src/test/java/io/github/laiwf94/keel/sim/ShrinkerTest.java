@@ -250,10 +250,9 @@ class ShrinkerTest {
    * and client operations that still show it.
    *
    * <p>It runs without leadership transfers and graceful shutdowns, which have a random source of
-   * their own, so seed 0 replays the run this was written against. With them on, the first seeds
-   * that fail are 2 and 3, and their client steps do not shrink to a minimal set within this replay
-   * budget; neither do seeds 2 to 4 without them. Shrinking a failure that the new faults cause is
-   * {@link #aFailureCausedByAGracefulShutdownShrinksToIt}.
+   * their own. With them on, the first seed that fails is 0, and its client steps do not shrink to
+   * a minimal set within this replay budget; neither do seeds 3 and 4 without them. Shrinking a
+   * failure that the new faults cause is {@link #aFailureCausedByAGracefulShutdownShrinksToIt}.
    */
   @Test
   void aDuplicatedRetryShrinksToAFewFaultsAndOperations() {
@@ -273,7 +272,7 @@ class ShrinkerTest {
     Shrinker.Result r = Shrinker.shrink("KvSimulationTest.forgetful", body, seed, 600);
     String report = r.report();
     System.out.println(report);
-    // Seed 0 goes from 30 faults and 654 steps to 2 faults and 4 steps in 136 replays.
+    // Seed 0 goes from 28 faults and 572 steps to 1 fault and 2 steps in 72 replays.
     assertTrue(r.minimal(), report);
     assertTrue(r.faults().cardinality() * 4 < r.originalFaults(), report);
     assertTrue(r.steps().cardinality() * 20 < r.originalSteps(), report);

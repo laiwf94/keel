@@ -159,9 +159,53 @@ class ModelTest {
     assertThrows(
         IllegalArgumentException.class,
         () -> new Message.AppendResponse("a", "b", 1, true, -1, 0, 0, 0, 0));
+    SnapshotMeta meta = new SnapshotMeta(1, 1, new Configuration(List.of()));
     assertThrows(
-        NullPointerException.class, () -> new Message.SnapshotRequest("a", "b", 1, null, 0));
+        NullPointerException.class,
+        () -> Message.SnapshotRequest.of("a", "b", 1, null, 0, new byte[0], true, 0));
     assertThrows(
-        IllegalArgumentException.class, () -> new Message.SnapshotResponse("a", "b", 1, 0, -1));
+        NullPointerException.class,
+        () -> Message.SnapshotRequest.of("a", "b", 1, meta, 0, null, true, 0));
+    assertThrows(
+        IllegalArgumentException.class,
+        () -> Message.SnapshotRequest.of("a", "b", 1, meta, -1, new byte[1], true, 0));
+    assertThrows(
+        IllegalArgumentException.class,
+        () -> Message.SnapshotRequest.of("a", "b", 1, meta, Long.MAX_VALUE, new byte[1], true, 0));
+    assertThrows(
+        IllegalArgumentException.class,
+        () -> Message.SnapshotRequest.of("a", "b", 1, meta, 0, new byte[0], false, 0));
+    assertThrows(
+        IllegalArgumentException.class,
+        () -> Message.SnapshotResponse.installed("a", "b", 1, 0, 0, -1));
+    assertThrows(
+        IllegalArgumentException.class,
+        () ->
+            new Message.SnapshotResponse(
+                "a", "b", 1, Message.SnapshotResult.ACCEPTED, 1, -1, 0, 0));
+    assertThrows(
+        NullPointerException.class,
+        () -> new Message.SnapshotResponse("a", "b", 1, null, 1, 0, 0, 0));
+    Message.SnapshotRequest chunk =
+        Message.SnapshotRequest.of("a", "b", 1, meta, 5, new byte[] {1, 2}, false, 0);
+    assertTrue(chunk.intact());
+    assertEquals(7, chunk.end());
+    assertEquals(
+        chunk, Message.SnapshotRequest.of("a", "b", 1, meta, 5, new byte[] {1, 2}, false, 0));
+    assertEquals(
+        chunk.hashCode(),
+        Message.SnapshotRequest.of("a", "b", 1, meta, 5, new byte[] {1, 2}, false, 0).hashCode());
+    assertNotEquals(
+        chunk, Message.SnapshotRequest.of("a", "b", 1, meta, 5, new byte[] {1, 3}, false, 0));
+    assertFalse(
+        new Message.SnapshotRequest("a", "b", 1, meta, 5, new byte[] {1, 2}, false, 0, 0).intact());
+    assertEquals(
+        "SnapshotRequest[from=a, to=b, term=1, snapshot=1@1, offset=5, 2B, seq=0]",
+        chunk.toString());
+    assertTrue(
+        Message.SnapshotRequest.of("a", "b", 1, meta, 0, new byte[0], true, 0)
+            .toString()
+            .contains("done"));
+    assertTrue(Message.SnapshotResult.fromCode(9).isEmpty());
   }
 }

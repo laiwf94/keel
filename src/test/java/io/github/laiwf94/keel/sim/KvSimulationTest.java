@@ -191,6 +191,7 @@ class KvSimulationTest {
   @Test
   void snapshotsAndPowerLossesHappenInMostSeeds() {
     AtomicInteger withInstall = new AtomicInteger();
+    AtomicInteger inChunks = new AtomicInteger();
     AtomicInteger withPowerLoss = new AtomicInteger();
     LongStream.range(0, 40)
         .parallel()
@@ -200,11 +201,17 @@ class KvSimulationTest {
               if (r.sim().snapshotsDelivered > 0) {
                 withInstall.incrementAndGet();
               }
+              if (r.sim().snapshotChunksDelivered >= 3 * r.sim().snapshotsDelivered + 1) {
+                inChunks.incrementAndGet();
+              }
               if (r.sim().powerLosses > 0) {
                 withPowerLoss.incrementAndGet();
               }
             });
     assertTrue(withInstall.get() >= 20, "InstallSnapshot ran in only " + withInstall + " of 40");
+    // Snapshots span several chunks, so transfers are cut up by the faults of the run.
+    assertTrue(
+        inChunks.get() >= 20, "snapshots went over in chunks in only " + inChunks + " of 40");
     assertTrue(withPowerLoss.get() >= 20, "power loss hit only " + withPowerLoss + " of 40");
   }
 
