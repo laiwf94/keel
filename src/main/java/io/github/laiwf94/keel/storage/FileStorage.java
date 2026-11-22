@@ -7,6 +7,7 @@ import io.github.laiwf94.keel.raft.Codec;
 import io.github.laiwf94.keel.raft.Entry;
 import io.github.laiwf94.keel.raft.HardState;
 import io.github.laiwf94.keel.raft.Snapshot;
+import io.github.laiwf94.keel.raft.SnapshotMeta;
 import io.github.laiwf94.keel.raft.Storage;
 import java.io.IOException;
 import java.nio.ByteBuffer;
@@ -32,8 +33,10 @@ import java.util.Optional;
  *   <li>{@code wal} holds the log as fixed-size segment files; see {@link SegmentedLog}. Appends
  *       are buffered by the OS until {@link #sync()}, which calls fdatasync. Truncating a
  *       conflicting suffix deletes the later segments and cuts the one holding the first entry to
- *       drop. After a snapshot the log is rewritten into {@code wal.new} to hold only later
- *       entries, and the two directories are swapped by renames.
+ *       drop. A snapshot that the log agrees with compacts it by deleting the segments wholly at or
+ *       below the snapshot index; live entries are never rewritten. Only a snapshot that conflicts
+ *       with the log (one installed from the leader that replaces it) writes a new log into {@code
+ *       wal.new}, and the two directories are swapped by renames.
  * </ul>
  *
  * <p>On startup a record that fails its length or CRC check is a torn final write if it is in the
@@ -59,6 +62,10 @@ public final class FileStorage implements Storage, AutoCloseable {
   private HardState pendingState;
   private long fsyncs;
   private long tornBytesDropped;
+  private long segmentsCompacted;
+  private long logRewrites;
+  private long snapIndex;
+  private long snapTerm;
   private State loaded;
 
   /** Opens (creating if needed) the storage directory and recovers its contents. */
@@ -122,36 +129,41 @@ public final class FileStorage implements Storage, AutoCloseable {
   private void recover() throws IOException {
     HardState hs = readState();
     Optional<Snapshot> snapshot = readSnapshot();
-    long snapIndex = snapshot.map(s -> s.meta().index()).orElse(0L);
+    snapIndex = snapshot.map(s -> s.meta().index()).orElse(0L);
+    snapTerm = snapshot.map(s -> s.meta().term()).orElse(0L);
     finishRewrite();
     migrateLegacyLog();
     List<Entry> entries = new ArrayList<>();
     log = SegmentedLog.open(wal, segmentBytes, entries);
     tornBytesDropped += log.tornBytesDropped();
 
-    // Keep only entries after the snapshot. If the log does not hold the snapshot's last entry
-    // with the same term, its entries conflict with the snapshot (we crashed between installing a
-    // snapshot from the leader and rewriting the log) and are dropped.
+    // Keep only entries after the snapshot. The first segment may begin with entries the
+    // snapshot covers, and a crash during compaction may leave whole segments of them; those are
+    // deleted now. If the log does not hold the snapshot's last entry with the same term, its
+    // entries conflict with the snapshot (we crashed between installing a snapshot from the
+    // leader and replacing the log) and are dropped.
     List<Entry> kept = entries;
-    if (snapshot.isPresent()) {
-      long snapTerm = snapshot.get().meta().term();
+    if (entries.isEmpty()) {
+      // A crash right after a segment was started can leave one with a header and no records.
+      if (log.segmentCount() == 0) {
+        log.startAt(snapIndex + 1);
+      } else if (log.nextIndex() != snapIndex + 1) {
+        rewriteLog(snapIndex + 1, kept);
+      }
+    } else if (snapshot.isPresent()) {
       int at = -1;
       for (int i = 0; i < entries.size(); i++) {
         if (entries.get(i).index() == snapIndex) {
           at = i;
         }
       }
-      boolean firstAfter = !entries.isEmpty() && entries.get(0).index() == snapIndex + 1;
       if (at >= 0 && entries.get(at).term() == snapTerm) {
         kept = entries.subList(at + 1, entries.size());
-      } else if (!firstAfter) {
+        segmentsCompacted += log.compactTo(snapIndex);
+      } else if (entries.get(0).index() != snapIndex + 1) {
         kept = List.of();
+        rewriteLog(snapIndex + 1, kept);
       }
-    }
-    if (kept.size() != entries.size()) {
-      rewriteLog(snapIndex + 1, kept);
-    } else if (entries.isEmpty()) {
-      log.startAt(snapIndex + 1);
     }
     loaded = new State(hs, snapshot, kept);
   }
@@ -295,7 +307,7 @@ public final class FileStorage implements Storage, AutoCloseable {
 
   /**
    * Replaces the log with {@code entries}, which start at {@code first}: they are written to a new
-   * directory, made durable, and swapped in with two renames and a directory fsync.
+   * directory, made durable, and swapped in with two renames, each followed by a directory fsync.
    */
   private void rewriteLog(long first, List<Entry> entries) throws IOException {
     deleteTree(walNew);
@@ -304,12 +316,40 @@ public final class FileStorage implements Storage, AutoCloseable {
     fsyncs += log.fsyncs();
     log = fresh;
     Files.move(wal, walOld, StandardCopyOption.ATOMIC_MOVE);
+    syncDirectory();
     Files.move(walNew, wal, StandardCopyOption.ATOMIC_MOVE);
     fresh.movedTo(wal);
     syncDirectory();
-    fsyncs++;
+    fsyncs += 2;
+    logRewrites++;
     // Recovery deletes wal.old if a crash leaves it, so this needs no fsync of its own.
     deleteTree(walOld);
+  }
+
+  /**
+   * Whether the log already is {@code snapshot} followed by {@code remaining}: it holds the
+   * snapshot's last entry with the same term (or an earlier compaction already dropped it at the
+   * same point) and then exactly the entries of {@code remaining}. Within that range only the first
+   * and last entries are read back and compared; by the Log Matching property two logs that agree
+   * on an entry's index and term agree on every entry before it, and the node appends through this
+   * storage, so the entries between agree too.
+   */
+  private boolean logIs(SnapshotMeta meta, List<Entry> remaining) throws IOException {
+    long index = meta.index();
+    long last = remaining.isEmpty() ? index : remaining.get(remaining.size() - 1).index();
+    if (log.nextIndex() - 1 != last
+        || (!remaining.isEmpty() && remaining.get(0).index() != index + 1)) {
+      return false;
+    }
+    boolean base =
+        index < log.firstIndex()
+            ? index == snapIndex && meta.term() == snapTerm
+            : log.read(index).map(e -> e.term() == meta.term()).orElse(false);
+    if (!base || remaining.isEmpty()) {
+      return base;
+    }
+    return log.read(index + 1).map(remaining.get(0)::equals).orElse(false)
+        && log.read(last).map(remaining.get(remaining.size() - 1)::equals).orElse(false);
   }
 
   @Override
@@ -342,7 +382,16 @@ public final class FileStorage implements Storage, AutoCloseable {
       ByteWriter w = new ByteWriter(snapshot.data().length + 256);
       Codec.writeSnapshot(w, snapshot);
       replaceAtomically("snapshot", w.toByteArray());
-      rewriteLog(snapshot.meta().index() + 1, remaining);
+      // The snapshot is durable before any segment goes, so a crash in between leaves segments
+      // that recovery recognises as covered by it and deletes.
+      SnapshotMeta meta = snapshot.meta();
+      if (logIs(meta, remaining)) {
+        segmentsCompacted += log.compactTo(meta.index());
+      } else {
+        rewriteLog(meta.index() + 1, remaining);
+      }
+      snapIndex = meta.index();
+      snapTerm = meta.term();
     } catch (IOException e) {
       throw new StorageException("snapshot failed: " + e.getMessage(), e);
     }
@@ -366,6 +415,16 @@ public final class FileStorage implements Storage, AutoCloseable {
   /** Number of log segment files, for metrics and tests. */
   public int segmentCount() {
     return log.segmentCount();
+  }
+
+  /** Number of segment files deleted by compaction since opening, for metrics and tests. */
+  public long segmentsCompacted() {
+    return segmentsCompacted;
+  }
+
+  /** Number of times the log was replaced wholesale since opening, for metrics and tests. */
+  public long logRewrites() {
+    return logRewrites;
   }
 
   /** Number of fsync calls made so far, for metrics. */

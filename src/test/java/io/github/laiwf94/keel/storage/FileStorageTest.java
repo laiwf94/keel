@@ -532,8 +532,12 @@ class FileStorageTest {
     assertEquals(entries(1, 1, 4), reopen(dir, SMALL).entries());
   }
 
+  static Object fileKey(Path f) throws IOException {
+    return Files.readAttributes(f, java.nio.file.attribute.BasicFileAttributes.class).fileKey();
+  }
+
   @Test
-  void snapshotsRewriteASegmentedLog() throws IOException {
+  void snapshotsDeleteWholeSegmentsWithoutRewritingTheRest() throws IOException {
     Path dir = tmp.resolve("n");
     Snapshot snap = new Snapshot(new SnapshotMeta(15, 1, CONFIG), new byte[] {4});
     try (FileStorage s = new FileStorage(dir, SMALL)) {
@@ -541,18 +545,247 @@ class FileStorageTest {
       s.append(entries(1, 20, 1));
       s.sync();
       assertEquals(10, s.segmentCount());
+      Path kept = dir.resolve("wal").resolve(SegmentedLog.name(17));
+      Object key = fileKey(kept);
+      byte[] bytes = Files.readAllBytes(kept);
+      long before = s.fsyncs();
+      // Segments 1..13 end at or below entry 15; segment 15 holds entry 16 and stays.
       s.saveSnapshot(snap, entries(16, 20, 1));
       assertEquals(3, s.segmentCount());
+      assertEquals(7, s.segmentsCompacted());
+      assertEquals(0, s.logRewrites());
+      // The snapshot file and its directory, then a directory fsync per deleted segment.
+      assertEquals(before + 2 + 7, s.fsyncs());
+      assertEquals(key, fileKey(kept));
+      assertArrayEquals(bytes, Files.readAllBytes(kept));
+      // Entry 15 is still on disk in the first segment but is compacted.
+      assertThrows(IllegalStateException.class, () -> s.append(entries(15, 15, 2)));
       s.append(entries(21, 22, 1));
       s.sync();
     }
     assertEquals(entries(16, 22, 1), reopen(dir, SMALL).entries());
-    assertEquals(SegmentedLog.name(16), segments(dir).get(0).getFileName().toString());
+    assertEquals(SegmentedLog.name(15), segments(dir).get(0).getFileName().toString());
     try (Stream<Path> files = Files.list(dir)) {
       assertEquals(
           List.of("lock", "snapshot", "wal"),
           files.map(f -> f.getFileName().toString()).sorted().toList());
     }
+    // Reopening leaves the partly compacted first segment alone.
+    try (FileStorage s = new FileStorage(dir, SMALL)) {
+      assertEquals(entries(16, 22, 1), s.load().entries());
+      assertEquals(0, s.segmentsCompacted());
+      assertEquals(0, s.logRewrites());
+      // A later snapshot past the end of segment 15 deletes it.
+      s.saveSnapshot(
+          new Snapshot(new SnapshotMeta(18, 1, CONFIG), new byte[0]), entries(19, 22, 1));
+      assertEquals(2, s.segmentsCompacted());
+      // A snapshot at the same point again changes nothing.
+      s.saveSnapshot(
+          new Snapshot(new SnapshotMeta(18, 1, CONFIG), new byte[0]), entries(19, 22, 1));
+      assertEquals(2, s.segmentsCompacted());
+      assertEquals(0, s.logRewrites());
+    }
+    assertEquals(entries(19, 22, 1), reopen(dir, SMALL).entries());
+    assertEquals(SegmentedLog.name(19), segments(dir).get(0).getFileName().toString());
+  }
+
+  @Test
+  void aSnapshotOfTheWholeLogDeletesEverySegment() throws IOException {
+    Path dir = tmp.resolve("n");
+    try (FileStorage s = new FileStorage(dir, SMALL)) {
+      s.load();
+      s.append(entries(1, 9, 1));
+      s.sync();
+      // Entry 9 is not synced when the snapshot covers it; nothing of it is needed.
+      s.append(entries(10, 10, 1));
+      s.saveSnapshot(new Snapshot(new SnapshotMeta(10, 1, CONFIG), new byte[0]), List.of());
+      assertEquals(0, s.segmentCount());
+      assertEquals(5, s.segmentsCompacted());
+      assertEquals(0, s.logRewrites());
+      assertTrue(segments(dir).isEmpty());
+      assertThrows(IllegalStateException.class, () -> s.append(entries(12, 12, 1)));
+      s.append(entries(11, 13, 2));
+      s.sync();
+    }
+    assertEquals(entries(11, 13, 2), reopen(dir, SMALL).entries());
+    assertEquals(SegmentedLog.name(11), segments(dir).get(0).getFileName().toString());
+  }
+
+  @Test
+  void aSnapshotEndingASegmentDeletesThatSegmentToo() throws IOException {
+    Path dir = tmp.resolve("n");
+    try (FileStorage s = new FileStorage(dir, SMALL)) {
+      s.load();
+      s.append(entries(1, 10, 1));
+      s.sync();
+      s.saveSnapshot(new Snapshot(new SnapshotMeta(6, 1, CONFIG), new byte[0]), entries(7, 10, 1));
+      assertEquals(3, s.segmentsCompacted());
+      assertEquals(2, s.segmentCount());
+    }
+    assertEquals(SegmentedLog.name(7), segments(dir).get(0).getFileName().toString());
+    assertEquals(entries(7, 10, 1), reopen(dir, SMALL).entries());
+  }
+
+  @Test
+  void aSuffixInsideThePartlyCompactedSegmentIsCut() throws IOException {
+    Path dir = tmp.resolve("n");
+    try (FileStorage s = new FileStorage(dir, SMALL)) {
+      s.load();
+      s.append(entries(1, 10, 1));
+      s.sync();
+      // Segment 5 holds entries 5 and 6; 5 is compacted, 6 is not.
+      s.saveSnapshot(new Snapshot(new SnapshotMeta(5, 1, CONFIG), new byte[0]), entries(6, 10, 1));
+      assertEquals(3, s.segmentCount());
+      // Replacing from entry 6 deletes the later segments and cuts segment 5 after entry 5.
+      s.append(entries(6, 6, 2));
+      assertEquals(1, s.segmentCount());
+      s.sync();
+      assertThrows(IllegalStateException.class, () -> s.append(entries(5, 5, 2)));
+    }
+    assertEquals(entries(6, 6, 2), reopen(dir, SMALL).entries());
+    try (FileStorage s = new FileStorage(dir, SMALL)) {
+      s.load();
+      s.append(entries(7, 9, 2));
+      s.sync();
+    }
+    assertEquals(entries(6, 9, 2), reopen(dir, SMALL).entries());
+  }
+
+  @Test
+  void aCompactionInterruptedByACrashIsFinishedOnOpen() throws IOException {
+    Path dir = tmp.resolve("n");
+    try (FileStorage s = new FileStorage(dir, SMALL)) {
+      s.load();
+      s.append(entries(1, 12, 1));
+      s.sync();
+    }
+    Path snapped = tmp.resolve("s");
+    try (FileStorage s = new FileStorage(snapped, SMALL)) {
+      s.load();
+      s.saveSnapshot(new Snapshot(new SnapshotMeta(9, 1, CONFIG), new byte[] {9}), List.of());
+    }
+    // The snapshot was durable and the crash came before, or between, the segment deletions.
+    for (int deletedBeforeCrash = 0; deletedBeforeCrash <= 4; deletedBeforeCrash++) {
+      Path crashed = tmp.resolve("c" + deletedBeforeCrash);
+      copyTree(dir, crashed);
+      Files.copy(snapped.resolve("snapshot"), crashed.resolve("snapshot"));
+      for (int k = 0; k < deletedBeforeCrash; k++) {
+        Files.delete(crashed.resolve("wal").resolve(SegmentedLog.name(1 + 2L * k)));
+      }
+      try (FileStorage s = new FileStorage(crashed, SMALL)) {
+        Storage.State st = s.load();
+        assertEquals(entries(10, 12, 1), st.entries());
+        assertEquals(9, st.snapshot().orElseThrow().meta().index());
+        assertEquals(4 - deletedBeforeCrash, s.segmentsCompacted());
+        assertEquals(0, s.logRewrites());
+      }
+      assertEquals(SegmentedLog.name(9), segments(crashed).get(0).getFileName().toString());
+      assertEquals(entries(10, 12, 1), reopen(crashed, SMALL).entries());
+    }
+  }
+
+  @Test
+  void aSnapshotTheLogDisagreesWithReplacesIt() throws IOException {
+    // Installed from a leader whose entry 6 has another term: the whole log goes.
+    Path dir = tmp.resolve("n");
+    try (FileStorage s = new FileStorage(dir, SMALL)) {
+      s.load();
+      s.append(entries(1, 10, 1));
+      s.sync();
+      s.saveSnapshot(new Snapshot(new SnapshotMeta(6, 2, CONFIG), new byte[0]), List.of());
+      assertEquals(1, s.logRewrites());
+      assertEquals(0, s.segmentsCompacted());
+      assertEquals(0, s.segmentCount());
+      s.append(entries(7, 7, 2));
+      s.sync();
+    }
+    assertEquals(entries(7, 7, 2), reopen(dir, SMALL).entries());
+
+    // Past the end of the log.
+    Path behind = tmp.resolve("b");
+    try (FileStorage s = new FileStorage(behind, SMALL)) {
+      s.load();
+      s.append(entries(1, 4, 1));
+      s.saveSnapshot(new Snapshot(new SnapshotMeta(30, 1, CONFIG), new byte[0]), List.of());
+      assertEquals(1, s.logRewrites());
+    }
+    assertTrue(reopen(behind, SMALL).entries().isEmpty());
+
+    // Remaining entries that do not match the log on disk, in length or at either end.
+    Entry other7 = new Entry(7, 1, EntryType.COMMAND, new byte[] {7});
+    Entry other10 = new Entry(10, 1, EntryType.COMMAND, new byte[] {10});
+    List<List<Entry>> wrong =
+        List.of(
+            entries(7, 9, 1),
+            entries(7, 11, 1),
+            List.of(other7, e(8, 1), e(9, 1), e(10, 1)),
+            List.of(e(7, 1), e(8, 1), e(9, 1), other10),
+            List.of(e(7, 1), e(8, 1), e(9, 1), e(10, 2)));
+    for (int i = 0; i < wrong.size(); i++) {
+      Path d = tmp.resolve("w" + i);
+      List<Entry> remaining = wrong.get(i);
+      try (FileStorage s = new FileStorage(d, SMALL)) {
+        s.load();
+        s.append(entries(1, 10, 1));
+        s.sync();
+        s.saveSnapshot(new Snapshot(new SnapshotMeta(6, 1, CONFIG), new byte[0]), remaining);
+        assertEquals(1, s.logRewrites(), "case " + i);
+      }
+      assertEquals(remaining, reopen(d, SMALL).entries(), "case " + i);
+    }
+  }
+
+  @Test
+  void anEntryThatNoLongerReadsBackStopsCompaction() throws IOException {
+    Path dir = tmp.resolve("n");
+    try (FileStorage s = new FileStorage(dir, SMALL)) {
+      s.load();
+      s.append(entries(1, 10, 1));
+      s.sync();
+      // Damage the record of entry 6, the snapshot's last entry, at the start of segment 5.
+      flip(dir.resolve("wal").resolve(SegmentedLog.name(5)), SegmentedLog.SEGMENT_HEADER + 50);
+      Snapshot snap = new Snapshot(new SnapshotMeta(6, 1, CONFIG), new byte[0]);
+      assertThrows(StorageException.class, () -> s.saveSnapshot(snap, entries(7, 10, 1)));
+    }
+  }
+
+  @Test
+  void anEmptySegmentAfterASnapshotOpens() throws IOException {
+    // A crash right after entry 11 started a segment, before its record was synced.
+    Path dir = tmp.resolve("n");
+    try (FileStorage s = new FileStorage(dir, SMALL)) {
+      s.load();
+      s.append(entries(1, 10, 1));
+      s.saveSnapshot(new Snapshot(new SnapshotMeta(10, 1, CONFIG), new byte[0]), List.of());
+      s.append(entries(11, 11, 1));
+      s.sync();
+    }
+    Path seg = dir.resolve("wal").resolve(SegmentedLog.name(11));
+    try (var ch = java.nio.channels.FileChannel.open(seg, StandardOpenOption.WRITE)) {
+      ch.truncate(SegmentedLog.SEGMENT_HEADER);
+    }
+    try (FileStorage s = new FileStorage(dir, SMALL)) {
+      assertTrue(s.load().entries().isEmpty());
+      assertEquals(0, s.logRewrites());
+      s.append(entries(11, 12, 2));
+      s.sync();
+    }
+    assertEquals(entries(11, 12, 2), reopen(dir, SMALL).entries());
+
+    // The same with an empty segment the snapshot does not lead into: the log is replaced.
+    writeSegment(dir.resolve("wal").resolve(SegmentedLog.name(11)), 11, List.of());
+    try (FileStorage s = new FileStorage(dir, SMALL)) {
+      s.load();
+      s.saveSnapshot(new Snapshot(new SnapshotMeta(20, 3, CONFIG), new byte[0]), List.of());
+    }
+    writeSegment(dir.resolve("wal").resolve(SegmentedLog.name(5)), 5, List.of());
+    try (FileStorage s = new FileStorage(dir, SMALL)) {
+      assertTrue(s.load().entries().isEmpty());
+      assertEquals(1, s.logRewrites());
+      s.append(entries(21, 21, 3));
+      s.sync();
+    }
+    assertEquals(entries(21, 21, 3), reopen(dir, SMALL).entries());
   }
 
   @Test

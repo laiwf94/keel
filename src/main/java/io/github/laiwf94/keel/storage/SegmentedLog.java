@@ -36,8 +36,14 @@ import java.util.zip.CRC32C;
  * last segment, with no valid record after it, is a torn tail and is cut; one anywhere else, or one
  * followed by a valid record, is damage to data the node may have acknowledged, and opening fails.
  *
+ * <p>Compaction deletes the segments that hold only entries at or below the snapshot index, from
+ * the first one forward, with a directory fsync after each deletion, so a crash leaves a suffix of
+ * the segments without a gap. Live data is never rewritten. The first segment left may still begin
+ * with compacted entries; they stay on disk until the whole segment is below a later snapshot, and
+ * {@link #firstIndex()} reports the first entry after the snapshot, not the first on disk.
+ *
  * <p>Memory is one {@code int} per entry, the byte offset of its record within its segment, which
- * is what truncating a conflicting suffix needs.
+ * is what truncating a conflicting suffix and reading one entry back need.
  *
  * <p>Not thread-safe; the storage owner serializes calls.
  */
@@ -87,6 +93,10 @@ final class SegmentedLog implements AutoCloseable {
 
   private boolean dirty;
   private long nextIndex = 1;
+
+  /** First entry not covered by a snapshot; entries below it in the first segment are dead. */
+  private long floor;
+
   private long fsyncs;
   private long tornBytesDropped;
 
@@ -396,9 +406,12 @@ final class SegmentedLog implements AutoCloseable {
     return dir.resolve(name(first));
   }
 
-  /** Index of the first entry held, or of the next to append if the log is empty. */
+  /**
+   * Index of the first entry held after the last compaction, or of the next to append if the log is
+   * empty.
+   */
   long firstIndex() {
-    return segments.isEmpty() ? nextIndex : segments.get(0).firstIndex;
+    return segments.isEmpty() ? nextIndex : Math.max(segments.get(0).firstIndex, floor);
   }
 
   /** Index the next appended entry must carry, unless it replaces a suffix. */
@@ -456,6 +469,78 @@ final class SegmentedLog implements AutoCloseable {
       nextIndex++;
       dirty = true;
     }
+  }
+
+  /**
+   * Reads entry {@code index} back from disk, or empty if the log does not hold it. Unsynced
+   * entries are read from the page cache. A record that no longer reads back as the entry the index
+   * says it is means the file changed under the node, and this throws.
+   */
+  Optional<Entry> read(long index) throws IOException {
+    if (index < firstIndex() || index >= nextIndex) {
+      return Optional.empty();
+    }
+    int k = segmentFor(index);
+    Segment s = segments.get(k);
+    long pos = s.offsets[(int) (index - s.firstIndex)];
+    Optional<Entry> e;
+    if (k == segments.size() - 1 && active != null) {
+      e = readRecord(active, pos, s.size);
+    } else {
+      try (FileChannel ch = FileChannel.open(path(s.firstIndex), StandardOpenOption.READ)) {
+        e = readRecord(ch, pos, s.size);
+      }
+    }
+    if (e.isEmpty() || e.get().index() != index) {
+      throw new StorageException(
+          "entry " + index + " no longer reads back from " + path(s.firstIndex) + " at " + pos);
+    }
+    return e;
+  }
+
+  /** Position in {@link #segments} of the segment holding {@code index}, which the log holds. */
+  private int segmentFor(long index) {
+    int lo = 0;
+    int hi = segments.size() - 1;
+    while (lo < hi) {
+      int mid = (lo + hi + 1) >>> 1;
+      if (segments.get(mid).firstIndex <= index) {
+        lo = mid;
+      } else {
+        hi = mid - 1;
+      }
+    }
+    return lo;
+  }
+
+  /**
+   * Drops every entry up to and including {@code index}, which must not be past the last entry.
+   * Segments holding nothing after {@code index} are deleted from the first one forward, each
+   * deletion made durable by a directory fsync before the next, so a crash leaves the segments
+   * after some point and never a gap. Returns the number of segments deleted.
+   */
+  int compactTo(long index) throws IOException {
+    if (index >= nextIndex) {
+      throw new IllegalStateException(
+          "cannot compact to " + index + " past the last entry " + (nextIndex - 1));
+    }
+    int deleted = 0;
+    while (!segments.isEmpty() && segments.get(0).lastIndex() <= index) {
+      Segment s = segments.get(0);
+      if (segments.size() == 1 && active != null) {
+        // Nothing in it survives, so unsynced records in it need no force.
+        dirty = false;
+        active.close();
+        active = null;
+      }
+      Files.delete(path(s.firstIndex));
+      syncDirectory(dir);
+      fsyncs++;
+      segments.remove(0);
+      deleted++;
+    }
+    floor = Math.max(floor, index + 1);
+    return deleted;
   }
 
   /** Makes the active segment durable and starts a new one whose first entry is {@code first}. */
