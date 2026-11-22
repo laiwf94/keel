@@ -527,4 +527,42 @@ class ElectionTest {
             () -> leader.addServer(new Member("n9", "n9:1", "n9:2", true)));
     assertTrue(e.getMessage().contains("transfer"));
   }
+
+  /**
+   * A follower that is not a voter in its own configuration, such as one whose log still shows it
+   * removed while the other members list it again, must stop counting a silent leader as alive
+   * after an election timeout, or it ignores the votes that member needs (#83).
+   */
+  @Test
+  void nonVoterStopsVouchingForASilentLeader() {
+    Configuration others =
+        new Configuration(
+            List.of(
+                new Member("n2", "n2:7000", "n2:8080", true),
+                new Member("n3", "n3:7000", "n3:8080", true)));
+    RaftOptions o = RaftOptions.DEFAULTS;
+    RaftNode n = new RaftNode("n1", others, o, new MemStorage(), new Random(5));
+    n.step(new AppendRequest("n2", "n1", 1, 0, 0, List.of(), 0, 0));
+    n.ready();
+    for (int t = 1; t <= 6 * o.electionTicks(); t++) {
+      n.tick();
+      n.step(new VoteRequest("n3", "n1", 2, 0, 0, true));
+      List<Message> out = n.ready().messages();
+      if (t < o.electionTicks()) {
+        assertTrue(out.isEmpty(), "answered a pre-vote while the leader is fresh, tick " + t);
+      } else {
+        assertEquals(1, out.size(), "ignored a pre-vote after the leader went silent, tick " + t);
+        assertTrue(((VoteResponse) out.get(0)).granted());
+      }
+      assertEquals(RaftNode.Role.FOLLOWER, n.role());
+    }
+    // A real vote for a higher term is taken too, and hearing from a leader again restores the
+    // lease.
+    n.step(new VoteRequest("n3", "n1", 2, 0, 0, false));
+    assertEquals(2, n.term());
+    n.step(new AppendRequest("n3", "n1", 2, 0, 0, List.of(), 0, 0));
+    n.ready();
+    n.step(new VoteRequest("n2", "n1", 3, 0, 0, true));
+    assertTrue(n.ready().messages().isEmpty());
+  }
 }

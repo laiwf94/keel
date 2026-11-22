@@ -197,7 +197,11 @@ public final class RaftNode {
       if (config().isVoter(id)) {
         campaign(true);
       } else {
-        resetElectionTimer();
+        // A non-voter never campaigns, but it has not heard from a leader for a whole timeout:
+        // keep the timer expired so inLease() stops vouching for that leader and the node answers
+        // votes from the members that need it. Resetting the timer here revived the lease for
+        // electionTicks out of every timeout, so the node ignored almost every vote (#83).
+        electionElapsed = randomizedElectionTicks;
       }
     }
   }
