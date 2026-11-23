@@ -19,6 +19,7 @@ import io.github.laiwf94.keel.raft.Message;
 import io.github.laiwf94.keel.raft.RaftNode;
 import io.github.laiwf94.keel.raft.RaftOptions;
 import io.github.laiwf94.keel.raft.Snapshot;
+import io.github.laiwf94.keel.raft.SnapshotSink;
 import io.github.laiwf94.keel.raft.Storage;
 import io.github.laiwf94.keel.replica.Outcome;
 import java.io.ByteArrayOutputStream;
@@ -191,6 +192,11 @@ class NodeLoopTest {
           }
 
           @Override
+          public SnapshotSink beginSnapshot() {
+            return inner.beginSnapshot();
+          }
+
+          @Override
           public void saveSnapshot(Snapshot snapshot, List<Entry> remaining) {
             inner.saveSnapshot(snapshot, remaining);
           }
@@ -233,6 +239,11 @@ class NodeLoopTest {
     public void append(List<Entry> entries) {
       dirty |= !entries.isEmpty();
       inner.append(entries);
+    }
+
+    @Override
+    public SnapshotSink beginSnapshot() {
+      return inner.beginSnapshot();
     }
 
     @Override

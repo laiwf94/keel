@@ -1,6 +1,9 @@
 package io.github.laiwf94.keel.sim;
 
 import io.github.laiwf94.keel.replica.StateMachine;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -17,14 +20,14 @@ final class ListMachine implements StateMachine {
   }
 
   @Override
-  public byte[] snapshot() {
-    return String.join("\n", applied).getBytes(StandardCharsets.UTF_8);
+  public void snapshot(OutputStream out) throws IOException {
+    out.write(String.join("\n", applied).getBytes(StandardCharsets.UTF_8));
   }
 
   @Override
-  public void restore(byte[] snapshot) {
+  public void restore(InputStream in) throws IOException {
+    String s = new String(in.readAllBytes(), StandardCharsets.UTF_8);
     applied.clear();
-    String s = new String(snapshot, StandardCharsets.UTF_8);
     if (!s.isEmpty()) {
       applied.addAll(Arrays.asList(s.split("\n", -1)));
     }

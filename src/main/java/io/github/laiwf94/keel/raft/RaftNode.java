@@ -10,7 +10,6 @@ import io.github.laiwf94.keel.raft.Message.VoteRequest;
 import io.github.laiwf94.keel.raft.Message.VoteResponse;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -134,42 +133,38 @@ public final class RaftNode {
 
   /**
    * A snapshot this follower is receiving in chunks: who sends it, in which term, and the bytes
-   * received so far, which always form a prefix of the snapshot.
+   * received so far, which always form a prefix of the snapshot. The bytes go straight to a sink
+   * from {@link Storage#beginSnapshot}, so file storage holds them in a temporary file and a
+   * snapshot of any size is received with one chunk in memory.
    */
   private static final class Inbound {
     final String leader;
     final long term;
     final SnapshotMeta meta;
-    byte[] buf = new byte[0];
-    int size;
+    final SnapshotSink sink;
 
-    Inbound(String leader, long term, SnapshotMeta meta) {
+    Inbound(String leader, long term, SnapshotMeta meta, SnapshotSink sink) {
       this.leader = leader;
       this.term = term;
       this.meta = meta;
+      this.sink = sink;
+    }
+
+    long size() {
+      return sink.size();
     }
 
     boolean carries(SnapshotRequest sr) {
       return sr.from().equals(leader) && sr.term() == term && sr.meta().equals(meta);
     }
 
-    /** Appends the part of {@code sr} past the bytes held; false if the snapshot gets too big. */
-    boolean append(SnapshotRequest sr) {
-      int skip = (int) (size - sr.offset());
+    /** Appends the part of {@code sr} past the bytes held. */
+    void append(SnapshotRequest sr) {
+      int skip = (int) (sink.size() - sr.offset());
       int add = sr.data().length - skip;
-      if (add <= 0) {
-        return true;
+      if (add > 0) {
+        sink.write(sr.data(), skip, add);
       }
-      if (add > Codec.MAX_SNAPSHOT_BYTES - size) {
-        return false;
-      }
-      if (size + add > buf.length) {
-        int cap = (int) Math.min(Codec.MAX_SNAPSHOT_BYTES, Math.max(size + add, 2L * buf.length));
-        buf = Arrays.copyOf(buf, cap);
-      }
-      System.arraycopy(sr.data(), skip, buf, size, add);
-      size += add;
-      return true;
     }
   }
 
@@ -431,9 +426,37 @@ public final class RaftNode {
     if (index <= log.snapshot().index()) {
       return;
     }
-    SnapshotMeta meta = log.compactTo(index);
-    latestSnapshot = new Snapshot(meta, data);
-    storage.saveSnapshot(latestSnapshot, log.entries());
+    SnapshotSink sink = storage.beginSnapshot();
+    sink.write(data, 0, data.length);
+    compact(index, sink);
+  }
+
+  /**
+   * Replaces the log up to {@code index} with the snapshot whose state machine bytes were written
+   * to {@code sink}, a sink from this node's {@link Storage#beginSnapshot}. The driver calls this
+   * after applying {@code index}. If the log is already compacted to {@code index} or past it, the
+   * sink is aborted and nothing changes.
+   */
+  public void compact(long index, SnapshotSink sink) {
+    if (index > handedOut) {
+      sink.abort();
+      throw new IllegalArgumentException(
+          "cannot snapshot at " + index + " before applying it (applied " + handedOut + ")");
+    }
+    if (index <= log.snapshot().index()) {
+      sink.abort();
+      return;
+    }
+    Snapshot snapshot;
+    try {
+      snapshot = sink.finish(log.metaAt(index));
+    } catch (RuntimeException e) {
+      sink.abort();
+      throw e;
+    }
+    log.compactTo(index);
+    storage.saveSnapshot(snapshot, log.entries());
+    latestSnapshot = snapshot;
   }
 
   /** Handles one message from another node. Messages addressed elsewhere are ignored. */
@@ -601,7 +624,7 @@ public final class RaftNode {
       role = Role.PRE_CANDIDATE;
     } else {
       term++;
-      inbound = null;
+      dropInbound();
       votedFor = id;
       persistHardState();
       role = Role.CANDIDATE;
@@ -786,7 +809,16 @@ public final class RaftNode {
     if (log.latestConfigIndex() <= commitIndex) {
       // The latest configuration is committed: stop replicating to servers it removed, and if
       // it removed this leader, step down (thesis section 4.2.2).
-      progress.keySet().removeIf(peer -> !config().contains(peer));
+      progress
+          .entrySet()
+          .removeIf(
+              e -> {
+                if (config().contains(e.getKey())) {
+                  return false;
+                }
+                endTransfer(e.getValue());
+                return true;
+              });
       if (!transferee.isEmpty() && !config().isVoter(transferee)) {
         abortTransfer();
       }
@@ -938,6 +970,8 @@ public final class RaftNode {
   private void sendSnapshot(String peer) {
     Progress pr = progress.get(peer);
     pr.state = Progress.State.SNAPSHOT;
+    latestSnapshot.data().retain();
+    endTransfer(pr);
     pr.snapshot = latestSnapshot;
     pr.snapshotAcked = 0;
     pr.snapshotSent = 0;
@@ -953,13 +987,14 @@ public final class RaftNode {
    */
   private void sendSnapshotChunks(String peer) {
     Progress pr = progress.get(peer);
-    byte[] data = pr.snapshot.data();
+    SnapshotData data = pr.snapshot.data();
+    long size = data.size();
     long window = (long) opts.snapshotChunkBytes() * opts.maxInflightSnapshotChunks();
     while (!pr.snapshotDoneSent && pr.snapshotSent - pr.snapshotAcked < window) {
-      int from = (int) pr.snapshotSent;
-      int to = (int) Math.min(data.length, pr.snapshotSent + opts.snapshotChunkBytes());
-      boolean done = to == data.length;
-      byte[] chunk = Arrays.copyOfRange(data, from, to);
+      long from = pr.snapshotSent;
+      long to = Math.min(size, from + opts.snapshotChunkBytes());
+      boolean done = to == size;
+      byte[] chunk = data.read(from, (int) (to - from));
       send(SnapshotRequest.of(id, peer, term, pr.snapshot.meta(), from, chunk, done, seq));
       pr.snapshotSent = to;
       pr.snapshotDoneSent = done;
@@ -983,7 +1018,7 @@ public final class RaftNode {
     if (meta.index() <= commitIndex) {
       // Already covered: a duplicate of an installed snapshot, or one this node no longer needs.
       if (inbound != null && inbound.meta.index() <= commitIndex) {
-        inbound = null;
+        dropInbound();
       }
       send(SnapshotResponse.installed(id, sr.from(), term, meta.index(), commitIndex, sr.seq()));
       return;
@@ -994,26 +1029,24 @@ public final class RaftNode {
         send(snapshotReply(sr, SnapshotResult.REJECTED, 0));
         return;
       }
-      inbound = new Inbound(sr.from(), sr.term(), meta);
+      dropInbound();
+      inbound = new Inbound(sr.from(), sr.term(), meta, storage.beginSnapshot());
     }
-    if (sr.offset() > inbound.size || !sr.intact()) {
-      send(snapshotReply(sr, SnapshotResult.REJECTED, inbound.size));
+    if (sr.offset() > inbound.size() || !sr.intact()) {
+      send(snapshotReply(sr, SnapshotResult.REJECTED, inbound.size()));
       return;
     }
-    if (!inbound.append(sr)) {
-      // Larger than this node can hold in memory. Retrying cannot help, so the transfer stops
-      // here and the leader's retries go unanswered.
-      inbound = null;
+    inbound.append(sr);
+    if (!sr.done() || sr.end() != inbound.size()) {
+      send(snapshotReply(sr, SnapshotResult.ACCEPTED, inbound.size()));
       return;
     }
-    if (!sr.done() || sr.end() != inbound.size) {
-      send(snapshotReply(sr, SnapshotResult.ACCEPTED, inbound.size));
-      return;
+    Snapshot snapshot;
+    try {
+      snapshot = inbound.sink.finish(meta);
+    } finally {
+      dropInbound();
     }
-    byte[] data =
-        inbound.size == inbound.buf.length ? inbound.buf : Arrays.copyOf(inbound.buf, inbound.size);
-    Snapshot snapshot = new Snapshot(meta, data);
-    inbound = null;
     log.installSnapshot(meta);
     storage.saveSnapshot(snapshot, log.entries());
     latestSnapshot = snapshot;
@@ -1046,7 +1079,7 @@ public final class RaftNode {
     pr.match = Math.max(pr.match, sr.matchIndex());
     pr.next = pr.match + 1;
     pr.state = Progress.State.PROBE;
-    pr.snapshot = null;
+    endTransfer(pr);
     pr.paused = false;
     maybeCommit();
     maybePromote();
@@ -1064,7 +1097,7 @@ public final class RaftNode {
    * the same offset, and going back for each would resend the window once per rejection.
    */
   private void continueSnapshot(String peer, Progress pr, SnapshotResponse sr) {
-    long size = pr.snapshot.data().length;
+    long size = pr.snapshot.data().size();
     long next = Math.min(sr.nextOffset(), size);
     if (sr.result() == SnapshotResult.ACCEPTED) {
       if (next <= pr.snapshotAcked) {
@@ -1111,16 +1144,41 @@ public final class RaftNode {
     send(new TimeoutNow(id, peer, term));
   }
 
+  /**
+   * Drops the follower's partial inbound snapshot, if any, and frees the bytes received so far. The
+   * sink is aborted even after it was finished; aborting a finished sink changes nothing.
+   */
+  private void dropInbound() {
+    if (inbound != null) {
+      inbound.sink.abort();
+      inbound = null;
+    }
+  }
+
+  /** Ends the leader's snapshot transfer to one follower and drops its hold on the snapshot. */
+  private static void endTransfer(Progress pr) {
+    if (pr.snapshot != null) {
+      pr.snapshot.data().release();
+      pr.snapshot = null;
+    }
+  }
+
+  /** Forgets every follower's progress, ending the snapshot transfers still running. */
+  private void clearProgress() {
+    progress.values().forEach(RaftNode::endTransfer);
+    progress.clear();
+  }
+
   private void becomeFollower(long newTerm, String leader) {
     if (newTerm > term) {
       term = newTerm;
-      inbound = null;
+      dropInbound();
       votedFor = NONE;
       persistHardState();
     }
     role = Role.FOLLOWER;
     leaderId = leader;
-    progress.clear();
+    clearProgress();
     broadcastPending = false;
     abortTransfer();
     clearReads();
@@ -1133,7 +1191,7 @@ public final class RaftNode {
     heartbeatElapsed = 0;
     checkQuorumElapsed = 0;
     recentlyActive.clear();
-    progress.clear();
+    clearProgress();
     abortTransfer();
     leaseRevoked = false;
     for (String peer : config().ids()) {

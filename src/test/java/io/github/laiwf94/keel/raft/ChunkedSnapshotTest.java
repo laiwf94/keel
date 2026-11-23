@@ -93,8 +93,9 @@ class ChunkedSnapshotTest {
       assertEquals(leader.log().snapshot().index(), fn.log().snapshot().index());
       assertEquals(leader.log().lastIndex(), fn.log().lastIndex());
       List<Snapshot> restored = c.restored.get(f);
-      assertArrayEquals(data, restored.get(restored.size() - 1).data());
-      assertArrayEquals(data, c.storages.get(f).load().snapshot().orElseThrow().data());
+      assertArrayEquals(data, restored.get(restored.size() - 1).data().toByteArray());
+      assertArrayEquals(
+          data, c.storages.get(f).load().snapshot().orElseThrow().data().toByteArray());
       assertEquals(RaftNode.Role.LEADER, leader.role());
     }
   }
@@ -291,10 +292,10 @@ class ChunkedSnapshotTest {
     assertTrue(partial.snapshot().isEmpty());
     // The last chunk installs the whole snapshot.
     Ready r = assertReply(n, chunk("n2", 1, a, data, 10, 11), SnapshotResult.INSTALLED, 5, 0);
-    assertArrayEquals(data, r.snapshot().orElseThrow().data());
+    assertArrayEquals(data, r.snapshot().orElseThrow().data().toByteArray());
     assertEquals(5, n.commitIndex());
     storage.sync();
-    assertArrayEquals(data, storage.load().snapshot().orElseThrow().data());
+    assertArrayEquals(data, storage.load().snapshot().orElseThrow().data().toByteArray());
     // Any chunk of a snapshot the node already covers is answered as installed.
     SnapshotResponse again = only(n, chunk("n2", 1, a, data, 4, 8));
     assertEquals(SnapshotResult.INSTALLED, again.result());
@@ -326,7 +327,7 @@ class ChunkedSnapshotTest {
     Ready r =
         assertReply(
             restarted, chunk("n3", 2, c, new byte[0], 0, 0), SnapshotResult.INSTALLED, 9, 0);
-    assertArrayEquals(new byte[0], r.snapshot().orElseThrow().data());
+    assertArrayEquals(new byte[0], r.snapshot().orElseThrow().data().toByteArray());
     assertEquals(9, restarted.commitIndex());
   }
 

@@ -135,7 +135,7 @@ class ModelTest {
         new Snapshot(new SnapshotMeta(5, 2, Configuration.EMPTY), new byte[] {9}).hashCode());
     assertNotEquals(s, new Snapshot(new SnapshotMeta(5, 2, Configuration.EMPTY), new byte[0]));
     assertNotEquals(s, (Object) "x");
-    assertEquals(1, s.data().length);
+    assertEquals(1, s.data().size());
     assertTrue(s.toString().contains("5@2"));
   }
 

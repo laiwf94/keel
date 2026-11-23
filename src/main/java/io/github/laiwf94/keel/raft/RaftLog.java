@@ -184,6 +184,21 @@ public final class RaftLog {
     return term > lastTerm() || (term == lastTerm() && index >= lastIndex());
   }
 
+  /**
+   * The snapshot metadata for a snapshot at {@code index}, which must be the snapshot index or an
+   * entry in the log, without compacting anything.
+   */
+  public SnapshotMeta metaAt(long index) {
+    if (index == snapshot.index()) {
+      return snapshot;
+    }
+    if (index < snapshot.index() || index > lastIndex()) {
+      throw new IllegalArgumentException(
+          "no entry at " + index + " in [" + snapshot.index() + ", " + lastIndex() + "]");
+    }
+    return new SnapshotMeta(index, termAt(index), configAt(index));
+  }
+
   /** Drops entries up to and including {@code index}, which a local snapshot now covers. */
   public SnapshotMeta compactTo(long index) {
     if (index <= snapshot.index()) {
@@ -192,7 +207,7 @@ public final class RaftLog {
     if (index > lastIndex()) {
       throw new IllegalArgumentException("cannot compact past last index " + lastIndex());
     }
-    SnapshotMeta next = new SnapshotMeta(index, termAt(index), configAt(index));
+    SnapshotMeta next = metaAt(index);
     entries.subList(0, (int) (index - snapshot.index())).clear();
     configs.headMap(index, true).clear();
     snapshot = next;

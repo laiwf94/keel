@@ -147,6 +147,20 @@ class RaftLogTest {
   }
 
   @Test
+  void metaAtDescribesASnapshotWithoutCompacting() {
+    RaftLog l = log(1, 1, 2);
+    assertSame(l.snapshot(), l.metaAt(0));
+    SnapshotMeta m = l.metaAt(3);
+    assertEquals(3, m.index());
+    assertEquals(2, m.term());
+    assertEquals(3, l.entries().size());
+    assertThrows(IllegalArgumentException.class, () -> l.metaAt(4));
+    l.compactTo(2);
+    assertThrows(IllegalArgumentException.class, () -> l.metaAt(1));
+    assertSame(l.snapshot(), l.metaAt(2));
+  }
+
+  @Test
   void installSnapshotKeepsMatchingSuffixOrDiscardsAll() {
     RaftLog l = log(1, 1, 2, 2);
     l.installSnapshot(new SnapshotMeta(2, 1, C0));

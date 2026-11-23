@@ -1,5 +1,7 @@
 package io.github.laiwf94.keel.codec;
 
+import java.io.IOException;
+import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
 
@@ -74,5 +76,11 @@ public final class ByteWriter {
 
   public byte[] toByteArray() {
     return Arrays.copyOf(buf, size);
+  }
+
+  /** Writes the bytes so far to {@code out} and empties the buffer, keeping its capacity. */
+  public void drainTo(OutputStream out) throws IOException {
+    out.write(buf, 0, size);
+    size = 0;
   }
 }

@@ -11,6 +11,7 @@ import io.github.laiwf94.keel.raft.RaftNode;
 import io.github.laiwf94.keel.raft.RaftOptions;
 import io.github.laiwf94.keel.raft.ReadMode;
 import io.github.laiwf94.keel.raft.Snapshot;
+import io.github.laiwf94.keel.raft.SnapshotSink;
 import io.github.laiwf94.keel.raft.Storage;
 import io.github.laiwf94.keel.replica.Outcome;
 import io.github.laiwf94.keel.replica.ReadOutcome;
@@ -672,6 +673,11 @@ final class Simulation {
       @Override
       public void append(List<Entry> entries) {
         m.append(entries);
+      }
+
+      @Override
+      public SnapshotSink beginSnapshot() {
+        return m.beginSnapshot();
       }
 
       @Override

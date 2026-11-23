@@ -10,6 +10,9 @@ import io.github.laiwf94.keel.raft.Member;
 import io.github.laiwf94.keel.raft.Message;
 import io.github.laiwf94.keel.raft.RaftNode;
 import io.github.laiwf94.keel.raft.RaftOptions;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
@@ -27,12 +30,13 @@ class ReplicaTest {
     }
 
     @Override
-    public byte[] snapshot() {
-      return new byte[0];
-    }
+    public void snapshot(OutputStream out) {}
 
     @Override
-    public void restore(byte[] snapshot) {
+    public void restore(InputStream in) throws IOException {
+      if (in.read() >= 0) {
+        throw new IOException("Echo snapshots are empty");
+      }
       seen.clear();
     }
   }

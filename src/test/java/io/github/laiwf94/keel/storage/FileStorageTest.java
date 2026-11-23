@@ -49,9 +49,20 @@ class FileStorageTest {
     return out;
   }
 
+  /**
+   * The state with its snapshot copied into memory, since a stored snapshot's data reads from the
+   * open file and cannot be read once its storage is closed.
+   */
+  static Storage.State detached(Storage.State st) {
+    return new Storage.State(
+        st.hardState(),
+        st.snapshot().map(x -> new Snapshot(x.meta(), x.data().toByteArray())),
+        st.entries());
+  }
+
   static Storage.State reopen(Path dir) {
     try (FileStorage s = new FileStorage(dir)) {
-      return s.load();
+      return detached(s.load());
     }
   }
 
@@ -181,7 +192,7 @@ class FileStorageTest {
 
   static Storage.State reopen(Path dir, long segmentBytes) {
     try (FileStorage s = new FileStorage(dir, segmentBytes)) {
-      return s.load();
+      return detached(s.load());
     }
   }
 
@@ -995,7 +1006,8 @@ class FileStorageTest {
       assertEquals(term, node.term());
       assertEquals(last, node.log().lastIndex());
       assertEquals(3, node.log().snapshot().index());
-      assertArrayEquals(new byte[] {42}, node.ready().snapshot().orElseThrow().data());
+      assertArrayEquals(
+          new byte[] {42}, node.ready().snapshot().orElseThrow().data().toByteArray());
     }
   }
 }

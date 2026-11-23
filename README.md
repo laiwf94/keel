@@ -171,7 +171,7 @@ A write is acknowledged only after it is on disk on the leader and on at least o
 
 ## What it does not do
 
-All data lives in memory and is snapshotted to disk, so the data set is bounded by the heap. Snapshots are sent in chunks, but each end holds the whole snapshot in memory, which caps it at 256 MiB. Only the leader serves linearizable and lease reads. Each session allows one outstanding request. Peer traffic is authenticated with HMAC-SHA256 but not encrypted, so run it on a private network. Lease reads assume clock rates differ by less than 25% between nodes; ReadIndex, the default, assumes nothing about clocks. Every founding node must start with the same member list, and a node that loses its disk must rejoin under a new id.
+All data lives in memory and is snapshotted to disk, so the data set is bounded by the heap. Snapshots are streamed to and from disk and sent in chunks, so they need no memory beyond a few MiB of buffers and have no size limit of their own. Only the leader serves linearizable and lease reads. Each session allows one outstanding request. Peer traffic is authenticated with HMAC-SHA256 but not encrypted, so run it on a private network. Lease reads assume clock rates differ by less than 25% between nodes; ReadIndex, the default, assumes nothing about clocks. Every founding node must start with the same member list, and a node that loses its disk must rejoin under a new id.
 
 docs/DESIGN.md explains the design, the reasons behind it, the failure modes and the trade-offs in detail.
 

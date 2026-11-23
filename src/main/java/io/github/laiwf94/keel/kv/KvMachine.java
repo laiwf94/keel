@@ -1,9 +1,12 @@
 package io.github.laiwf94.keel.kv;
 
-import io.github.laiwf94.keel.codec.ByteReader;
 import io.github.laiwf94.keel.codec.ByteWriter;
 import io.github.laiwf94.keel.codec.CodecException;
+import io.github.laiwf94.keel.codec.StreamReader;
 import io.github.laiwf94.keel.replica.StateMachine;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.Map;
@@ -54,6 +57,7 @@ public final class KvMachine implements StateMachine {
   }
 
   private static final int MAX_SNAPSHOT_KEYS = 50_000_000;
+  private static final int FLUSH = 64 << 10;
 
   private final long sessionTimeoutMs;
   private final int maxSessions;
@@ -153,13 +157,20 @@ public final class KvMachine implements StateMachine {
     return sessions.size();
   }
 
+  /**
+   * Writes the state as a stream: the clock, the keys in order, then the sessions. Records are
+   * buffered and flushed every 64 KiB, so the serialized state is never held in memory at once.
+   */
   @Override
-  public byte[] snapshot() {
-    ByteWriter w = new ByteWriter(1024);
+  public void snapshot(OutputStream out) throws IOException {
+    ByteWriter w = new ByteWriter(FLUSH + 1024);
     w.writeLong(clock);
     w.writeInt(data.size());
     for (Map.Entry<String, Value> e : data.entrySet()) {
       w.writeString(e.getKey()).writeBytes(e.getValue().bytes()).writeLong(e.getValue().version());
+      if (w.size() >= FLUSH) {
+        w.drainTo(out);
+      }
     }
     w.writeInt(sessions.size());
     for (Map.Entry<Long, Session> e : sessions.entrySet()) {
@@ -169,13 +180,21 @@ public final class KvMachine implements StateMachine {
       if (s.lastResult != null) {
         s.lastResult.writeTo(w);
       }
+      if (w.size() >= FLUSH) {
+        w.drainTo(out);
+      }
     }
-    return w.toByteArray();
+    w.drainTo(out);
+    out.flush();
   }
 
+  /**
+   * Reads a snapshot from a stream into new maps and swaps them in only once the whole stream has
+   * read cleanly, so a corrupt or truncated snapshot leaves the state as it was.
+   */
   @Override
-  public void restore(byte[] snapshot) {
-    ByteReader r = new ByteReader(snapshot);
+  public void restore(InputStream in) throws IOException {
+    StreamReader r = new StreamReader(in);
     long newClock = r.readNonNegativeLong();
     TreeMap<String, Value> newData = new TreeMap<>();
     int n = r.readCount(MAX_SNAPSHOT_KEYS);

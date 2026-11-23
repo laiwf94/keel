@@ -4,6 +4,7 @@ import io.github.laiwf94.keel.obs.Metrics;
 import io.github.laiwf94.keel.raft.Entry;
 import io.github.laiwf94.keel.raft.HardState;
 import io.github.laiwf94.keel.raft.Snapshot;
+import io.github.laiwf94.keel.raft.SnapshotSink;
 import io.github.laiwf94.keel.raft.Storage;
 import java.util.List;
 
@@ -34,6 +35,11 @@ final class ObservedStorage implements Storage {
   public void append(List<Entry> entries) {
     dirty |= !entries.isEmpty();
     inner.append(entries);
+  }
+
+  @Override
+  public SnapshotSink beginSnapshot() {
+    return inner.beginSnapshot();
   }
 
   @Override

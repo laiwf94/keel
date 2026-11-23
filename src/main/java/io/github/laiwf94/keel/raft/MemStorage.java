@@ -49,6 +49,11 @@ public final class MemStorage implements Storage {
   }
 
   @Override
+  public SnapshotSink beginSnapshot() {
+    return SnapshotSink.inMemory();
+  }
+
+  @Override
   public void saveSnapshot(Snapshot s, List<Entry> remaining) {
     List<Entry> copy = List.copyOf(remaining);
     pending.add(

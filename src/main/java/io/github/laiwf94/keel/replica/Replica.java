@@ -12,7 +12,13 @@ import io.github.laiwf94.keel.raft.RaftOptions;
 import io.github.laiwf94.keel.raft.ReadMode;
 import io.github.laiwf94.keel.raft.Ready;
 import io.github.laiwf94.keel.raft.Snapshot;
+import io.github.laiwf94.keel.raft.SnapshotSink;
 import io.github.laiwf94.keel.raft.Storage;
+import java.io.BufferedOutputStream;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.io.UncheckedIOException;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
@@ -184,7 +190,7 @@ public final class Replica {
       }
     }
     if (appliedIndex - node.log().snapshot().index() >= snapshotEvery) {
-      node.compact(appliedIndex, machine.snapshot());
+      compact();
     }
     Ready.Status before = status;
     status = r.status();
@@ -202,8 +208,32 @@ public final class Replica {
     }
   }
 
+  /**
+   * Snapshots the state machine at the applied index. The machine serializes straight into a sink
+   * from storage, which for file storage is the new snapshot file, so the serialized state is never
+   * held in memory.
+   */
+  private void compact() {
+    SnapshotSink sink = storage.beginSnapshot();
+    try (OutputStream out = new BufferedOutputStream(sink.stream(), 64 << 10)) {
+      machine.snapshot(out);
+    } catch (IOException | RuntimeException e) {
+      sink.abort();
+      if (e instanceof IOException io) {
+        throw new UncheckedIOException("state machine snapshot failed: " + io.getMessage(), io);
+      }
+      throw (RuntimeException) e;
+    }
+    node.compact(appliedIndex, sink);
+  }
+
+  /** Restores the state machine from a snapshot, streamed from storage. */
   private void restore(Snapshot s) {
-    machine.restore(s.data());
+    try (InputStream in = s.data().open()) {
+      machine.restore(in);
+    } catch (IOException e) {
+      throw new UncheckedIOException("snapshot restore failed: " + e.getMessage(), e);
+    }
     appliedIndex = s.meta().index();
     // Proposals the snapshot covers were either applied by others or overwritten; we cannot
     // tell which from here.

@@ -1,5 +1,7 @@
 package io.github.laiwf94.keel.kv;
 
+import static io.github.laiwf94.keel.replica.MachineSnapshots.bytes;
+import static io.github.laiwf94.keel.replica.MachineSnapshots.restore;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -97,8 +99,8 @@ class KvMachineTest {
     apply(m, 3, Command.put(10, a, 1, "x", b("1"), -1));
     apply(m, 4, Command.put(10, 0, 0, "y", b("2"), -1));
     KvMachine copy = new KvMachine(1_000, 2);
-    copy.restore(m.snapshot());
-    assertArrayEquals(m.snapshot(), copy.snapshot());
+    restore(copy, bytes(m));
+    assertArrayEquals(bytes(m), bytes(copy));
     assertEquals("1", value(copy, "x"));
     // The retry is still deduplicated after restore.
     assertEquals(
@@ -113,8 +115,50 @@ class KvMachineTest {
     KvMachine fresh = new KvMachine(1_000, 2);
     apply(fresh, 1, Command.register(0));
     KvMachine fresh2 = new KvMachine(1_000, 2);
-    fresh2.restore(fresh.snapshot());
+    restore(fresh2, bytes(fresh));
     assertEquals(1, fresh2.sessionCount());
+  }
+
+  @Test
+  void aLargeStateStreamsInBlocksAndAFailedRestoreChangesNothing() throws Exception {
+    KvMachine m = new KvMachine(1_000, 4);
+    long client = apply(m, 1, Command.register(0)).version();
+    byte[] value = new byte[1000];
+    for (int i = 0; i < 2000; i++) {
+      apply(m, 2 + i, Command.put(5, 0, 0, "key" + i, value, -1));
+    }
+    apply(m, 3000, Command.put(6, client, 1, "last", b("v"), -1));
+    // The snapshot reaches the stream in pieces, none much larger than the 64 KiB flush size.
+    java.util.List<Integer> writes = new java.util.ArrayList<>();
+    java.io.ByteArrayOutputStream all = new java.io.ByteArrayOutputStream();
+    m.snapshot(
+        new java.io.OutputStream() {
+          @Override
+          public void write(int b) {
+            all.write(b);
+            writes.add(1);
+          }
+
+          @Override
+          public void write(byte[] b, int off, int len) {
+            all.write(b, off, len);
+            writes.add(len);
+          }
+        });
+    assertTrue(all.size() > 2_000_000);
+    assertTrue(writes.size() > 25, "writes: " + writes.size());
+    assertTrue(writes.stream().allMatch(n -> n < (64 << 10) + 2048), writes.toString());
+    assertArrayEquals(bytes(m), all.toByteArray());
+    KvMachine copy = new KvMachine(1_000, 4);
+    restore(copy, all.toByteArray());
+    assertEquals(2001, copy.size());
+    assertArrayEquals(bytes(m), bytes(copy));
+    // A snapshot cut short, or with a byte too many, leaves the machine as it was.
+    byte[] cut = java.util.Arrays.copyOf(all.toByteArray(), all.size() - 5);
+    assertThrows(CodecException.class, () -> restore(copy, cut));
+    byte[] longer = java.util.Arrays.copyOf(all.toByteArray(), all.size() + 1);
+    assertThrows(CodecException.class, () -> restore(copy, longer));
+    assertArrayEquals(bytes(m), bytes(copy));
   }
 
   @Test
@@ -123,7 +167,7 @@ class KvMachineTest {
     assertEquals(
         new Result(Result.Status.INVALID, 0), Result.decode(m.apply(1, new byte[] {9, 9})));
     assertEquals(new Result(Result.Status.INVALID, 0), Result.decode(m.apply(1, new byte[0])));
-    assertThrows(CodecException.class, () -> m.restore(new byte[] {1, 2, 3}));
+    assertThrows(CodecException.class, () -> restore(m, new byte[] {1, 2, 3}));
     assertThrows(CodecException.class, () -> Result.decode(new byte[] {7, 0, 0, 0, 0, 0, 0, 0, 0}));
     byte[] badKey =
         new ByteWriter()
@@ -183,6 +227,6 @@ class KvMachineTest {
       byte[] cmd = c.encode();
       assertArrayEquals(x.apply(i, cmd), y.apply(i, cmd));
     }
-    assertArrayEquals(x.snapshot(), y.snapshot());
+    assertArrayEquals(bytes(x), bytes(y));
   }
 }

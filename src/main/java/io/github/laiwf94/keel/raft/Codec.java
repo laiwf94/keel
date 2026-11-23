@@ -9,8 +9,11 @@ public final class Codec {
   /** Largest entry payload accepted from disk or the network. */
   public static final int MAX_ENTRY_BYTES = 8 << 20;
 
-  /** Largest snapshot accepted from disk or the network. */
-  public static final int MAX_SNAPSHOT_BYTES = 256 << 20;
+  /**
+   * Largest snapshot in the single-record snapshot file written before snapshots were streamed.
+   * Snapshots in the current file format have no limit but the disk.
+   */
+  public static final int MAX_LEGACY_SNAPSHOT_BYTES = 256 << 20;
 
   /** Largest InstallSnapshot chunk accepted from the network. */
   public static final int MAX_SNAPSHOT_CHUNK_BYTES = 8 << 20;
@@ -33,14 +36,16 @@ public final class Codec {
     }
   }
 
-  public static void writeSnapshot(ByteWriter w, Snapshot s) {
+  /** Writes a snapshot as one value, the layout of the snapshot file before it was streamed. */
+  public static void writeLegacySnapshot(ByteWriter w, Snapshot s) {
     writeSnapshotMeta(w, s.meta());
-    w.writeBytes(s.data());
+    w.writeBytes(s.data().toByteArray());
   }
 
-  public static Snapshot readSnapshot(ByteReader r) {
+  /** Reads a snapshot written by {@link #writeLegacySnapshot}. */
+  public static Snapshot readLegacySnapshot(ByteReader r) {
     SnapshotMeta meta = readSnapshotMeta(r);
-    return new Snapshot(meta, r.readBytes(MAX_SNAPSHOT_BYTES));
+    return new Snapshot(meta, r.readBytes(MAX_LEGACY_SNAPSHOT_BYTES));
   }
 
   public static void writeSnapshotMeta(ByteWriter w, SnapshotMeta meta) {

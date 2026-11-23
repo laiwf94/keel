@@ -1,5 +1,6 @@
 package io.github.laiwf94.keel.sim;
 
+import static io.github.laiwf94.keel.replica.MachineSnapshots.bytes;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -8,6 +9,9 @@ import io.github.laiwf94.keel.kv.Command;
 import io.github.laiwf94.keel.kv.KvMachine;
 import io.github.laiwf94.keel.raft.ReadMode;
 import io.github.laiwf94.keel.replica.StateMachine;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
 import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -68,7 +72,7 @@ class KvSimulationTest {
     long applied = nodes.get(0).replica.appliedIndex();
     for (var n : nodes) {
       if (n.replica.appliedIndex() == applied) {
-        assertArrayEquals(nodes.get(0).machine.snapshot(), n.machine.snapshot());
+        assertArrayEquals(bytes(nodes.get(0).machine), bytes(n.machine));
       }
     }
   }
@@ -109,7 +113,7 @@ class KvSimulationTest {
           for (String id : members.ids()) {
             var n = sim.nodes.get(id);
             assertEquals(leader.replica.appliedIndex(), n.replica.appliedIndex(), id);
-            assertArrayEquals(leader.machine.snapshot(), n.machine.snapshot(), id);
+            assertArrayEquals(bytes(leader.machine), bytes(n.machine), id);
           }
         });
   }
@@ -163,13 +167,13 @@ class KvSimulationTest {
     }
 
     @Override
-    public byte[] snapshot() {
-      return inner.snapshot();
+    public void snapshot(OutputStream out) throws IOException {
+      inner.snapshot(out);
     }
 
     @Override
-    public void restore(byte[] snapshot) {
-      inner.restore(snapshot);
+    public void restore(InputStream in) throws IOException {
+      inner.restore(in);
     }
   }
 

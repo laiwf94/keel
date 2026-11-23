@@ -8,8 +8,10 @@ import io.github.laiwf94.keel.raft.Entry;
 import io.github.laiwf94.keel.raft.HardState;
 import io.github.laiwf94.keel.raft.Snapshot;
 import io.github.laiwf94.keel.raft.SnapshotMeta;
+import io.github.laiwf94.keel.raft.SnapshotSink;
 import io.github.laiwf94.keel.raft.Storage;
 import java.io.IOException;
+import java.io.InputStream;
 import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
 import java.nio.channels.FileLock;
@@ -20,8 +22,11 @@ import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
+import java.util.Collections;
+import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Optional;
+import java.util.Set;
 
 /**
  * Durable storage in one directory.
@@ -29,7 +34,10 @@ import java.util.Optional;
  * <ul>
  *   <li>{@code state} holds the term and vote. It is replaced atomically: write a temporary file,
  *       fsync it, rename it over the old one, fsync the directory.
- *   <li>{@code snapshot} holds the latest snapshot, replaced the same way.
+ *   <li>{@code snapshot} holds the latest snapshot in the streamed layout of {@link SnapshotFile}.
+ *       A new snapshot is written a block at a time to {@code snapshot.N.tmp}, fsynced, and renamed
+ *       over it, followed by a directory fsync, so neither writing nor installing one needs the
+ *       snapshot in memory. Temporary files left by a crash are deleted on startup.
  *   <li>{@code wal} holds the log as fixed-size segment files; see {@link SegmentedLog}. Appends
  *       are buffered by the OS until {@link #sync()}, which calls fdatasync. Truncating a
  *       conflicting suffix deletes the later segments and cuts the one holding the first entry to
@@ -45,7 +53,9 @@ import java.util.Optional;
  * acknowledged, and startup fails rather than silently dropping entries.
  *
  * <p>A directory written before the log was segmented has a single {@code log} file of the same
- * records; it is read with the same rules and moved into segments on first open.
+ * records; it is read with the same rules and moved into segments on first open. A snapshot file
+ * written before snapshots were streamed is one checksummed record; it is read and rewritten in the
+ * streamed layout on first open.
  */
 public final class FileStorage implements Storage, AutoCloseable {
   private static final int HEADER = SegmentedLog.RECORD_HEADER;
@@ -66,6 +76,9 @@ public final class FileStorage implements Storage, AutoCloseable {
   private long logRewrites;
   private long snapIndex;
   private long snapTerm;
+  private SnapshotFile.Data current;
+  private final Set<SnapshotFile.Data> staged = Collections.newSetFromMap(new IdentityHashMap<>());
+  private long tempSnapshots;
   private State loaded;
 
   /** Opens (creating if needed) the storage directory and recovers its contents. */
@@ -115,6 +128,10 @@ public final class FileStorage implements Storage, AutoCloseable {
       if (log != null) {
         log.close();
       }
+      if (current != null) {
+        current.release();
+        current = null;
+      }
       if (fl != null) {
         fl.release();
       }
@@ -128,6 +145,7 @@ public final class FileStorage implements Storage, AutoCloseable {
 
   private void recover() throws IOException {
     HardState hs = readState();
+    deleteTempSnapshots();
     Optional<Snapshot> snapshot = readSnapshot();
     snapIndex = snapshot.map(s -> s.meta().index()).orElse(0L);
     snapTerm = snapshot.map(s -> s.meta().term()).orElse(0L);
@@ -243,20 +261,42 @@ public final class FileStorage implements Storage, AutoCloseable {
     }
   }
 
+  /** Deletes temporary snapshot files a crash left behind; none of them was ever installed. */
+  private void deleteTempSnapshots() throws IOException {
+    boolean removed = false;
+    try (DirectoryStream<Path> tmps = Files.newDirectoryStream(dir, "snapshot*.tmp")) {
+      for (Path f : tmps) {
+        Files.delete(f);
+        removed = true;
+      }
+    }
+    if (removed) {
+      syncDirectory();
+      fsyncs++;
+    }
+  }
+
   private Optional<Snapshot> readSnapshot() throws IOException {
     Path p = dir.resolve("snapshot");
     if (!Files.exists(p)) {
       return Optional.empty();
     }
-    byte[] payload = readChecked(p, Codec.MAX_SNAPSHOT_BYTES + 64 * 1024);
+    if (SnapshotFile.isStreamed(p)) {
+      Snapshot s = SnapshotFile.open(p);
+      current = (SnapshotFile.Data) s.data();
+      return Optional.of(s);
+    }
+    byte[] payload = readChecked(p, Codec.MAX_LEGACY_SNAPSHOT_BYTES + 64 * 1024);
+    Snapshot legacy;
     try {
       ByteReader r = new ByteReader(payload);
-      Snapshot s = Codec.readSnapshot(r);
+      legacy = Codec.readLegacySnapshot(r);
       r.expectEnd();
-      return Optional.of(s);
     } catch (CodecException e) {
       throw new StorageException(p + " is corrupt: " + e.getMessage(), e);
     }
+    // Rewrite it in the streamed layout; the old file stays until the new one replaces it.
+    return Optional.of(install(legacy));
   }
 
   /** Reads a file written by {@link #replaceAtomically}, checking its size before reading it. */
@@ -376,12 +416,60 @@ public final class FileStorage implements Storage, AutoCloseable {
     }
   }
 
+  /**
+   * Starts a snapshot in a new temporary file. The sink writes in blocks of 256 KiB, so a snapshot
+   * of any size is written with that much memory.
+   */
+  @Override
+  public SnapshotSink beginSnapshot() {
+    Path tmp = dir.resolve("snapshot." + tempSnapshots++ + ".tmp");
+    try {
+      return new SnapshotFile.Sink(tmp, () -> fsyncs++, staged::add);
+    } catch (IOException e) {
+      throw new StorageException("cannot start snapshot " + tmp + ": " + e.getMessage(), e);
+    }
+  }
+
+  /**
+   * Makes {@code snapshot} the stored snapshot and returns it as stored. A snapshot finished by one
+   * of this storage's sinks is renamed into place; any other is first copied through a new sink a
+   * block at a time. Either way the file is durable before the rename, and the directory is synced
+   * after it. Storage then holds the one reference to the new file and drops its reference to the
+   * old one, which stays readable for any transfer still holding it.
+   */
+  private Snapshot install(Snapshot snapshot) throws IOException {
+    Snapshot s = snapshot;
+    if (!(s.data() instanceof SnapshotFile.Data d && staged.remove(d))) {
+      SnapshotSink sink = beginSnapshot();
+      try (InputStream in = s.data().open()) {
+        byte[] block = new byte[64 << 10];
+        for (int n; (n = in.read(block)) >= 0; ) {
+          sink.write(block, 0, n);
+        }
+      } catch (IOException | RuntimeException e) {
+        sink.abort();
+        throw e;
+      }
+      s = sink.finish(s.meta());
+      staged.remove((SnapshotFile.Data) s.data());
+    }
+    SnapshotFile.Data data = (SnapshotFile.Data) s.data();
+    Path target = dir.resolve("snapshot");
+    Files.move(data.path(), target, StandardCopyOption.ATOMIC_MOVE);
+    data.movedTo(target);
+    syncDirectory();
+    fsyncs++;
+    if (current != null) {
+      current.release();
+    }
+    current = data;
+    return s;
+  }
+
   @Override
   public void saveSnapshot(Snapshot snapshot, List<Entry> remaining) {
     try {
-      ByteWriter w = new ByteWriter(snapshot.data().length + 256);
-      Codec.writeSnapshot(w, snapshot);
-      replaceAtomically("snapshot", w.toByteArray());
+      install(snapshot);
       // The snapshot is durable before any segment goes, so a crash in between leaves segments
       // that recovery recognises as covered by it and deletes.
       SnapshotMeta meta = snapshot.meta();
@@ -437,9 +525,18 @@ public final class FileStorage implements Storage, AutoCloseable {
     return tornBytesDropped;
   }
 
+  /** The stored snapshot's data, for tests; null if there is none. */
+  SnapshotFile.Data currentSnapshot() {
+    return current;
+  }
+
   @Override
   public void close() {
     try {
+      if (current != null) {
+        current.release();
+        current = null;
+      }
       log.close();
       lock.release();
       lockChannel.close();

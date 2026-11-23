@@ -27,7 +27,19 @@ public interface Storage {
    */
   void append(List<Entry> entries);
 
-  /** Replaces the snapshot and the log with the snapshot plus the entries that follow it. */
+  /**
+   * Starts a new snapshot. The caller writes the state machine bytes to the sink, seals them with
+   * {@link SnapshotSink#finish} and installs the result with {@link #saveSnapshot}, or throws them
+   * away with {@link SnapshotSink#abort}. Storage that keeps snapshots on disk writes the bytes
+   * straight to a file, so a snapshot never has to fit in memory.
+   */
+  SnapshotSink beginSnapshot();
+
+  /**
+   * Replaces the snapshot and the log with the snapshot plus the entries that follow it. A snapshot
+   * from this storage's own {@link #beginSnapshot} is installed without copying its bytes; any
+   * other is copied in.
+   */
   void saveSnapshot(Snapshot snapshot, List<Entry> remaining);
 
   void sync();

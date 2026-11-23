@@ -50,13 +50,13 @@ class SnapshotTest {
     c.ticks(10);
     assertEquals(1, snapshots.get());
     // The follower's Ready carried the snapshot for its state machine.
-    assertArrayEquals(new byte[] {42}, c.restored.get(f).get(0).data());
+    assertArrayEquals(new byte[] {42}, c.restored.get(f).get(0).data().toByteArray());
     RaftNode fn = c.node(f);
     assertEquals(applied, fn.log().snapshot().index());
     assertEquals(leader.log().lastIndex(), fn.log().lastIndex());
     // MemStorage holds the snapshot durably.
     Storage.State st = c.storages.get(f).load();
-    assertArrayEquals(new byte[] {42}, st.snapshot().orElseThrow().data());
+    assertArrayEquals(new byte[] {42}, st.snapshot().orElseThrow().data().toByteArray());
   }
 
   @Test
@@ -89,7 +89,7 @@ class SnapshotTest {
     c.storages.get("n1").sync();
     RaftNode restarted = new RaftNode("n1", c.config, c.opts, c.storages.get("n1"), new Random(1));
     Ready r = restarted.ready();
-    assertArrayEquals(new byte[] {7}, r.snapshot().orElseThrow().data());
+    assertArrayEquals(new byte[] {7}, r.snapshot().orElseThrow().data().toByteArray());
     assertTrue(restarted.ready().snapshot().isEmpty());
     assertEquals(n.commitIndex(), restarted.commitIndex());
   }

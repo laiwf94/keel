@@ -3,6 +3,8 @@ package io.github.laiwf94.keel.kv;
 import io.github.laiwf94.keel.codec.ByteReader;
 import io.github.laiwf94.keel.codec.ByteWriter;
 import io.github.laiwf94.keel.codec.CodecException;
+import io.github.laiwf94.keel.codec.StreamReader;
+import java.io.IOException;
 
 /**
  * The reply to a {@link Command}.
@@ -51,6 +53,11 @@ public record Result(Status status, long version) {
   }
 
   static Result readFrom(ByteReader r) {
+    Status s = Status.fromCode(r.readByte());
+    return new Result(s, r.readLong());
+  }
+
+  static Result readFrom(StreamReader r) throws IOException {
     Status s = Status.fromCode(r.readByte());
     return new Result(s, r.readLong());
   }
