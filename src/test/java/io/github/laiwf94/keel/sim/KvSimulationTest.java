@@ -219,6 +219,41 @@ class KvSimulationTest {
     assertTrue(withPowerLoss.get() >= 20, "power loss hit only " + withPowerLoss + " of 40");
   }
 
+  /**
+   * Snapshot chunk faults are on by default: across seeds, chunks are lost, held back behind later
+   * ones and corrupted, both ends of a transfer crash between two chunks, and followers whose
+   * transfer was cut still install a snapshot once they are back.
+   */
+  @Test
+  void snapshotChunkFaultsHappenInMostSeeds() {
+    AtomicInteger lost = new AtomicInteger();
+    AtomicInteger heldBack = new AtomicInteger();
+    AtomicInteger corrupted = new AtomicInteger();
+    AtomicInteger crashes = new AtomicInteger();
+    AtomicInteger resumed = new AtomicInteger();
+    LongStream.range(0, 40)
+        .parallel()
+        .forEach(
+            seed -> {
+              Simulation sim =
+                  run(seed, Simulation.Options.defaults(), () -> new KvMachine(60_000, 100)).sim();
+              count(lost, sim.chunksLost);
+              count(heldBack, sim.chunksHeldBack);
+              count(corrupted, sim.chunksCorrupted);
+              count(crashes, sim.midTransferCrashes);
+              count(resumed, sim.installsAfterMidTransferCrash);
+            });
+    System.out.printf(
+        "of 40 seeds: chunks lost %s, held back %s, corrupted %s; crashes mid-transfer %s;"
+            + " installs after a cut transfer %s%n",
+        lost, heldBack, corrupted, crashes, resumed);
+    assertTrue(lost.get() >= 30, "chunks lost in only " + lost + " of 40");
+    assertTrue(heldBack.get() >= 30, "chunks held back in only " + heldBack + " of 40");
+    assertTrue(corrupted.get() >= 20, "chunks corrupted in only " + corrupted + " of 40");
+    assertTrue(crashes.get() >= 18, "crashes mid-transfer in only " + crashes + " of 40");
+    assertTrue(resumed.get() >= 15, "installs after a cut transfer in only " + resumed + " of 40");
+  }
+
   /** One-way partitions and every kind of disk fault are on by default and turn up across seeds. */
   @Test
   void oneWayPartitionsAndDiskFaultsHappenInMostSeeds() {

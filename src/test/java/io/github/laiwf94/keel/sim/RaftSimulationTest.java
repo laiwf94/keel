@@ -4,10 +4,15 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import io.github.laiwf94.keel.raft.Configuration;
+import io.github.laiwf94.keel.raft.Message;
 import io.github.laiwf94.keel.raft.RaftNode;
+import io.github.laiwf94.keel.raft.SnapshotMeta;
 import io.github.laiwf94.keel.replica.Outcome;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.BitSet;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
@@ -229,11 +234,55 @@ class RaftSimulationTest {
     assertTrue(!sim.faultLog.isEmpty(), "the classic faults did not run");
     assertEquals(new Random(Simulation.faultSeed(42)).nextLong(), sim.faultRnd.nextLong());
     assertEquals(new Random(Simulation.transferSeed(42)).nextLong(), sim.transferRnd.nextLong());
+    assertEquals(new Random(Simulation.chunkSeed(42)).nextLong(), sim.chunkRnd.nextLong());
     assertEquals(0, sim.oneWayFaults + sim.slowSyncs + sim.fsyncFailures + sim.lateTicks);
     assertEquals(0, sim.transfersStarted + sim.gracefulShutdowns);
+    assertEquals(
+        0, sim.chunksLost + sim.chunksHeldBack + sim.chunksCorrupted + sim.midTransferCrashes);
     Result a = run(42, classic);
     assertEquals(a.trace(), run(42, classic).trace());
     assertNotEquals(a.trace(), run(42, Simulation.Options.defaults()).trace());
+  }
+
+  /**
+   * Snapshot chunk faults are faults like the others: a plan that refuses every fault leaves every
+   * chunk alone, and the same seed with only them turned off runs differently.
+   */
+  @Test
+  void snapshotChunkFaultsFollowThePlan() {
+    Simulation.Options opts = Simulation.Options.defaults();
+    Simulation[] quiet = new Simulation[1];
+    Plan.runUnder(
+        Plan.only(new BitSet(), null),
+        () -> {
+          quiet[0] = new Simulation(9, opts, ListMachine::new);
+          quiet[0].startAll();
+          quiet[0].runUntil(opts.durationMs());
+        });
+    assertEquals(
+        0,
+        quiet[0].chunksLost
+            + quiet[0].chunksHeldBack
+            + quiet[0].chunksCorrupted
+            + quiet[0].midTransferCrashes);
+    assertNotEquals(run(9, opts).trace(), run(9, opts.withSnapshotFaults(false)).trace());
+  }
+
+  /** A corrupted chunk keeps the checksum of the original, so the follower must reject it. */
+  @Test
+  void aCorruptedChunkFailsItsChecksum() {
+    var meta = new SnapshotMeta(5, 2, new Configuration(List.of(Simulation.member("n1"))));
+    var chunk =
+        Message.SnapshotRequest.of(
+            "n1", "n2", 2, meta, 64, Simulation.bytes("0123456789"), false, 7);
+    assertTrue(chunk.intact());
+    for (int bit = 0; bit < chunk.data().length * 8; bit++) {
+      var bad = Simulation.corrupt(chunk, bit);
+      assertTrue(!bad.intact(), "bit " + bit);
+      assertEquals(chunk.offset(), bad.offset());
+      assertEquals(chunk.checksum(), bad.checksum());
+      assertEquals("0123456789", new String(chunk.data(), StandardCharsets.UTF_8));
+    }
   }
 
   /**

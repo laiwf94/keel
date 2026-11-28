@@ -8,13 +8,14 @@ import java.util.List;
  * Which of a run's faults and client steps are allowed to happen.
  *
  * <p>Before the simulator injects a fault (a crash, a restart, a two-way or one-way partition, a
- * heal, a power loss, a failed fsync or a disk stall) it asks the plan, and so does a simulated
- * client before it issues an operation. Each question gets the next ordinal of its kind: {@code f0,
- * f1, ...} for faults and {@code s0, s1, ...} for steps. The plan answers from its sets of allowed
- * ordinals; a refused fault is skipped and a refused step leaves the client idle for a moment. The
- * random draws behind the decision are made either way, so a plan that allows everything replays a
- * seed exactly as it runs without a plan, and the {@link Shrinker} can take faults and steps out of
- * a failing run one set at a time.
+ * heal, a power loss, a failed fsync, a disk stall, a leadership transfer, a graceful shutdown, or
+ * a snapshot chunk lost, held back, corrupted or cut off by a crash) it asks the plan, and so does
+ * a simulated client before it issues an operation. Each question gets the next ordinal of its
+ * kind: {@code f0, f1, ...} for faults and {@code s0, s1, ...} for steps. The plan answers from its
+ * sets of allowed ordinals; a refused fault is skipped and a refused step leaves the client idle
+ * for a moment. The random draws behind the decision are made either way, so a plan that allows
+ * everything replays a seed exactly as it runs without a plan, and the {@link Shrinker} can take
+ * faults and steps out of a failing run one set at a time.
  *
  * <p>Ambient behaviour is not part of the plan: message delays, drops and duplicates, ordinary sync
  * latency, election timeouts and membership changes stay as the seed draws them.

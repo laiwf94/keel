@@ -56,13 +56,15 @@ final class Simulation {
       boolean oneWayPartitions,
       boolean diskFaults,
       boolean transfers,
+      boolean snapshotFaults,
       RaftOptions raft) {
     /**
      * Every fault on. {@code oneWayPartitions} adds a second fault schedule that cuts links in one
      * direction only; {@code diskFaults} gives every node a disk with its own latency, stall and
      * fsync-failure rates; {@code transfers} adds a third schedule of leadership transfers and
-     * graceful shutdowns, each followed by a restart. All three only act while {@code faults} is
-     * on.
+     * graceful shutdowns, each followed by a restart; {@code snapshotFaults} loses, holds back and
+     * corrupts InstallSnapshot chunks and crashes either end of a transfer between two chunks. All
+     * four only act while {@code faults} is on.
      */
     static Options defaults() {
       return new Options(
@@ -80,6 +82,7 @@ final class Simulation {
           true,
           true,
           true,
+          true,
           // Chunks far smaller than the snapshots the runs take, so every InstallSnapshot goes
           // over in several chunks, each one exposed to the drops, duplicates, delays and
           // crashes of the run.
@@ -88,10 +91,33 @@ final class Simulation {
 
     /**
      * Only the faults the simulator had before one-way partitions, disk faults, leadership
-     * transfers and graceful shutdowns.
+     * transfers, graceful shutdowns and snapshot chunk faults.
      */
     Options withClassicFaults() {
-      return withOneWayPartitions(false).withDiskFaults(false).withTransfers(false);
+      return withOneWayPartitions(false)
+          .withDiskFaults(false)
+          .withTransfers(false)
+          .withSnapshotFaults(false);
+    }
+
+    Options withSnapshotFaults(boolean on) {
+      return new Options(
+          nodes,
+          durationMs,
+          tickMs,
+          minDelayMs,
+          maxDelayMs,
+          dropRate,
+          duplicateRate,
+          faults,
+          meanFaultGapMs,
+          snapshotEvery,
+          maxDrift,
+          oneWayPartitions,
+          diskFaults,
+          transfers,
+          on,
+          raft);
     }
 
     Options withTransfers(boolean on) {
@@ -110,6 +136,7 @@ final class Simulation {
           oneWayPartitions,
           diskFaults,
           on,
+          snapshotFaults,
           raft);
     }
 
@@ -129,6 +156,7 @@ final class Simulation {
           on,
           diskFaults,
           transfers,
+          snapshotFaults,
           raft);
     }
 
@@ -148,6 +176,7 @@ final class Simulation {
           oneWayPartitions,
           on,
           transfers,
+          snapshotFaults,
           raft);
     }
 
@@ -167,6 +196,7 @@ final class Simulation {
           oneWayPartitions,
           diskFaults,
           transfers,
+          snapshotFaults,
           raft);
     }
 
@@ -186,6 +216,7 @@ final class Simulation {
           oneWayPartitions,
           diskFaults,
           transfers,
+          snapshotFaults,
           raft);
     }
 
@@ -206,6 +237,7 @@ final class Simulation {
           oneWayPartitions,
           diskFaults,
           transfers,
+          snapshotFaults,
           raft);
     }
 
@@ -226,6 +258,7 @@ final class Simulation {
           oneWayPartitions,
           diskFaults,
           transfers,
+          snapshotFaults,
           raft);
     }
 
@@ -245,6 +278,7 @@ final class Simulation {
           oneWayPartitions,
           diskFaults,
           transfers,
+          snapshotFaults,
           raft);
     }
   }
@@ -340,6 +374,12 @@ final class Simulation {
    */
   final Random transferRnd;
 
+  /**
+   * The random source for snapshot chunk faults, separate from the others for the same reason as
+   * {@link #faultRnd}: with them off, a seed replays the run it did before.
+   */
+  final Random chunkRnd;
+
   final Options opts;
 
   /** Which faults may happen; see {@link Plan}. */
@@ -373,6 +413,7 @@ final class Simulation {
     this.rnd = new Random(seed);
     this.faultRnd = new Random(faultSeed(seed));
     this.transferRnd = new Random(transferSeed(seed));
+    this.chunkRnd = new Random(chunkSeed(seed));
     this.opts = opts;
     this.machines = machines;
     List<Member> ms = new ArrayList<>();
@@ -395,6 +436,10 @@ final class Simulation {
 
   static long transferSeed(long seed) {
     return Long.rotateLeft(seed, 17) ^ 0xD1B54A32D192ED03L;
+  }
+
+  static long chunkSeed(long seed) {
+    return Long.rotateLeft(seed, 47) ^ 0x94D049BB133111EBL;
   }
 
   private DiskProfile newDisk() {
@@ -575,17 +620,158 @@ final class Simulation {
     return blocked.contains(link) || blockedOneWay.contains(link);
   }
 
-  private void send(Message m) {
+  private void send(Message message) {
+    Message m = message;
+    long heldBack = 0;
+    if (m instanceof Message.SnapshotRequest sr && chunkFaultsOn()) {
+      ChunkFault f = chunkFault(sr);
+      if (f.lost) {
+        return;
+      }
+      m = f.chunk;
+      heldBack = f.heldBackMs;
+    }
     if (linkDown(m) || rnd.nextDouble() < opts.dropRate()) {
       return;
     }
     // A message produced after a slow fsync leaves only when the fsync returns.
     SimNode sender = nodes.get(m.from());
     long hold = sender == null ? 0 : Math.max(0, sender.busyUntil - now);
-    deliverLater(m, hold);
+    deliverLater(m, hold + heldBack);
     if (rnd.nextDouble() < opts.duplicateRate()) {
       deliverLater(m, hold);
     }
+  }
+
+  /** Per chunk sent: the chance it is lost on top of the ambient drop rate. */
+  static final double CHUNK_LOSS_RATE = 0.08;
+
+  /** Per chunk sent: the chance it is held back so that later chunks overtake it. */
+  static final double CHUNK_HOLD_RATE = 0.08;
+
+  /** Per chunk sent: the chance one bit of its data flips in flight, under the same checksum. */
+  static final double CHUNK_CORRUPT_RATE = 0.03;
+
+  /** Per chunk delivered that is not the last: the chance one end of the transfer crashes. */
+  static final double MID_TRANSFER_CRASH_RATE = 0.03;
+
+  /** How long a held-back chunk waits on top of its delay: past the rest of a window. */
+  static final int MIN_CHUNK_HOLD_MS = 20;
+
+  static final int MAX_CHUNK_HOLD_MS = 120;
+
+  /** How long a node that crashed mid-transfer stays down. */
+  static final int MIN_MID_TRANSFER_DOWN_MS = 30;
+
+  static final int MAX_MID_TRANSFER_DOWN_MS = 400;
+
+  long chunksLost;
+  long chunksHeldBack;
+  long chunksCorrupted;
+  long midTransferCrashes;
+
+  /** Snapshots installed by a node after a transfer to it was cut by a crash of either end. */
+  long installsAfterMidTransferCrash;
+
+  /** Nodes a transfer to which was cut by a crash and that have not installed a snapshot since. */
+  private final Set<String> transferCutBy = new HashSet<>();
+
+  private boolean chunkFaultsOn() {
+    return opts.faults() && opts.snapshotFaults() && now < opts.durationMs();
+  }
+
+  /** What happens to one chunk in flight. */
+  private record ChunkFault(boolean lost, Message.SnapshotRequest chunk, long heldBackMs) {}
+
+  /**
+   * Draws the fate of one chunk: lost, corrupted, held back or untouched. The draws are the same
+   * whatever the plan answers, so refusing one chunk fault leaves the others as they were.
+   */
+  private ChunkFault chunkFault(Message.SnapshotRequest sr) {
+    double p = chunkRnd.nextDouble();
+    int bit = chunkRnd.nextInt(Math.max(1, sr.data().length * 8));
+    long holdMs =
+        MIN_CHUNK_HOLD_MS + (long) chunkRnd.nextInt(MAX_CHUNK_HOLD_MS - MIN_CHUNK_HOLD_MS + 1);
+    String chunk = "snapshot chunk at " + sr.offset() + " from " + sr.from() + " to " + sr.to();
+    if (p < CHUNK_LOSS_RATE) {
+      if (plan.fault(now, "lose " + chunk)) {
+        chunksLost++;
+        faultLog.add(now + " lose " + chunk);
+        return new ChunkFault(true, sr, 0);
+      }
+    } else if (p < CHUNK_LOSS_RATE + CHUNK_CORRUPT_RATE) {
+      if (sr.data().length > 0 && plan.fault(now, "flip bit " + bit + " of " + chunk)) {
+        chunksCorrupted++;
+        faultLog.add(now + " flip bit " + bit + " of " + chunk);
+        return new ChunkFault(false, corrupt(sr, bit), 0);
+      }
+    } else if (p < CHUNK_LOSS_RATE + CHUNK_CORRUPT_RATE + CHUNK_HOLD_RATE) {
+      if (plan.fault(now, "hold back " + chunk + " for " + holdMs + " ms")) {
+        chunksHeldBack++;
+        faultLog.add(now + " hold back " + chunk + " for " + holdMs + " ms");
+        return new ChunkFault(false, sr, holdMs);
+      }
+    }
+    return new ChunkFault(false, sr, 0);
+  }
+
+  /** The same chunk with one bit of its data flipped and the checksum of the original. */
+  static Message.SnapshotRequest corrupt(Message.SnapshotRequest sr, int bit) {
+    byte[] data = sr.data().clone();
+    data[bit / 8] ^= (byte) (1 << (bit % 8));
+    return new Message.SnapshotRequest(
+        sr.from(),
+        sr.to(),
+        sr.term(),
+        sr.meta(),
+        sr.offset(),
+        data,
+        sr.done(),
+        sr.checksum(),
+        sr.seq());
+  }
+
+  /**
+   * After a chunk that is not the last has been handled, crashes the follower that took it or the
+   * leader that sent it, so the transfer is cut between two chunks, and restarts that node shortly
+   * after.
+   */
+  private void maybeCrashMidTransfer(Message.SnapshotRequest sr) {
+    double p = chunkRnd.nextDouble();
+    boolean follower = chunkRnd.nextBoolean();
+    long downMs =
+        MIN_MID_TRANSFER_DOWN_MS
+            + (long) chunkRnd.nextInt(MAX_MID_TRANSFER_DOWN_MS - MIN_MID_TRANSFER_DOWN_MS + 1);
+    String victim = follower ? sr.to() : sr.from();
+    if (p >= MID_TRANSFER_CRASH_RATE || !nodes.get(victim).up) {
+      return;
+    }
+    String what =
+        "crash "
+            + (follower ? "follower " : "leader ")
+            + victim
+            + " after snapshot chunk at "
+            + sr.offset()
+            + " from "
+            + sr.from()
+            + " to "
+            + sr.to();
+    if (!plan.fault(now, what)) {
+      return;
+    }
+    midTransferCrashes++;
+    faultLog.add(now + " " + what);
+    crash(victim);
+    transferCutBy.add(sr.to());
+    schedule(
+        downMs,
+        () -> {
+          if (!retired.contains(victim)
+              && !nodes.get(victim).up
+              && plan.fault(now, "restart " + victim + " after a crash mid-transfer")) {
+            restart(victim);
+          }
+        });
   }
 
   private void deliverLater(Message m, long hold) {
@@ -615,6 +801,17 @@ final class Simulation {
     mix(m.hashCode());
     n.replica.receive(m);
     afterStep(n);
+    if (m instanceof Message.SnapshotRequest sr) {
+      if (sr.done()
+          && n.up
+          && sr.meta().equals(n.replica.node().log().snapshot())
+          && transferCutBy.remove(n.id)) {
+        installsAfterMidTransferCrash++;
+      }
+      if (!sr.done() && n.up && chunkFaultsOn()) {
+        maybeCrashMidTransfer(sr);
+      }
+    }
   }
 
   /** Thrown from a sync to model losing power in the middle of an fsync. */
