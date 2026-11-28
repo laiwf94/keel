@@ -81,6 +81,18 @@ tasks.register<JavaExec>("linearizabilityBenchmark") {
     maxHeapSize = "1g"
 }
 
+// Times compaction and a new server's catch-up on 1, 4 and 16 GiB; see bench/RESULTS.md.
+// -Psizes=1g,4g picks the sizes and -Pdir=/path the directory the data is written to.
+tasks.register<JavaExec>("logBenchmark") {
+    description = "Times log compaction and snapshot catch-up for large logs."
+    classpath = sourceSets.main.get().runtimeClasspath
+    mainClass = "io.github.laiwf94.keel.bench.LogBench"
+    // The heap the roadmap allows for a 4 GiB snapshot; the benchmark reports its peak use.
+    maxHeapSize = "256m"
+    args("--sizes", providers.gradleProperty("sizes").getOrElse("1g,4g,16g"))
+    providers.gradleProperty("dir").orNull?.let { args("--dir", it) }
+}
+
 jacoco {
     toolVersion = "0.8.15"
 }

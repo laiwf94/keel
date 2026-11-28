@@ -171,7 +171,7 @@ A write is acknowledged only after it is on disk on the leader and on at least o
 
 ## What it does not do
 
-All data lives in memory and is snapshotted to disk, so the data set is bounded by the heap. Snapshots are streamed to and from disk and sent in chunks, so they need no memory beyond a few MiB of buffers and have no size limit of their own. Only the leader serves linearizable and lease reads. Each session allows one outstanding request. Peer traffic is authenticated with HMAC-SHA256 but not encrypted, so run it on a private network. Lease reads assume clock rates differ by less than 25% between nodes; ReadIndex, the default, assumes nothing about clocks. Every founding node must start with the same member list, and a node that loses its disk must rejoin under a new id.
+All data lives in memory and is snapshotted to disk, so the data set is bounded by the heap. Snapshots are streamed to and from disk and sent in chunks, so they need no memory beyond a few MiB of buffers and have no size limit of their own. Compaction still blocks the node: about a second per GiB of state to write the snapshot, and about half a second per GiB of log to delete covered segments (bench/RESULTS.md). Only the leader serves linearizable and lease reads. Each session allows one outstanding request. Peer traffic is authenticated with HMAC-SHA256 but not encrypted, so run it on a private network. Lease reads assume clock rates differ by less than 25% between nodes; ReadIndex, the default, assumes nothing about clocks. Every founding node must start with the same member list, and a node that loses its disk must rejoin under a new id.
 
 docs/DESIGN.md explains the design, the reasons behind it, the failure modes and the trade-offs in detail.
 
@@ -185,6 +185,7 @@ docs/DESIGN.md explains the design, the reasons behind it, the failure modes and
     -Dkeel.sim.seed=1234 -Dkeel.sim.shrink=true      # shrink a failing seed to its causes
 bench/run.sh local                                  # benchmark three local JVMs
 ./gradlew linearizabilityBenchmark                  # time the linearizability checker
+./gradlew logBenchmark                              # compaction pause and catch-up, 1 to 16 GiB
 scripts/verify-commits.sh                           # run the gate on every commit
 ```
 

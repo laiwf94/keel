@@ -499,8 +499,10 @@ class StreamedSnapshotTest {
       int[] sent = {0};
       try (FileStorage s1 = new FileStorage(dir.resolve("n1"));
           FileStorage s2 = new FileStorage(dir.resolve("n2"))) {
-        StreamedTransfer.FillerMachine m1 = new StreamedTransfer.FillerMachine(50_000);
-        StreamedTransfer.FillerMachine m2 = new StreamedTransfer.FillerMachine(50_000);
+        io.github.laiwf94.keel.bench.FillerMachine m1 =
+            new io.github.laiwf94.keel.bench.FillerMachine(50_000);
+        io.github.laiwf94.keel.bench.FillerMachine m2 =
+            new io.github.laiwf94.keel.bench.FillerMachine(50_000);
         Replica leader =
             new Replica(
                 "n1",
@@ -560,8 +562,8 @@ class StreamedSnapshotTest {
           assertEquals(leader.appliedIndex(), follower.appliedIndex());
           // The first transfer ends with the older snapshot; the leader compacted past it
           // meanwhile, so a second transfer sends the newer one.
-          assertEquals(2, m2.restores);
-          assertEquals(m1.digest, m2.digest);
+          assertEquals(2, m2.restores());
+          assertEquals(m1.digest(), m2.digest());
         }
         assertFalse(first.isOpen(), "the finished transfer still holds its snapshot");
         assertTrue(second.isOpen());
